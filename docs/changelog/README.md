@@ -50,6 +50,7 @@
 
 ## 索引
 
+- [2026-09-17 客户端 UI 静态原型去除本机用户名](2026-09-17-client-ui-mockup-redact-username.md)
 - [2026-09-17 客户端 UI 设计文档去除本机用户名](2026-09-17-client-ui-doc-redact-username.md)
 - [2026-09-17 工作台 W1 + W2：Space/会话持久化 + 本地 HTTP + SSE API](2026-09-17-workbench-spaces-and-local-api.md)
 - [2026-09-17 M2 完成：其余 6 个内置工具 + 输出截断落盘 + 只读并行/含写串行](2026-09-17-m2-tools-truncation-and-fixes.md)
