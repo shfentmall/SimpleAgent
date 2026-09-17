@@ -38,18 +38,32 @@ const state = {
 };
 
 /* ────────────────────────────── 请求封装 ────────────────────────────── */
+/* 浏览器对同一个 host 最多开 6 条 HTTP/1.1 连接，连接占满时新请求只会排队：
+   不报错、不超时，界面上就是「点了没反应」。给每个请求设个上限，至少变成看得见的错误。 */
+const REQ_TIMEOUT_MS = 20000;
+
 async function req(method, path, data) {
-  const r = await fetch(path, {
-    method,
-    headers: data === undefined ? {} : { "Content-Type": "application/json" },
-    body: data === undefined ? undefined : JSON.stringify(data),
-  });
-  if (!r.ok) {
-    let msg = `${r.status}`;
-    try { msg = (await r.json()).error || msg; } catch { /* 非 JSON 响应就用状态码 */ }
-    throw new Error(msg);
+  try {
+    const r = await fetch(path, {
+      method,
+      headers: data === undefined ? {} : { "Content-Type": "application/json" },
+      body: data === undefined ? undefined : JSON.stringify(data),
+      signal: AbortSignal.timeout(REQ_TIMEOUT_MS),
+    });
+    if (!r.ok) {
+      let msg = `${r.status}`;
+      try { msg = (await r.json()).error || msg; } catch { /* 非 JSON 响应就用状态码 */ }
+      throw new Error(msg);
+    }
+    return r.status === 204 ? null : await r.json();
+  } catch (e) {
+    // 超时可能发生在排队、等响应头或读 body 的任一阶段，统一换成看得懂的提示。
+    // 读 body 时超时 Chromium 报的是 AbortError 而不是 TimeoutError；这里没有别处会 abort，两个都算超时
+    if (e.name === "TimeoutError" || e.name === "AbortError") {
+      throw new Error("请求超时：sa serve 没响应，或浏览器到它的连接被占满（工作台标签页开太多时会这样）");
+    }
+    throw e;
   }
-  return r.status === 204 ? null : r.json();
 }
 const api = {
   get: (p) => req("GET", p),
@@ -471,10 +485,15 @@ function closeStream() {
   if (state.es) { state.es.close(); state.es = null; }
 }
 
-function subscribe(sessionId) {
+/* resume=true 是续传：保留 lastSeq，让服务端只重放它之后的帧。
+   EventSource 没法自己设 Last-Event-ID 头，所以用 query 传。 */
+function subscribe(sessionId, { resume = false } = {}) {
   closeStream();
-  state.lastSeq = 0;
-  const es = new EventSource(`/api/sessions/${sessionId}/events`);
+  if (!resume) state.lastSeq = 0;
+  // 后台标签页不占连接，等切回前台再连（见 boot 里的 visibilitychange）
+  if (document.hidden) return;
+  const query = resume ? `?last_event_id=${state.lastSeq}` : "";
+  const es = new EventSource(`/api/sessions/${sessionId}/events${query}`);
   state.es = es;
   for (const t of FRAME_TYPES) {
     es.addEventListener(t, (ev) => {
@@ -1314,13 +1333,29 @@ async function createSpace() {
   }
   const v = $("f-verify").value.trim();
   if (v) { body.verify_command = v; body.verify_trigger = "on_stop"; }
+
+  // 请求在路上时给出反馈，也防止连点建出两个同名空间
+  const btn = $("f-create");
+  btn.disabled = true;
+  btn.textContent = "创建中…";
+  $("modal-err").textContent = "";
+  let sp;
   try {
-    const sp = await api.post("/api/spaces", body);
-    $("modal").classList.add("hidden");
+    sp = await api.post("/api/spaces", body);
+  } catch (e) {
+    $("modal-err").textContent = `创建失败：${e.message}`;
+    return;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "创建";
+  }
+  $("modal").classList.add("hidden");
+  // 向导已经关了，后面再出错写进 modal-err 就没人看得见，改用 toast
+  try {
     await loadSpaces();
     await newSession(sp.id);
   } catch (e) {
-    $("modal-err").textContent = `创建失败：${e.message}`;
+    toast(`空间已创建，但打开会话失败：${e.message}`);
   }
 }
 
@@ -1406,6 +1441,14 @@ async function boot() {
     await loadPanel();
   };
   $("todo-add").onclick = addTodoInline;
+
+  // 每个工作台标签页挂一条 SSE，开到 6 个就把浏览器给这个 host 的连接占满了，
+  // 之后创建空间、发消息全卡在排队里。所以切到后台就断开，回到前台再续传，
+  // 错过的帧由服务端按 lastSeq 重放，前端按 seq 去重。
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) closeStream();
+    else if (state.sessionId && !state.es) subscribe(state.sessionId, { resume: true });
+  });
 
   // 运行中每秒刷新一次「已用时」
   setInterval(() => {

@@ -391,7 +391,12 @@ class Server:
 
     # ----------------------------------------------------------------- SSE
     def _sse(self, session_id: str, headers: dict[str, str]) -> Response:
-        last_event_id = headers.get("last-event-id")
+        # 浏览器断线自动重连时会带 Last-Event-ID 头；前端主动续传（标签页切回前台时重新
+        # 订阅）没法给 EventSource 设头，只能走 query。两者都有时以头为准，它更新。
+        last_event_id = (
+            headers.get("last-event-id")
+            or parse_qs(headers.get("x-query", "")).get("last_event_id", [None])[0]
+        )
         q, replay = self.runner.bus.subscribe(session_id, last_event_id)
 
         def stream() -> Iterator[str]:
