@@ -126,9 +126,10 @@ class Runner:
         session = self.store.load_session(space_id, session_id)
         agent = self._build_agent(space, session)
         self._agents[session_id] = agent
-        # 落盘：用户消息 + 状态置为 running
+        # 落盘：用户消息 + 状态置为 running；再广播一帧，面板才知道"开始了"
         self.store.append_message(space_id, session_id, {"role": "user", "content": user_input})
         self.store.update_meta(space_id, session_id, status="running")
+        self.bus.publish(status_frame(session_id, "running", {"space_id": space_id}))
 
         task = asyncio.current_task()
         if task is not None:
@@ -137,12 +138,12 @@ class Runner:
             async for event in agent.run(session, user_input):
                 self._on_event(space_id, session_id, event)
         except asyncio.CancelledError:
-            self.bus.publish(status_frame(session_id, "cancelled"))
             self._finalize(space_id, session_id, session, "cancelled")
             raise
         except Exception as e:  # noqa: BLE001  任何异常都转成 error 帧并落盘状态
-            self.bus.publish(error_frame(session_id, f"{type(e).__name__}: {e}"))
-            self._finalize(space_id, session_id, session, "error")
+            message = f"{type(e).__name__}: {e}"
+            self.bus.publish(error_frame(session_id, message))
+            self._finalize(space_id, session_id, session, "error", reason=message)
         else:
             self._finalize(space_id, session_id, session, "done")
         finally:
@@ -158,8 +159,27 @@ class Runner:
             self.store.append_message(space_id, session_id, event.as_message())
         self.bus.publish(event_to_frame(event, session_id))
 
-    def _finalize(self, space_id: str, session_id: str, session: Session, status: str) -> None:
-        self.store.update_meta(space_id, session_id, status=status, usage=session.usage.__dict__)
+    def _finalize(
+        self,
+        space_id: str,
+        session_id: str,
+        session: Session,
+        status: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """一轮结束的唯一收口点：落盘终态 + 广播一帧 status。
+
+        原来只有 cancelled / error 分支发帧，正常结束只写 meta，所以"跑完了"这件事
+        从来没出过总线 —— 控制面板只能靠轮询 meta、且只筛 running，于是任务一结束
+        就从面板消失。三个终态（done / error / cancelled）统一在这里广播。
+        """
+        usage = session.usage.__dict__
+        self.store.update_meta(space_id, session_id, status=status, usage=usage)
+        extra: dict[str, Any] = {"space_id": space_id, "usage": usage}
+        if reason is not None:
+            extra["reason"] = reason
+        self.bus.publish(status_frame(session_id, status, extra))
 
     def _build_agent(self, space: Space, session: Session) -> Agent:
         profile = self.config.profiles[space.profile]

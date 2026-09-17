@@ -50,6 +50,7 @@
 
 ## 索引
 
+- [2026-09-17 控制面板改为「近期活动流」，任务完成首次广播状态帧](2026-09-17-panel-recent-activity-and-done-frame.md)
 - [2026-09-17 客户端 UI 静态原型去除本机用户名](2026-09-17-client-ui-mockup-redact-username.md)
 - [2026-09-17 客户端 UI 设计文档去除本机用户名](2026-09-17-client-ui-doc-redact-username.md)
 - [2026-09-17 工作台 W1 + W2：Space/会话持久化 + 本地 HTTP + SSE API](2026-09-17-workbench-spaces-and-local-api.md)
