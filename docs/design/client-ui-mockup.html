@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="YYWot9A3R38mgn68Er68Lu">
+<head data-page-node-id="wD2HG3lgAxQTSoboFoSkvp">
+<meta charset="utf-8" data-page-node-id="yPtSlMqJk27psZobmUtljc">
+<meta name="viewport" content="width=device-width, initial-scale=1" data-page-node-id="SBgIEXdD9AD3o5izV2KMoD">
+<title>SimpleAgent 工作台 · 界面草图</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --panel-2:#fbfcfd;
+    --border:#e4e7ec; --border-strong:#d3d8e0;
+    --text:#1f2328; --text-2:#5b6472; --text-3:#8b95a3;
+    --accent:#2f6feb; --accent-soft:#eaf1fe;
+    --green:#1a7f45; --green-soft:#e7f5ed;
+    --red:#c0392b; --red-soft:#fdeceb;
+    --amber:#9a6700; --amber-soft:#fdf3e0;
+    --blue:#1b64c9; --blue-soft:#e9f1fd;
+    --radius:8px;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; height:100vh; background:var(--bg); color:var(--text);
+    font:13px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",Arial,sans-serif;
+  }
+  .app{display:grid; grid-template-columns:300px 1fr; height:100vh}
+
+  /* ---------- 左栏 ---------- */
+  .sidebar{
+    background:var(--panel); border-right:1px solid var(--border);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .brand{
+    padding:14px 16px; font-weight:600; font-size:13px; letter-spacing:.2px;
+    display:flex; align-items:center; gap:8px; border-bottom:1px solid var(--border);
+  }
+  .brand .dot{width:8px;height:8px;border-radius:50%;background:var(--accent)}
+  .side-scroll{overflow-y:auto; flex:1; padding:12px 10px 24px}
+  .btn-new{
+    width:100%; padding:8px 10px; border-radius:var(--radius); border:1px solid var(--accent);
+    background:var(--accent); color:#fff; font-size:13px; font-weight:500; cursor:pointer;
+    text-align:left; margin-bottom:10px;
+  }
+  .btn-new:hover{background:#2559c4}
+  .nav{display:flex; flex-direction:column; gap:1px}
+  .nav-item{
+    display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:6px;
+    color:var(--text); cursor:pointer; text-decoration:none;
+  }
+  .nav-item:hover{background:var(--bg)}
+  .nav-item .ico{width:16px; text-align:center; color:var(--text-3)}
+  .nav-item .tail{margin-left:auto; font-size:11px; color:var(--text-3)}
+
+  .sec-head{
+    display:flex; align-items:center; gap:6px; margin:18px 6px 8px;
+    font-size:11px; color:var(--text-3); font-weight:600; letter-spacing:.5px;
+  }
+  .sec-head .tail{margin-left:auto}
+  .search{
+    width:100%; padding:6px 9px; border:1px solid var(--border); border-radius:6px;
+    background:var(--panel-2); font-size:12px; margin:0 0 8px; color:var(--text);
+  }
+
+  .space{
+    border:1px solid var(--border); border-radius:var(--radius); margin-bottom:8px;
+    background:var(--panel); overflow:hidden;
+  }
+  .space.open{border-color:var(--border-strong)}
+  .space-head{padding:8px 10px; cursor:pointer; display:flex; flex-direction:column; gap:3px}
+  .space-head:hover{background:var(--panel-2)}
+  .space-title{display:flex; align-items:center; gap:6px; font-weight:600; font-size:12.5px}
+  .caret{color:var(--text-3); font-size:10px; width:8px}
+  .badge{
+    font-size:10px; padding:1px 5px; border-radius:4px; font-weight:600; letter-spacing:.3px;
+  }
+  .b-generic{background:#eef0f3; color:#5b6472}
+  .b-cc{background:#f3ecdf; color:#8a5a1a}
+  .b-oc{background:#e9eef8; color:#2c4a80}
+  .b-sa{background:var(--accent-soft); color:var(--accent)}
+  .space-path{font-size:11px; color:var(--text-3); font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding-left:14px}
+  .space-meta{padding-left:14px; font-size:10.5px; color:var(--text-3)}
+  .sessions{padding:2px 6px 8px 14px; display:none}
+  .space.open .sessions{display:block}
+  .s-item{
+    display:flex; align-items:center; gap:6px; padding:4px 6px; border-radius:5px;
+    font-size:12px; cursor:pointer; color:var(--text-2);
+  }
+  .s-item:hover{background:var(--bg); color:var(--text)}
+  .s-item.active{background:var(--accent-soft); color:var(--accent)}
+  .s-item .t{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1}
+  .s-item .time{font-size:10.5px; color:var(--text-3)}
+  .st{width:7px;height:7px;border-radius:50%;flex:0 0 7px}
+  .st-run{background:var(--blue); box-shadow:0 0 0 2px var(--blue-soft)}
+  .st-done{background:#c8cdd6}
+  .v{font-size:10px; width:12px; text-align:center}
+  .v-pass{color:var(--green)} .v-fail{color:var(--red)}
+  .v-none{color:#c8cdd6} .v-stale{color:var(--amber)}
+  .more{padding:4px 6px 4px 20px; font-size:11px; color:var(--accent); cursor:pointer}
+
+  /* ---------- 右栏 ---------- */
+  .main{display:flex; flex-direction:column; overflow:hidden}
+  .m-head{padding:12px 20px; border-bottom:1px solid var(--border); background:var(--panel)}
+  .crumb{display:flex; align-items:center; gap:8px; font-size:12px; color:var(--text-3); flex-wrap:wrap}
+  .crumb b{color:var(--text); font-size:14px; font-weight:600}
+  .crumb .sep{color:var(--border-strong)}
+  .head-row{display:flex; align-items:center; gap:10px; margin-top:6px; flex-wrap:wrap}
+  .chip{
+    display:inline-flex; align-items:center; gap:4px; font-size:11px; padding:2px 8px;
+    border-radius:20px; border:1px solid var(--border); color:var(--text-2); background:var(--panel-2);
+  }
+  .chip.ok{border-color:#bfe0cd; background:var(--green-soft); color:var(--green)}
+  .chip.warn{border-color:#e8d5a8; background:var(--amber-soft); color:var(--amber)}
+  .chip.bad{border-color:#f0c4bf; background:var(--red-soft); color:var(--red)}
+  .chip.run{border-color:#c2d8f5; background:var(--blue-soft); color:var(--blue)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px}
+  .actions{margin-left:auto; display:flex; gap:6px}
+  .btn{
+    padding:4px 10px; border:1px solid var(--border-strong); background:var(--panel);
+    border-radius:6px; font-size:12px; cursor:pointer; color:var(--text);
+  }
+  .btn:hover{background:var(--bg)}
+  .btn.primary{background:var(--accent); border-color:var(--accent); color:#fff}
+  .tabs{display:flex; gap:2px; padding:0 20px; border-bottom:1px solid var(--border); background:var(--panel)}
+  .tab{padding:8px 12px; font-size:12.5px; color:var(--text-2); cursor:pointer; border-bottom:2px solid transparent}
+  .tab:hover{color:var(--text)}
+  .tab.active{color:var(--accent); border-bottom-color:var(--accent); font-weight:500}
+  .tab .n{font-size:10px; color:var(--text-3); margin-left:3px}
+
+  .stream{flex:1; overflow-y:auto; padding:18px 20px; background:var(--bg)}
+  .bubble{max-width:860px; margin:0 auto 14px}
+  .who{font-size:11px; color:var(--text-3); margin-bottom:4px; display:flex; gap:6px; align-items:center}
+  .msg{background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:10px 12px}
+  .msg.user{background:#f0f4fb; border-color:#dce6f6}
+  .tool{
+    background:var(--panel); border:1px solid var(--border); border-radius:var(--radius);
+    margin:0 auto 10px; max-width:860px; overflow:hidden;
+  }
+  .tool-head{display:flex; align-items:center; gap:8px; padding:7px 11px; font-size:12px; cursor:pointer}
+  .tool-head .gear{color:var(--text-3)}
+  .tool-head .name{font-family:ui-monospace,Menlo,monospace; font-weight:600}
+  .tool-head .arg{color:var(--text-3); font-family:ui-monospace,Menlo,monospace; font-size:11px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1}
+  .tool-head .res{font-size:11px; color:var(--text-3)}
+  .tool-body{display:none; padding:9px 11px; border-top:1px solid var(--border);
+    background:var(--panel-2); font-family:ui-monospace,Menlo,monospace; font-size:11.5px;
+    color:var(--text-2); white-space:pre; overflow-x:auto; margin:0}
+  .tool.open .tool-body{display:block}
+  .verify-card{
+    max-width:860px; margin:0 auto 14px; border:1px solid #bfe0cd; background:var(--green-soft);
+    border-radius:var(--radius); padding:9px 12px; font-size:12px; color:var(--green);
+    display:flex; align-items:center; gap:8px;
+  }
+  .verify-card .cmd{margin-left:auto; font-family:ui-monospace,Menlo,monospace; color:#3f6b52}
+  .approval{
+    max-width:860px; margin:0 auto 14px; border:1px solid #e8d5a8; background:var(--amber-soft);
+    border-radius:var(--radius); padding:10px 12px; font-size:12px; color:var(--amber);
+  }
+  .approval .row{margin-top:8px; display:flex; gap:6px}
+  .thinking{font-size:11px; color:var(--text-3); border-left:2px solid var(--border-strong);
+    padding-left:8px; margin:0 auto 10px; max-width:860px}
+
+  .composer{border-top:1px solid var(--border); background:var(--panel); padding:10px 20px 14px}
+  .composer-box{max-width:860px; margin:0 auto;
+    border:1px solid var(--border-strong); border-radius:10px; background:var(--panel); padding:8px}
+  .composer textarea{
+    width:100%; border:0; outline:none; resize:none; font:inherit; color:var(--text);
+    min-height:44px; padding:2px 4px; background:transparent;
+  }
+  .c-row{display:flex; align-items:center; gap:8px; margin-top:6px}
+  .c-row select{border:1px solid var(--border); border-radius:6px; padding:3px 6px; font-size:11.5px; background:var(--panel-2); color:var(--text-2)}
+  .hint{font-size:11px; color:var(--text-3)}
+  .send{margin-left:auto; background:var(--accent); color:#fff; border:0; border-radius:6px; padding:5px 14px; font-size:12px; cursor:pointer}
+  .empty{color:var(--text-3); text-align:center; padding:40px 0; font-size:13px}
+</style>
+</head>
+<body data-page-node-id="Ma6sxsFAJCq1tgBrqYYN0V">
+<div class="app" data-page-node-id="GN4rlCDOIgJLDUOPEAc0na">
+  <!-- ================= 左栏 ================= -->
+  <aside class="sidebar" data-page-node-id="GFIXykE9iGjjrBvwwClhCH">
+    <div class="brand" data-page-node-id="tMYBxC4HGgzHPjmPzlNUHB"><span class="dot" data-page-node-id="6Fk8Wc4FER84SINzYcFI8N"></span>SimpleAgent 工作台</div>
+    <div class="side-scroll" data-page-node-id="kBjr4TbOkz4TPCukh7Ea3H">
+      <button class="btn-new" data-page-node-id="c9oNhZM7YkvFCxIE5mEu6J">＋ 新建 Agent</button>
+      <nav class="nav" data-page-node-id="DyzoEZHC82gSGfDUV4dL8M">
+        <a class="nav-item" data-page-node-id="FwW9BZArKWmDHxDoe85Wdp"><span class="ico" data-page-node-id="ly89qzkTd94uudk2BouzsK">▦</span>控制面板<span class="tail" data-page-node-id="70cwfOIPOzblCBKlUixxxB">2 个运行中</span></a>
+        <a class="nav-item" data-page-node-id="tN2ItzrpSXKIbEHWeEVoes"><span class="ico" data-page-node-id="B5DsUqqRGLLQqy7anZknBu">❏</span>知识库<span class="tail" data-page-node-id="SAfRjRjCTXe1FyVV92s6WK">M7</span></a>
+      </nav>
+
+      <div class="sec-head" data-page-node-id="uHZD4ezuxHPkIdCmYPvmo9">打开的空间 <span class="tail" data-page-node-id="RhH2a5xhXyVMSyAUQYAmq1">3</span></div>
+      <input class="search" placeholder="搜索空间或任务…" data-page-node-id="JLFyhhiTFS7DJGISPEa3eW">
+
+      <!-- 空间 1：通用任务 -->
+      <div class="space open" data-page-node-id="c5QyMlNH6ATDZdonzb2MXT">
+        <div class="space-head" data-page-node-id="ZcSGkg1MrcfuaGEUd0p1mZ">
+          <div class="space-title" data-page-node-id="MZJOeJaXhiHPDZFXenEE4q"><span class="caret" data-page-node-id="83vY6HHdJRxDtL5EeBoLuk">▾</span>临时整理 <span class="badge b-generic" data-page-node-id="z1ILjxYs2NH3LN9ZH95Xqr">通用</span></div>
+          <div class="space-path" data-page-node-id="iDRNSamUlH7yJint7eUHoa">~/.simpleagent/spaces/sp_a1b2c3/tmp</div>
+          <div class="space-meta" data-page-node-id="MKTOnBvaTd6jMgx96hile6">已验证 1 / 5 · 共 12 个</div>
+        </div>
+        <div class="sessions" data-page-node-id="6CAfYRAm6MLjJ72LaGZAqX">
+          <div class="s-item" data-s="s1" data-page-node-id="X8ss0yMuJEFAYI1I1bApqe"><span class="st st-run" data-page-node-id="k8V9pHkDNbYrF8xuxDaTFk"></span><span class="t" data-page-node-id="D8FKFF3ORF1IIDGlwegp92">整理下载目录里的 PDF</span><span class="v v-none" data-page-node-id="fmHL4P0wUz0eWv0BGgDGOh">○</span><span class="time" data-page-node-id="nBZ8aofRN6UKN9qSReZNJl">运行中</span></div>
+          <div class="s-item" data-s="s2" data-page-node-id="KOFxg5pi3UVm56ruakAHlE"><span class="st st-done" data-page-node-id="7hPtCwLauS7HWUgUu8OFiu"></span><span class="t" data-page-node-id="FYp064CBHp2VVNna3mfJcI">统计 src/ 下 py 文件行数</span><span class="v v-pass" data-page-node-id="SZ3CUlqSFFF4sVifQ0CERH">✓</span><span class="time" data-page-node-id="G4Eubrd8p8DdqJ6GxbJJjT">2 小时前</span></div>
+          <div class="s-item" data-s="s3" data-page-node-id="GqXzFoUcjBgJUMi7uThhAF"><span class="st st-done" data-page-node-id="2J6rcVVcXeJsSUUOgIheGv"></span><span class="t" data-page-node-id="X1ICWSmFIvR65BZlNHp67c">批量重命名截图</span><span class="v v-fail" data-page-node-id="git1dCiV7qjPdQLjMUXjvB">✗</span><span class="time" data-page-node-id="y91L6Yy5K5mUN0H8uBXL0W">昨天</span></div>
+          <div class="s-item" data-s="s4" data-page-node-id="4e4AUbMBSY0zF8zzL9r7gb"><span class="st st-done" data-page-node-id="BRpP8eVlERoBGpwtHOzc5K"></span><span class="t" data-page-node-id="c8qh0zNdzaeHW80YuUqvcG">试算 token 成本</span><span class="v v-none" data-page-node-id="4GE5xi5vk8ZCsvXRL67nfP">○</span><span class="time" data-page-node-id="MDlLFqYwMdUkGPU7s11TOY">周一</span></div>
+          <div class="s-item" data-s="s5" data-page-node-id="anU59WUqcEF7dxn2D8Sx1b"><span class="st st-done" data-page-node-id="aiGY6mAfFfM4wIk10S9q5C"></span><span class="t" data-page-node-id="6AjlWZCbcFi8ex6VmUsGvT">把 changelog 翻成中文</span><span class="v v-stale" data-page-node-id="iRRYaCA3CHZUpcfKPHJ8id">⚠</span><span class="time" data-page-node-id="BcaBAunxdeD1C0wKmAhxzU">上周</span></div>
+          <div class="more" data-page-node-id="D8c9dMRhHtSal6aaViu8mI">查看全部 (12)</div>
+        </div>
+      </div>
+
+      <!-- 空间 2：Claude Code -->
+      <div class="space open" data-page-node-id="cN3y26AjL9KnlkrHXj7KI1">
+        <div class="space-head" data-page-node-id="k0Pvo8ubh3ER6xWF3JaEYB">
+          <div class="space-title" data-page-node-id="MYA0pvE6VQjt4wEe5Z4LPv"><span class="caret" data-page-node-id="ZwBNZ9IWYQJst0AGdYGzBv">▾</span>SimpleAgent 重构 <span class="badge b-cc" data-page-node-id="Ix5wmBs7BhKO0mFcZbURyq">CC</span></div>
+          <div class="space-path" data-page-node-id="gdmhejGjbi3MAmhUuEwVVF">~/dev_code/SimpleAgent</div>
+          <div class="space-meta" data-page-node-id="HspeCvvJxlTtIAaHV27SqP">已验证 2 / 5 · 共 9 个</div>
+        </div>
+        <div class="sessions" data-page-node-id="02TMQQaKTRpq2mCJs5BXrq">
+          <div class="s-item active" data-s="s6" data-page-node-id="2mmDpP7WX4rA8cSGFvr2OH"><span class="st st-run" data-page-node-id="zH34rCv7u0ICnpWLHDQB21"></span><span class="t" data-page-node-id="3iE8e3AYT0GzcD3ws8O55E">修 pytest 临时目录权限问题</span><span class="v v-none" data-page-node-id="Lgoy6kfYakNbW6kDjQrofu">○</span><span class="time" data-page-node-id="g5AL4O0uzgEMoZxYqH9hsx">运行中</span></div>
+          <div class="s-item" data-s="s7" data-page-node-id="Qdwot7zsixo3P1JrUReY9f"><span class="st st-done" data-page-node-id="5FpKow8E34EUzzwirbmU0M"></span><span class="t" data-page-node-id="tLyhEw9P2d4xLwzACyGG5R">补 M3 权限规则单测</span><span class="v v-pass" data-page-node-id="ZwSmW1BtjMPF1A89ruxhgS">✓</span><span class="time" data-page-node-id="vE36OxMdfyE9tM9c4iygZP">3 小时前</span></div>
+          <div class="s-item" data-s="s8" data-page-node-id="DNRMUz7xsrVSWafrb3TD2M"><span class="st st-done" data-page-node-id="gLnLT380rmTRBdPiucDyrs"></span><span class="t" data-page-node-id="fxZCBrAhhXuEwOaLaZFNJb">写 M2 changelog</span><span class="v v-pass" data-page-node-id="zQfxPXOosl2EdfPUIfnKos">✓</span><span class="time" data-page-node-id="YBUsYWiGRwBOmDCrQlCbJW">昨天</span></div>
+          <div class="s-item" data-s="s9" data-page-node-id="o8qza1mjaM3O5alhGZHGjQ"><span class="st st-done" data-page-node-id="dW55ViTM1bBG1AjBfe3T60"></span><span class="t" data-page-node-id="mHE35ZvDlfeAGcFnpLDDr3">把 list_dir 深度默认值改成 2</span><span class="v v-stale" data-page-node-id="Ht7tGVAFrFDC4cHMaifqDS">⚠</span><span class="time" data-page-node-id="gRC78bSsd7rlfjSqtYoTkk">2 天前</span></div>
+          <div class="s-item" data-s="s10" data-page-node-id="LpivSc7xDT0wtHRXzKBBZO"><span class="st st-done" data-page-node-id="1E0p7bUpiPbbVoPABqk9Gy"></span><span class="t" data-page-node-id="FELY8JNv1bBWPWBbB2qAJg">调研 ACP 协议</span><span class="v v-none" data-page-node-id="8k9p2gYr9ErmiulLgGTTEA">○</span><span class="time" data-page-node-id="MVuWEL4qJ1TkPq9OCFwf41">3 天前</span></div>
+          <div class="more" data-page-node-id="eCLIiScpKdJTsxwBK3UOwy">查看全部 (9)</div>
+        </div>
+      </div>
+
+      <!-- 空间 3：OpenCode -->
+      <div class="space" data-page-node-id="KX1Ef2QOLbI45SlxlyxBiH">
+        <div class="space-head" data-page-node-id="B0G3jBbF3QOAfnhTWRy5VT">
+          <div class="space-title" data-page-node-id="BZqiUAB1QL5A3G4fYpct6e"><span class="caret" data-page-node-id="xHYVcRgrh9mabfNVvqAY3F">▸</span>实验区 <span class="badge b-oc" data-page-node-id="htTLlIRBjhLhAUd6Cgjj2o">OC</span></div>
+          <div class="space-path" data-page-node-id="sNEVG2H0J8tVHTPhDofIQJ">/tmp/opencode-lab</div>
+          <div class="space-meta" data-page-node-id="sFvwH5OsSm6xJd1HD9R0aB">已验证 0 / 3 · 共 3 个</div>
+        </div>
+        <div class="sessions" data-page-node-id="L51OSSqwwxsLy28c0HZqnl">
+          <div class="s-item" data-s="s11" data-page-node-id="mcCKQCg086q42utfh8kqqf"><span class="st st-done" data-page-node-id="VSZUEqvtV1NGSgIjOOOrPR"></span><span class="t" data-page-node-id="Go6bFK9PGxUgmuEQ4TsEin">对比 opencode 与 claude 的工具集</span><span class="v v-none" data-page-node-id="8AUyLDU1vcQX2B0KfAiR3U">○</span><span class="time" data-page-node-id="NjNCq7vyCtxRkse7Rv2IzY">4 天前</span></div>
+          <div class="s-item" data-s="s12" data-page-node-id="Ud489H8A8gySDFYOVse4Nv"><span class="st st-done" data-page-node-id="23Mbzqj3abySA0N5KxoNJy"></span><span class="t" data-page-node-id="LAIAsrXi3BxEOhooQZzsqW">跑通 stream-json 输出</span><span class="v v-fail" data-page-node-id="vgbOuQeYgBUFaUmICaC6x5">✗</span><span class="time" data-page-node-id="9CkHAIBnhPUyYZHxyUyDyf">上周</span></div>
+          <div class="s-item" data-s="s13" data-page-node-id="kpJ9oXQyBQASXP8508VH9j"><span class="st st-done" data-page-node-id="5PA86nlgD5ZfOSCRo3vEV9"></span><span class="t" data-page-node-id="o6vLsEzmn7ub3wxS7goQ6R">第一次接入</span><span class="v v-none" data-page-node-id="WEoEv5Ec8Z90sdBG80rNa2">○</span><span class="time" data-page-node-id="TuvCzzzAqOidUNoo6ew6eK">上周</span></div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ================= 右栏 ================= -->
+  <section class="main" data-page-node-id="q4qRuEF6DUXwx3eLNfuwek">
+    <div class="m-head" data-page-node-id="NGrPFvaGVuzicmoRGCARlc">
+      <div class="crumb" data-page-node-id="CDXaJifXBa5jOIClCXFFWs">SimpleAgent 重构 <span class="sep" data-page-node-id="ihzDNkYE1dtYtPIUlB4atb">/</span> <b id="title" data-page-node-id="51NTWrlbrbuN0KlacUFiEg">修 pytest 临时目录权限问题</b></div>
+      <div class="head-row" data-page-node-id="J4rjFL6gUeYMmORfKaZAVt">
+        <span class="badge b-cc" data-page-node-id="pLFf1OhhcEhg8y0lEMX1jy">CC</span>
+        <span class="chip mono" id="cwd" data-page-node-id="spzRoXIbeKbcTmCe8PEsf7">~/dev_code/SimpleAgent</span>
+        <span class="chip run" id="vchip" data-page-node-id="zG9J0JWyUNBhOYaBMqtElz">◐ 验证中 uv run pytest -q</span>
+        <span class="chip" data-page-node-id="SuMoA6FCWbF1NFDGunCfbS">12.0k tokens</span>
+        <div class="actions" data-page-node-id="nee54a3ju8bmEwx2ujprgU">
+          <button class="btn" data-page-node-id="9f5cu8CNbXG463k8hE2QIX">＋ 新任务</button>
+          <button class="btn" data-page-node-id="GDG1VNLng6H30kxC5PCwDB">停止</button>
+          <button class="btn" data-page-node-id="MnhhJgHA6dwvG7isCtSSjP">重跑</button>
+          <button class="btn primary" data-page-node-id="XwOAt7owcvn6rAOGe9P3SF">跑验证</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="tabs" data-page-node-id="w7pFSIVG0NMKZ6ugekrSKf">
+      <div class="tab active" data-tab="chat" data-page-node-id="X6gTvZy2bbarrWqu7GiAs5">对话</div>
+      <div class="tab" data-tab="diff" data-page-node-id="xfTB7oZePGsoiVo7CGTxrJ">变更<span class="n" data-page-node-id="SHp44LIh2N0q4oYxDN3A9R">2</span></div>
+      <div class="tab" data-tab="files" data-page-node-id="LxUtAUCFJz6FHtPGINxGDb">文件</div>
+      <div class="tab" data-tab="log" data-page-node-id="vSiFifaOtBzRcwjsOTsUAz">日志</div>
+    </div>
+
+    <div class="stream" id="stream" data-page-node-id="9caxbjLE6ckWXo51jXz0ZU">
+      <div class="bubble" data-page-node-id="OBbEDLSBCRwNlnvZiZcnQi"><div class="who" data-page-node-id="9a4cVsu8ME4oLrDOO2pAXd">你 · 14:31</div>
+        <div class="msg user" data-page-node-id="WJm8AXHjB3ZsCXUfUYdo5O">沙箱里跑 pytest 时 tmp_path 一直 PermissionError，先定位原因，改完跑一遍 pytest 和 ruff。</div>
+      </div>
+
+      <div class="bubble" data-page-node-id="QyS1klQrbL6deS9hVZER9B"><div class="who" data-page-node-id="JuEl8DXynQQj0zmHYveYUb">Claude Code · claude-sonnet</div>
+        <div class="msg" data-page-node-id="kBL7JfIudLt0TBe60y6W2R">先看 tests/conftest.py 里 tmp 目录是怎么建的，再确认系统临时目录的权限。</div>
+      </div>
+
+      <div class="tool" onclick="this.classList.toggle('open')" data-page-node-id="zYaaHBxltzMbPv1UPN38Pl">
+        <div class="tool-head" data-page-node-id="eKKanBKa89GSsC7oyAB0uo"><span class="gear" data-page-node-id="I7SzD11RPbjkQDQFmdDpGl">⚙</span><span class="name" data-page-node-id="WZxBXGxlHjwHK5WFfW9GeU">read_file</span>
+          <span class="arg" data-page-node-id="kizXTOGgVji6hP6KTI1nDF">tests/conftest.py</span><span class="res" data-page-node-id="OEOhHqbubUnD2f1nNR5IrS">38 行</span></div>
+        <pre class="tool-body" data-page-node-id="ol3sggCcHjKxyrflVA4Av3">     1  import os
+     2  from pathlib import Path
+     3  import pytest
+     4
+     5  @pytest.fixture
+     6  def sa_home(tmp_path, monkeypatch):
+     7      home = tmp_path / "sa"
+     8      home.mkdir(parents=True, exist_ok=True)
+     9      monkeypatch.setenv("SIMPLEAGENT_HOME", str(home))
+    10      return home</pre>
+      </div>
+
+      <div class="tool" onclick="this.classList.toggle('open')" data-page-node-id="nbR7v0GKjrWVEM8jGDOBOR">
+        <div class="tool-head" data-page-node-id="yvPAhHNB8GENJ2OnqiL8Bo"><span class="gear" data-page-node-id="kdCbbFxlB36FKeNRnuxeim">⚙</span><span class="name" data-page-node-id="NugzQgmatjFKugHn3KJU6h">bash</span>
+          <span class="arg" data-page-node-id="kwVFF7MuFSE7U2FZ7cAu3Z">ls -ld /private/var/folders/xx/T</span><span class="res" data-page-node-id="wvdTnQUhYgQYVbPT4N0ZFV">3 行 · 需要审批</span></div>
+        <pre class="tool-body" data-page-node-id="52pmm3OMGgz9mLIpFNrn5k">drwx------  3 user  staff  96  9 17 14:31 /private/var/folders/xx/T
+# 权限正常，问题在下层：pytest 复用同名目录时 mkdir 报 EEXIST</pre>
+      </div>
+
+      <div class="approval" data-page-node-id="qLmIrT26GGrZrq9ieHeFHs">
+        ⚠ 需要审批：执行 <span class="mono" data-page-node-id="nPiMv2ujEmhdZ7XXZdn7N3">bash: ls -ld /private/var/folders/xx/T</span>
+        <div class="row" data-page-node-id="QyeYkP8P3rDmRvY56PEkWT"><button class="btn" data-page-node-id="eNGlGiz9IjGMBi17FstGH4">允许</button><button class="btn" data-page-node-id="SpyM1viKvKgaQL4ZOA7FYH">拒绝</button><button class="btn" data-page-node-id="jUSWMw4a4dugvDAxgihehT">本次会话始终允许</button></div>
+      </div>
+
+      <div class="thinking" data-page-node-id="MkTC4AYC3fnXmxuP5xnXuV">思考：报错是 mkdir 的 EEXIST 而不是权限被拒，说明目录已存在；pytest 的 tmp_path 会在多次运行间复用基目录……</div>
+
+      <div class="tool" onclick="this.classList.toggle('open')" data-page-node-id="Mb4xpZeV4Oaz3QJqD8IMDc">
+        <div class="tool-head" data-page-node-id="8sH3wywD7zdNr07odurxCP"><span class="gear" data-page-node-id="ubeKdZoyzesyHJfdGIxRjh">⚙</span><span class="name" data-page-node-id="GP6xGqfpDqLpKsf5RL4QkJ">edit_file</span>
+          <span class="arg" data-page-node-id="VOpDwEAByWoN883R5xqqDv">tests/conftest.py</span><span class="res" data-page-node-id="p3DesOIJylafLK3902SSKS">+4 -1</span></div>
+        <pre class="tool-body" data-page-node-id="vJK0QjtB23QDnAw8IWbVxU">@@ -5,6 +5,9 @@
+ @pytest.fixture
+ def sa_home(tmp_path, monkeypatch):
+-    home = tmp_path / "sa"
++    import time
++    home = tmp_path / f"sa_{time.time_ns()}"
++    # 每次用新子目录：重名目录会触发 EEXIST
+     home.mkdir(parents=True, exist_ok=True)
+     monkeypatch.setenv("SIMPLEAGENT_HOME", str(home))</pre>
+      </div>
+
+      <div class="verify-card" data-page-node-id="KwfiagKBonwsYxV3gkCb6R">✅ 验证通过 · 退出码 0 · 1.8s <span class="cmd" data-page-node-id="MVU6j4SJyshYqhqZTOFQiE">uv run pytest -q &amp;&amp; uv run ruff check</span></div>
+
+      <div class="bubble" data-page-node-id="wJUX6XstDWkWTjqSWFRo7z"><div class="who" data-page-node-id="PgJunH0cMe8tOsSOONCWHA">Claude Code · claude-sonnet</div>
+        <div class="msg" data-page-node-id="GACoNr48pPW2SmHaZyEIbl">原因不是权限，是 tmp_path 基目录重名导致 <span class="mono" data-page-node-id="hzB6HVfUlSFKy7vCjcYBAK">mkdir</span> 抛 EEXIST。改成每次新建带纳秒时间戳的子目录后，42 个用例全通过，ruff 也干净了。</div>
+      </div>
+    </div>
+
+    <div class="composer" data-page-node-id="BS2kNpvlnCEaFsSXZQUppM">
+      <div class="composer-box" data-page-node-id="8MCIG4JlAyoPjueahZqiWX">
+        <textarea placeholder="接着聊…  @ 引用文件，/ 调命令"></textarea>
+        <div class="c-row" data-page-node-id="OLgkeMH8LhH4C1Jr96FyWe">
+          <select data-page-node-id="vQK1qqdMQXzaK8wRuZCidv"><option data-page-node-id="EXgCLarnIdIeC4SaejVnY8">claude-sonnet</option><option data-page-node-id="Da0cY3MSxvW5IQXetqpIKe">deepseek</option><option data-page-node-id="Quc7uFCIR86EMBtGftlLaC">glm-4.6</option></select>
+          <span class="hint" data-page-node-id="IpUO1bvEN1SzAoVVLthUOI">⏎ 发送 · ⇧⏎ 换行</span>
+          <button class="send" data-page-node-id="XClbWD7NVDomKbBNjIGB3k">发送</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+  // 空间展开/收起
+  document.querySelectorAll('.space-head').forEach(h => {
+    h.addEventListener('click', () => {
+      const sp = h.parentElement;
+      sp.classList.toggle('open');
+      h.querySelector('.caret').textContent = sp.classList.contains('open') ? '▾' : '▸';
+    });
+  });
+
+  // 会话数据（示意：真实数据来自 /api/sessions/{id}）
+  const DATA = {
+    s6:{title:'修 pytest 临时目录权限问题', cwd:'~/dev_code/SimpleAgent',
+        badge:'CC', v:'run', vtext:'◐ 验证中 uv run pytest -q'},
+    s7:{title:'补 M3 权限规则单测', cwd:'~/dev_code/SimpleAgent',
+        badge:'CC', v:'ok', vtext:'✓ 已验证'},
+    s2:{title:'统计 src/ 下 py 文件行数', cwd:'~/.simpleagent/spaces/sp_a1b2c3/tmp',
+        badge:'通用', v:'ok', vtext:'✓ 已验证'},
+    s3:{title:'批量重命名截图', cwd:'~/.simpleagent/spaces/sp_a1b2c3/tmp',
+        badge:'通用', v:'bad', vtext:'✗ 未通过'},
+    s9:{title:'把 list_dir 深度默认值改成 2', cwd:'~/dev_code/SimpleAgent',
+        badge:'CC', v:'warn', vtext:'⚠ 已失效 · 验证后有新改动'},
+  };
+
+  document.querySelectorAll('.s-item').forEach(it => {
+    it.addEventListener('click', e => {
+      e.stopPropagation();
+      document.querySelectorAll('.s-item').forEach(x => x.classList.remove('active'));
+      it.classList.add('active');
+      const d = DATA[it.dataset.s];
+      if (!d) { document.getElementById('stream').innerHTML =
+        '<div class="empty">这是草图里的占位任务，点“修 pytest 临时目录权限问题 / 统计 src 行数 / 批量重命名截图”看不同状态。</div>';
+        return; }
+      document.getElementById('title').textContent = d.title;
+      document.getElementById('cwd').textContent = d.cwd;
+      const chip = document.getElementById('vchip');
+      chip.className = 'chip ' + d.v; chip.textContent = d.vtext;
+      if (d.v !== 'ok') document.querySelector('.verify-card').style.display = 'none';
+      else document.querySelector('.verify-card').style.display = 'flex';
+    });
+  });
+
+  // tab 切换（草图只做高亮）
+  document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+    });
+  });
+</script>
+</body>
+</html>

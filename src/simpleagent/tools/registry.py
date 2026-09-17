@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
@@ -16,6 +16,11 @@ from simpleagent.tools.output import (
     DEFAULT_MAX_LINES,
     truncate,
 )
+
+if TYPE_CHECKING:
+    # 只用于类型标注。不能在这里做运行时导入：serve/__init__ 会拉起 runner，
+    # runner 又回来导入本模块的调用方 agent.loop，形成循环导入。
+    from simpleagent.serve.approval import Approver
 
 
 def format_validation_error(error: ValidationError) -> str:
@@ -32,12 +37,15 @@ class ToolRegistry:
         tools: Iterable[Tool] = (),
         max_output_chars: int = DEFAULT_MAX_CHARS,
         max_output_lines: int = DEFAULT_MAX_LINES,
+        approver: Approver | None = None,
     ) -> None:
         self._tools: dict[str, Tool] = {}
         for item in tools:
             self.register(item)
         self.max_output_chars = max_output_chars
         self.max_output_lines = max_output_lines
+        # 写操作执行前的审批器；None 表示不审批（沿用旧行为，REPL 默认走这条路径）
+        self.approver = approver
 
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
@@ -79,6 +87,15 @@ class ToolRegistry:
             args = tool.args_model.model_validate(data)
         except ValidationError as e:
             return error(f"参数校验失败：{format_validation_error(e)}")
+        # 写操作（readonly=False）执行前先问审批器；只读工具直接放行
+        if self.approver is not None and not tool.readonly:
+            decision = await self.approver.request(
+                session_id=ctx.session_id or "",
+                tool_name=name,
+                arguments=raw_arguments,
+            )
+            if not decision.allow:
+                return error(f"工具 {name} 需要人工审批，已被拒绝")
         try:
             content = await tool.fn(args, ctx)
         except ToolError as e:

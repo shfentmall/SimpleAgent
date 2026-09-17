@@ -6,13 +6,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from simpleagent.agent.session import Session
 from simpleagent.events import Event, MaxStepsReached, MessageDone, TextDelta, ToolCallStart
 from simpleagent.llm.client import LLM
 from simpleagent.tools import ToolContext, ToolRegistry
+
+if TYPE_CHECKING:
+    from simpleagent.serve.approval import Approver
 
 INTERRUPTED_RESULT = "错误：执行被中断，没有结果"
 
@@ -27,6 +32,7 @@ class Agent:
         max_steps: int = 20,
         output_dir: Path | None = None,
         hidden_env: frozenset[str] = frozenset(),
+        approver: Approver | None = None,
     ):
         self.llm = llm
         self.tools = tools
@@ -35,12 +41,30 @@ class Agent:
         self.max_steps = max_steps
         self.output_dir = output_dir  # 过长的工具输出落盘到这里
         self.hidden_env = hidden_env  # 工具启动子进程时去掉的环境变量（API key）
+        self.approver = approver  # 写操作审批器；None 表示不审批
+        self._task: asyncio.Task | None = None
+
+    def cancel(self) -> None:
+        """取消当前正在跑的这轮对话（对应 HTTP 接口的 /cancel）。
+
+        通过取消底层的 asyncio 任务实现：loop 的 except BaseException 会先把历史修成
+        合法状态，再把 CancelledError 抛出，由调用方收尾。
+        """
+        if self._task is not None:
+            self._task.cancel()
 
     async def run(self, session: Session, user_input: str) -> AsyncIterator[Event]:
         """处理一条用户输入。中断或出错时先把历史修成合法状态，再把异常原样抛出。"""
         turn_start = len(session.messages)
         session.messages.append({"role": "user", "content": user_input})
-        ctx = ToolContext(cwd=self.cwd, output_dir=self.output_dir, hidden_env=self.hidden_env)
+        self._task = asyncio.current_task()
+        ctx = ToolContext(
+            cwd=self.cwd,
+            output_dir=self.output_dir,
+            hidden_env=self.hidden_env,
+            session_id=session.id,
+            approver=self.approver,
+        )
         partial: list[str] = []  # 本次请求已经输出的正文，中断时保存
         try:
             for _ in range(self.max_steps):

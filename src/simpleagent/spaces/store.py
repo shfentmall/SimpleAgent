@@ -1,0 +1,333 @@
+"""SpaceStore：空间与会话的持久化与查询。
+
+落盘布局（在 <SIMPLEAGENT_HOME>/spaces/ 下）：
+    <space-id>/space.toml          空间定义（唯一真值）
+    <space-id>/tmp/                通用空间的工作目录（kind=generic 时建）
+    <space-id>/sessions/<sid>.jsonl   消息流，只追加
+    <space-id>/sessions/<sid>.meta.json  会话元信息（标题/状态/验证），可变
+
+不用额外依赖：TOML 用标准库 tomllib 读、自己拼字符串写；JSON 用标准库 json。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tomllib
+from pathlib import Path
+from typing import Any
+
+from simpleagent.config import home_dir
+from simpleagent.spaces.models import (
+    AgentBinding,
+    GenericConfig,
+    SessionMeta,
+    Space,
+    SpaceSpec,
+    VerifyConfig,
+    _now,
+)
+
+SPACES_DIRNAME = "spaces"
+
+
+def new_id(prefix: str) -> str:
+    import time
+
+    return f"{prefix}_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
+
+
+def _toml_str(s: str) -> str:
+    s = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{s}"'
+
+
+def _space_to_toml(space: Space) -> str:
+    out: list[str] = [
+        f"id = {_toml_str(space.id)}",
+        f"name = {_toml_str(space.name)}",
+        f"kind = {_toml_str(space.kind)}",
+        f"profile = {_toml_str(space.profile)}",
+        f"opened = {str(space.opened).lower()}",
+        f"pinned = {str(space.pinned).lower()}",
+        f"created_at = {_toml_str(space.created_at)}",
+        f"last_opened_at = {_toml_str(space.last_opened_at)}",
+        f"keep_sessions = {space.keep_sessions}",
+    ]
+    if space.kind == "agent" and space.agent:
+        a = space.agent
+        out += [
+            "",
+            "[agent]",
+            f"name = {_toml_str(a.name)}",
+            f"command = {_toml_str(a.command)}",
+            f"args = {json.dumps(a.args, ensure_ascii=False)}",
+        ]
+        if a.cwd is not None:
+            out.append(f"cwd = {_toml_str(a.cwd)}")
+        if a.resume_flag:
+            out.append(f"resume_flag = {_toml_str(a.resume_flag)}")
+    elif space.kind == "generic" and space.generic:
+        out += ["", "[generic]", f"tmp_dir = {_toml_str(space.generic.tmp_dir)}"]
+    if space.verify and space.verify.command:
+        v = space.verify
+        out += [
+            "",
+            "[verify]",
+            f"command = {_toml_str(v.command)}",
+            f"trigger = {_toml_str(v.trigger)}",
+            f"timeout = {v.timeout}",
+        ]
+    return "\n".join(out) + "\n"
+
+
+def _space_from_toml(data: dict[str, Any], space_id: str) -> Space:
+    return Space(
+        id=space_id,
+        name=data.get("name", space_id),
+        kind=data.get("kind", "generic"),
+        profile=data.get("profile", "default"),
+        opened=bool(data.get("opened", True)),
+        pinned=bool(data.get("pinned", False)),
+        created_at=data.get("created_at", ""),
+        last_opened_at=data.get("last_opened_at", ""),
+        keep_sessions=int(data.get("keep_sessions", 50)),
+        generic=GenericConfig.from_dict(data["generic"]) if data.get("generic") else None,
+        agent=AgentBinding.from_dict(data["agent"]) if data.get("agent") else None,
+        verify=VerifyConfig.from_dict(data["verify"]) if data.get("verify") else None,
+    )
+
+
+def _user_text(msg: dict) -> str:
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        return "".join(parts).strip()
+    return ""
+
+
+class SpaceStore:
+    """空间与会话的读写入口。"""
+
+    def __init__(self, home: Path | None = None):
+        self.home = Path(home or home_dir())
+        self.spaces_dir = self.home / SPACES_DIRNAME
+
+    # ----- 路径 -----
+    def _space_dir(self, space_id: str) -> Path:
+        return self.spaces_dir / space_id
+
+    def _space_toml(self, space_id: str) -> Path:
+        return self._space_dir(space_id) / "space.toml"
+
+    def _sessions_dir(self, space_id: str) -> Path:
+        return self._space_dir(space_id) / "sessions"
+
+    def _session_jsonl(self, space_id: str, session_id: str) -> Path:
+        return self._sessions_dir(space_id) / f"{session_id}.jsonl"
+
+    def _session_meta(self, space_id: str, session_id: str) -> Path:
+        return self._sessions_dir(space_id) / f"{session_id}.meta.json"
+
+    # ----- 空间 -----
+    def list_spaces(self, opened_only: bool = True) -> list[Space]:
+        if not self.spaces_dir.exists():
+            return []
+        spaces: list[Space] = []
+        for d in sorted(self.spaces_dir.iterdir()):
+            if not d.is_dir():
+                continue
+            toml = d / "space.toml"
+            if not toml.exists():
+                continue
+            try:
+                with toml.open("rb") as f:
+                    data = tomllib.load(f)
+            except tomllib.TOMLDecodeError:
+                continue
+            sp = _space_from_toml(data, d.name)
+            if opened_only and not sp.opened:
+                continue
+            spaces.append(sp)
+        spaces.sort(key=lambda s: s.last_opened_at or "", reverse=True)
+        return spaces
+
+    def get_space(self, space_id: str) -> Space | None:
+        toml = self._space_toml(space_id)
+        if not toml.exists():
+            return None
+        with toml.open("rb") as f:
+            data = tomllib.load(f)
+        return _space_from_toml(data, space_id)
+
+    def create_space(self, spec: SpaceSpec) -> Space:
+        space_id = new_id("sp")
+        sd = self._space_dir(space_id)
+        sd.mkdir(parents=True, exist_ok=True)
+        space = Space.from_spec(spec, space_id)
+        if space.kind == "generic":
+            (sd / "tmp").mkdir(exist_ok=True)
+        self._sessions_dir(space_id).mkdir(exist_ok=True)
+        self._write_space_toml(space)
+        return space
+
+    def _write_space_toml(self, space: Space) -> None:
+        self._space_toml(space.id).write_text(_space_to_toml(space), encoding="utf-8")
+
+    def update_space(self, space_id: str, **fields: Any) -> Space:
+        space = self.get_space(space_id)
+        if space is None:
+            raise KeyError(f"空间不存在: {space_id}")
+        allowed = {"name", "profile", "opened", "pinned", "last_opened_at", "keep_sessions"}
+        for k, v in fields.items():
+            if k not in allowed:
+                raise ValueError(f"不能修改字段 {k}")
+            setattr(space, k, v)
+        self._write_space_toml(space)
+        return space
+
+    def close_space(self, space_id: str) -> None:
+        """只从“打开的空间”列表移除，不删数据。"""
+        self.update_space(space_id, opened=False)
+
+    def delete_space(self, space_id: str) -> None:
+        import shutil
+
+        sd = self._space_dir(space_id)
+        if sd.exists():
+            shutil.rmtree(sd)
+
+    # ----- 会话 -----
+    def list_sessions(
+        self, space_id: str, limit: int = 5, include_pinned: bool = True
+    ) -> list[SessionMeta]:
+        """最近 N 个 session。pin 和 running 永远在列表里、不占 N 个名额。"""
+        sdir = self._sessions_dir(space_id)
+        if not sdir.exists():
+            return []
+        metas: list[SessionMeta] = []
+        for m in sorted(sdir.glob("*.meta.json")):
+            data = json.loads(m.read_text(encoding="utf-8"))
+            metas.append(SessionMeta.from_dict(data))
+
+        if include_pinned:
+            pinned = [s for s in metas if s.pinned]
+            non_pinned = [s for s in metas if not s.pinned]
+        else:
+            pinned = []
+            non_pinned = list(metas)
+
+        running = [s for s in non_pinned if s.status == "running"]
+        others = sorted(
+            (s for s in non_pinned if s.status != "running"),
+            key=lambda s: s.updated_at or "",
+            reverse=True,
+        )
+        return list(pinned) + running + others[:limit]
+
+    def create_session(self, space_id: str, agent: str | None = None) -> SessionMeta:
+        space = self.get_space(space_id)
+        if space is None:
+            raise KeyError(f"空间不存在: {space_id}")
+        session_id = new_id("se")
+        now = _now()
+        meta = SessionMeta(
+            id=session_id,
+            space_id=space_id,
+            status="idle",
+            agent=agent or (space.agent.name if space.agent else "simpleagent"),
+            created_at=now,
+            updated_at=now,
+        )
+        self._sessions_dir(space_id).mkdir(parents=True, exist_ok=True)
+        self._write_meta(space_id, meta)
+        self._session_jsonl(space_id, session_id).write_text("", encoding="utf-8")
+        return meta
+
+    def get_session_meta(self, space_id: str, session_id: str) -> SessionMeta | None:
+        m = self._session_meta(space_id, session_id)
+        if not m.exists():
+            return None
+        return SessionMeta.from_dict(json.loads(m.read_text(encoding="utf-8")))
+
+    def find_session_space(self, session_id: str) -> str | None:
+        """跨空间定位某个 session 属于哪个空间（session id 全局唯一）。
+
+        用于按 session id 直接访问（GET /api/sessions/{id}）而不必带上 space id。
+        """
+        if not self.spaces_dir.exists():
+            return None
+        for d in self.spaces_dir.iterdir():
+            if not d.is_dir():
+                continue
+            if (d / "sessions" / f"{session_id}.meta.json").exists():
+                return d.name
+        return None
+
+    def _write_meta(self, space_id: str, meta: SessionMeta) -> None:
+        self._session_meta(space_id, meta.id).write_text(
+            json.dumps(meta.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def load_session(self, space_id: str, session_id: str):
+        """重建 Session（消息历史 + 用量）。依赖 agent/session.py。"""
+        from simpleagent.agent.session import Session
+        from simpleagent.events import Usage
+
+        jsonl = self._session_jsonl(space_id, session_id)
+        messages: list[dict] = []
+        if jsonl.exists():
+            for line in jsonl.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    messages.append(json.loads(line))
+        meta = self.get_session_meta(space_id, session_id)
+        usage = Usage(
+            **{
+                k: (meta.usage.get(k, 0) if meta else 0)
+                for k in ("prompt_tokens", "completion_tokens", "cached_tokens", "reasoning_tokens")
+            }
+        )
+        return Session(id=session_id, messages=messages, usage=usage, requests=len(messages))
+
+    def append_message(self, space_id: str, session_id: str, msg: dict) -> None:
+        jsonl = self._session_jsonl(space_id, session_id)
+        jsonl.parent.mkdir(parents=True, exist_ok=True)
+        with jsonl.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        meta = self.get_session_meta(space_id, session_id)
+        if meta is None:
+            return
+        meta.updated_at = _now()
+        # 默认标题取第一条用户消息截断 40 字
+        if meta.title == "新会话" and msg.get("role") == "user":
+            text = _user_text(msg)
+            if text:
+                meta.title = text[:40]
+        self._write_meta(space_id, meta)
+
+    def update_meta(self, space_id: str, session_id: str, **fields: Any) -> SessionMeta:
+        meta = self.get_session_meta(space_id, session_id)
+        if meta is None:
+            raise KeyError(f"会话不存在: {session_id}")
+        allowed = {
+            "title",
+            "status",
+            "pinned",
+            "agent",
+            "agent_session_id",
+            "usage",
+            "verification",
+        }
+        for k, v in fields.items():
+            if k not in allowed:
+                raise ValueError(f"不能修改字段 {k}")
+            setattr(meta, k, v)
+        meta.updated_at = _now()
+        self._write_meta(space_id, meta)
+        return meta

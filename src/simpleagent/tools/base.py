@@ -14,9 +14,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, get_type_hints
+from typing import TYPE_CHECKING, Any, get_type_hints
 
 from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from simpleagent.serve.approval import Approver
 
 ToolFn = Callable[[Any, "ToolContext"], Awaitable[str]]
 
@@ -33,6 +36,10 @@ class ToolContext:
     # 启动子进程时要去掉的环境变量（配置里各 profile 的 api_key_env），
     # 否则用户 export 的 key 会被 bash 继承，`env` 一下就进了模型上下文和 trace
     hidden_env: frozenset[str] = field(default_factory=frozenset)
+    # 当前会话 id（持久化 / 事件路由用）；默认 None（无会话上下文时）
+    session_id: str | None = None
+    # 审批器：写操作（readonly=False）执行前先问它。默认 None 表示不审批（沿用旧行为）
+    approver: Approver | None = None
 
     def resolve(self, path: str) -> Path:
         """相对路径基于 ctx.cwd 解析，不用进程的当前目录（daemon 里两者不一样）。"""

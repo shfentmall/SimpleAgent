@@ -1,0 +1,87 @@
+"""事件 → 帧 的序列化，以及服务端自己发出的补充帧。
+
+核心 loop 产出的 Event（TextDelta / MessageDone / ToolCallStart / ToolResult / ...）在这里
+转成总线上的 Frame；另外服务端在「会话状态变化」「出错」「等待审批」「验证完成」时也会发帧，
+这些帧由本模块构造（type 分别为 status / error / approval_request / verification）。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from simpleagent.events import (
+    Event,
+    MaxStepsReached,
+    MessageDone,
+    ReasoningDelta,
+    TextDelta,
+    ToolCallStart,
+    ToolResult,
+)
+from simpleagent.serve.bus import Frame
+
+
+def event_to_frame(event: Event, session_id: str) -> Frame:
+    """把核心事件映射成总线帧。类型名见 docs/design/client-ui.md 6.1。"""
+    if isinstance(event, TextDelta):
+        return Frame(session_id, "text_delta", {"text": event.text})
+    if isinstance(event, ReasoningDelta):
+        return Frame(session_id, "reasoning_delta", {"text": event.text})
+    if isinstance(event, MessageDone):
+        payload: dict[str, Any] = {
+            "message": event.message,
+            "finish_reason": event.finish_reason,
+        }
+        if event.usage is not None:
+            payload["usage"] = {
+                "prompt_tokens": event.usage.prompt_tokens,
+                "completion_tokens": event.usage.completion_tokens,
+                "cached_tokens": event.usage.cached_tokens,
+                "reasoning_tokens": event.usage.reasoning_tokens,
+            }
+        return Frame(session_id, "message_done", payload)
+    if isinstance(event, ToolCallStart):
+        return Frame(
+            session_id,
+            "tool_call_start",
+            {"call_id": event.call_id, "name": event.name, "arguments": event.arguments},
+        )
+    if isinstance(event, ToolResult):
+        return Frame(
+            session_id,
+            "tool_result",
+            {
+                "call_id": event.call_id,
+                "name": event.name,
+                "content": event.content,
+                "is_error": event.is_error,
+            },
+        )
+    if isinstance(event, MaxStepsReached):
+        return Frame(session_id, "max_steps", {"max_steps": event.max_steps})
+    return Frame(session_id, "unknown", {"repr": repr(event)})
+
+
+def status_frame(session_id: str, status: str, extra: dict[str, Any] | None = None) -> Frame:
+    payload: dict[str, Any] = {"status": status}
+    if extra:
+        payload.update(extra)
+    return Frame(session_id, "status", payload)
+
+
+def error_frame(session_id: str, message: str) -> Frame:
+    return Frame(session_id, "error", {"message": message})
+
+
+def approval_request_frame(
+    session_id: str, approval_id: str, tool_name: str, arguments: str
+) -> Frame:
+    return Frame(
+        session_id,
+        "approval_request",
+        {"approval_id": approval_id, "tool_name": tool_name, "arguments": arguments},
+    )
+
+
+def verification_frame(session_id: str, verification: dict[str, Any]) -> Frame:
+    return Frame(session_id, "verification", verification)
