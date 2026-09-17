@@ -38,6 +38,7 @@ SimpleAgent 是一个自用的本地 agent，有两个目标：一是学习 agen
 
 - 内容：功能变化（新增、升级、修复）；`src/` 下按函数/类列出改动；配置与依赖变化，尤其是需要用户手动处理的地方；测试情况
 - 规则和模板见 [docs/changelog/README.md](docs/changelog/README.md)
+- 在 Claude Code 里用子 agent [`changelog-writer`](.claude/agents/changelog-writer.md) 来写：它只负责写记录，主会话检查后再提交推送
 
 ### 2.3 提交与推送
 

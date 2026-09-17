@@ -50,4 +50,5 @@
 
 ## 索引
 
+- [2026-09-17 新增 changelog-writer 子 agent，用于推送前写变更记录](2026-09-17-changelog-writer-agent.md)
 - [2026-09-17 M0 + M1：项目脚手架与流式对话 REPL](2026-09-17-m0-m1-streaming-chat.md)
