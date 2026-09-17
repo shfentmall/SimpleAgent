@@ -1252,34 +1252,46 @@ function openModal() {
   $("f-name").focus();
 }
 
-/* 两个维度各管各的：形态只管工作目录，执行者只管模型那一栏怎么显示。
-   所以先点开向导、再切来切去都不会出现「上次选的东西被悄悄换掉」。 */
-function syncModalFields() {
-  const kind = $("f-kind").value;
-  const executor = $("f-executor").value;
-  const external = executor !== "simpleagent";
-  $("f-cwd-wrap").classList.toggle("hidden", kind !== "agent");
-  $("f-model-hint").classList.toggle("hidden", !external);
-  $("f-perm-wrap").classList.toggle("hidden", !external);
-  $("f-model-label").textContent = external ? "模型" : "模型 profile";
+/* 执行者名单由 /api/meta 给，启动时填一次；之后再打开向导不重填，保留上次的选择。 */
+function fillExecutorOptions() {
+  $("f-executor").innerHTML = state.executors
+    .map((e) => `<option value="${escapeHtml(e.name)}">${escapeHtml(e.label)}</option>`)
+    .join("");
+  fillExecutorDependents();
+}
 
+/* 模型、权限两个下拉的选项取决于执行者，只在执行者变了时重建。
+   形态、权限自己变动时不重建，不然刚选的「全放行」会被悄悄换回默认档。 */
+function fillExecutorDependents() {
+  const executor = $("f-executor").value;
   const sel = $("f-profile");
-  if (external) {
+  if (executor !== "simpleagent") {
     // 外部 CLI 本次只支持「本机默认」：不注入任何 env/args，用它自己的配置
     sel.innerHTML = `<option value="">本机默认（不注入配置）</option>`;
   } else {
-    sel.innerHTML = state.profiles.map((p) => `<option value="${p}">${p}</option>`).join("");
+    sel.innerHTML = state.profiles
+      .map((p) => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join("");
     sel.value = state.defaultProfile || state.profiles[0] || "";
   }
 
   const perm = $("f-permission");
   const info = state.executors.find((e) => e.name === executor);
-  if (external && info && info.permissions.length) {
-    perm.innerHTML = info.permissions
-      .map((p) => `<option value="${p.name}">${p.label}</option>`).join("");
-    perm.value = info.default_permission || info.permissions[0].name;
-  }
-  $("f-perm-hint").classList.toggle("hidden", perm.value !== "full");
+  const perms = (info && info.permissions) || [];
+  perm.innerHTML = perms
+    .map((p) => `<option value="${escapeHtml(p.name)}">${escapeHtml(p.label)}</option>`).join("");
+  if (perms.length) perm.value = info.default_permission || perms[0].name;
+}
+
+/* 两个维度各管各的：形态只管工作目录，执行者只管模型、权限那几栏怎么显示。
+   这里只切显隐和文案，不动下拉的选项，所以切来切去不会把上次选的东西换掉。 */
+function syncModalFields() {
+  const kind = $("f-kind").value;
+  const external = $("f-executor").value !== "simpleagent";
+  $("f-cwd-wrap").classList.toggle("hidden", kind !== "agent");
+  $("f-model-hint").classList.toggle("hidden", !external);
+  $("f-perm-wrap").classList.toggle("hidden", !external);
+  $("f-model-label").textContent = external ? "模型" : "模型 profile";
+  $("f-perm-hint").classList.toggle("hidden", !external || $("f-permission").value !== "full");
 }
 
 async function createSpace() {
@@ -1318,13 +1330,17 @@ async function boot() {
   state.profiles = meta.profiles || [];
   state.defaultProfile = meta.default_profile || state.profiles[0] || "";
   state.executors = meta.executors || [{ name: "simpleagent", label: "内置 SimpleAgent" }];
+  fillExecutorOptions();
   await loadSpaces();
 
   $("btn-new-space").onclick = openModal;
   $("f-cancel").onclick = () => $("modal").classList.add("hidden");
   $("f-create").onclick = createSpace;
   $("f-kind").onchange = syncModalFields;
-  $("f-executor").onchange = syncModalFields;
+  $("f-executor").onchange = () => {
+    fillExecutorDependents();
+    syncModalFields();
+  };
   $("f-permission").onchange = syncModalFields;
   $("btn-send").onclick = send;
   $("btn-new-session").onclick = () => state.spaceId && newSession(state.spaceId);
