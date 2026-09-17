@@ -1,0 +1,171 @@
+# 架构设计
+
+## 选型
+
+| 项 | 选择 | 理由 |
+|---|---|---|
+| 语言 | Python 3.12 + uv | LLM / MCP 生态最全，读源码学习成本低 |
+| 模型接入 | 只接 OpenAI 兼容协议（Chat Completions） | 一套协议覆盖 DeepSeek / GLM / Qwen / Ollama 等，用 `base_url` 切换 |
+| 实现方式 | 从零手写 agent loop，只依赖官方 `openai` SDK | 每个机制都自己写，学习价值最高 |
+| 首要场景 | 个人自动化 | 定时任务、整理本地文件、通过 MCP 接日历/邮件/IM |
+
+## 设计原则
+
+1. **核心 loop 和前端解耦**：`Agent.run()` 返回异步事件流（`AsyncIterator[Event]`）。交互式 REPL、单次命令 `sa run`、定时 daemon 都只是事件流的消费方，所以同一个 agent 既能对话，也能被定时触发。
+2. **内部消息直接用 OpenAI Chat Completions 格式**（dict），不再另造抽象。各家的差异在 profile 的 `quirks` 里处理。
+3. **全程可观测**：每次 LLM 请求的完整请求体和响应都写到 `traces/`，包括失败和中断的请求。这样可以直接看到真实发出去的上下文。
+4. **注册式扩展**：内置工具、MCP 工具、Skills、子 agent 统一注册成 `Tool`；新 feature 用配置开关接入，方便 A/B 对比。
+5. **确定性测试**：`FakeLLM` 按脚本返回响应，不联网也能测 loop、权限、压缩等逻辑。客户端测试用 `httpx2.MockTransport` 模拟 SSE，走真实的 SDK 解析路径。
+6. **全异步**（asyncio + `AsyncOpenAI`）：并行工具调用、MCP stdio、调度器、流式输出都需要。
+7. **依赖尽量少**：运行时只依赖 `openai`、`pydantic`（openai 已依赖）；M4 再引入 `croniter`。CLI 用标准库 `argparse`。
+
+## 整体架构
+
+```
+ ┌──────────────────── 前端（消费事件流）────────────────────┐
+ │  REPL 交互 (sa)    单次 headless (sa run)    定时 daemon (sa daemon) │
+ └────────────────────────────┬─────────────────────────────┘
+                              │ run(session, input) -> AsyncIterator[Event]
+                       ┌──────▼──────┐   hooks
+                       │ Agent Loop  │──────────► trace / 日志 / 通知
+                       └──┬────┬───┬─┘
+         ┌────────────────┘    │   └────────────────┐
+  ┌──────▼───────┐     ┌───────▼──────┐     ┌───────▼────────┐
+  │ Context 管理  │     │  LLM Client  │     │  Tool Runtime  │
+  │ prompt 组装   │     │ OpenAI 兼容   │     │ 解析→权限→执行 │
+  │ 预算/清理/压缩 │     │ 多 profile    │     │ →超时→截断      │
+  └──────┬───────┘     └──────────────┘     └───────┬────────┘
+  ┌──────▼───────┐                        ┌─────────┼─────────┬──────────┐
+  │ Session JSONL │                     内置工具   MCP 工具   Skills   子 agent
+  └──────────────┘
+```
+
+### Agent loop（M2，目标约 150 行）
+
+```python
+async def run(self, session, user_input) -> AsyncIterator[Event]:
+    session.append({"role": "user", "content": user_input})
+    for step in range(self.max_steps):
+        messages = self.context.build(session)  # system prompt + 历史（超预算时压缩）
+        async for ev in self.llm.stream(messages, tools=self.tools.schemas()):
+            yield ev  # TextDelta / ReasoningDelta / MessageDone
+        msg = ev.message  # 流结束时拼好的 assistant 消息
+        session.append(msg)
+        if not msg.get("tool_calls"):
+            yield TurnEnd()
+            return
+        results = await asyncio.gather(*(self.tools.execute(tc, ctx) for tc in msg["tool_calls"]))
+        for r in results:
+            yield ToolResult(r)
+            session.append(r.as_message())
+    yield MaxStepsReached()
+```
+
+要点：
+- 流式 `tool_calls` 按 `index` 分片到达，要自己拼（`StreamAccumulator` 已实现）
+- 模型给出非法 JSON 参数时，把错误作为 tool 结果回给模型自我纠正，不抛异常
+- Ctrl+C 中断时，给还没返回结果的 tool_call 补“已取消”结果，否则下一次请求会被 API 拒绝
+- 工具输出过长：完整内容落盘，只给模型返回开头部分和文件路径
+
+### Tool 抽象（M2）
+
+```python
+class ReadFileArgs(BaseModel):
+    path: str = Field(description="文件绝对路径")
+    offset: int = 0
+    limit: int = 2000
+
+
+@tool(name="read_file", description="...", permission="allow")  # allow / ask / deny
+async def read_file(args: ReadFileArgs, ctx: ToolContext) -> str: ...
+```
+- schema 由 `Args.model_json_schema()` 生成，包装成 `{"type": "function", "function": {...}}`
+- `ToolContext` 带上 cwd、session、approver（审批器）、中断信号
+- 审批器由前端注入：REPL 版询问用户（y / n / always）；headless 版按任务的 `allowed_tools` 白名单判断，需要 ask 的一律拒绝，并把拒绝原因回给模型
+
+### LLM Client 与配置（M1，已实现）
+
+配置文件 `~/.simpleagent/config.toml`，由 `sa init` 生成，模板见 [`config.example.toml`](../src/simpleagent/config.example.toml)。每个 profile 包含：
+
+- `base_url` / `model` / `api_key_env`（只写环境变量名，不写 key 本身）。key 的值先查环境变量，再查 `~/.simpleagent/.env`。`.env` 只读进内存、不写入 `os.environ`，所以工具启动的子进程不会继承 key
+- `extra_body`：厂商私有参数，原样合并进请求体，用于试验新 feature（比如思考开关）
+- `quirks`：
+  - `reasoning_field`：思考内容所在字段（`reasoning_content` / `reasoning`）
+  - `reasoning_echo`：历史里的思考内容是否回传（`none` / `current_turn` / `all`）
+  - `stream_usage`：是否发送 `stream_options.include_usage`
+  - `parallel_tool_calls`：是否允许并行工具调用
+
+实现细节：
+- 会话历史里的思考内容统一存到 `reasoning_content` 字段，发请求前由 `prepare_messages` 按 profile 改名或去掉
+- usage 同时兼容 OpenAI 的 `prompt_tokens_details.cached_tokens` 和 DeepSeek 的 `prompt_cache_hit_tokens`
+- `base_url` 是回环地址时不读代理环境变量，避免本机代理把 Ollama 的请求转走
+- 重试直接用 SDK 自带的 `max_retries`；上下文超长错误在 M6 转去做压缩
+
+### 数据目录
+
+`~/.simpleagent/`（可用 `SIMPLEAGENT_HOME` 覆盖）：
+
+| 路径 | 用途 | 引入 |
+|---|---|---|
+| `config.toml` | 配置 | M1 |
+| `traces/<session>/<n>.json` | 每次 LLM 请求/响应 | M1 |
+| `sessions/*.jsonl` | 会话持久化 | M3 |
+| `schedules.toml`、`logs/` | 定时任务和运行日志 | M4 |
+| `tool_outputs/` | 过长工具输出的完整内容 | M2 |
+| `memory/`、`skills/` | 长期记忆、技能 | M7 |
+
+## 长期形态：个人 AI 工作台（具体内容待设计）
+
+目标是一个**桌面客户端**形式的个人 AI 工作台。业务逻辑全部在自己写的 Python 代码里；客户端只负责界面和消息通知，不承载逻辑，所以客户端用什么技术栈不影响核心。
+
+```
+  桌面客户端（工作台界面、系统通知）     终端 REPL      IM / webhook
+              │                          │               ▲
+              └──────── 本地 API（WebSocket）──┘               │
+                            │                               │
+  ┌─────────────────────── Python 后台引擎 ────────────────────────┐
+  │  会话管理 · 定时调度 · 事件总线 · 通知路由（客户端在线推客户端，否则走系统通知/IM）│
+  └────────────────────────────┬───────────────────────────────┘
+                               │
+                     Agent Loop / 工具 / MCP / 外部 agent
+```
+
+- M4 的 `sa daemon` 往后演进成这个常驻的后台引擎：调度任务、交互会话、通知都在同一个进程里
+- 后台任务需要审批时，客户端在线就推给客户端等待确认（带超时），不在线就按无人值守策略处理
+- 外部 agent（Claude Code / OpenCode）作为工具接入：先用无头 CLI（`claude -p --output-format stream-json`、`opencode run --format json`），再考虑 ACP 协议
+
+### M2 起就要守住的接口约定
+
+为了让终端、桌面客户端、定时任务共用同一个核心：
+
+1. **状态归 `Agent` / `Session`**：消息历史、用量、当前模型不放在任何界面层（M1 暂时在 `Repl` 里，M2 迁出）
+2. **审批器是异步接口**：`async def approve(...)`，终端、客户端、无人值守各自实现
+3. **工具能上报进度**：`ToolContext.emit(event)`，长时间运行的工具（比如外部 agent）靠它流式反馈
+4. **取消是显式调用**：`agent.cancel()`；Ctrl+C、客户端的停止按钮都只是调用方
+5. **事件可序列化**：事件带 `type` 字段、能转 JSON，方便通过本地 API 推给客户端
+
+## 代码结构
+
+✅ 表示已实现，其余按里程碑逐步加入。
+
+```
+src/simpleagent/
+  cli.py                  ✅ argparse 入口：sa / sa init（后续加 run / daemon / schedule / sessions）
+  config.py               ✅ TOML + 环境变量 → pydantic 配置模型
+  config.example.toml     ✅ sa init 使用的配置模板
+  events.py               ✅ 事件类型（后续加 hooks 分发）
+  trace.py                ✅ 请求/响应全量落盘
+  llm/client.py           ✅ 流式调用、chunk 拼接、思考内容、quirks
+  llm/fake.py             ✅ 测试用的脚本化模型
+  agent/prompt.py         ✅ system prompt 组装（后续加 AGENTS.md、记忆、skills 列表）
+  agent/loop.py              Agent loop（M2）
+  agent/session.py           JSONL 持久化、恢复会话（M3）
+  agent/context.py           token 预算、结果清理、压缩（M6）
+  tools/                     Tool 抽象、注册表、内置工具（M2 起）
+  permissions.py             规则匹配、工作目录边界（M3）
+  scheduler/                 定时 daemon（M4）
+  mcp/client.py              stdio JSON-RPC MCP 客户端（M5）
+  skills.py                  SKILL.md 发现与按需加载（M7）
+  ui/repl.py              ✅ 交互式 REPL
+tests/                    ✅ 各模块对应测试
+```

@@ -1,0 +1,29 @@
+# 路线图
+
+排序思路：先把核心机制（loop、工具、权限、会话）打扎实，然后**尽早**做出“无人值守定时跑任务”，再逐步补 MCP、上下文工程、记忆、Skills、子 agent。
+
+每个里程碑的交付物 = 能跑的代码 + 测试 + `docs/notes/` 下一篇学习笔记。
+
+| 状态 | 里程碑 | 内容 | 学习重点 |
+|---|---|---|---|
+| ✅ | **M0 脚手架** | uv 项目、配置加载、trace 落盘、FakeLLM、pytest + ruff | 项目骨架、可测试性 |
+| ✅ | **M1 流式对话** | `sa` REPL；OpenAI 兼容流式客户端；`/model` 切换 profile；思考内容显示；usage 统计；Ctrl+C 中断 | Chat Completions 协议、SSE、各家兼容差异 |
+| | **M2 工具调用 + Agent Loop** | Tool 抽象和注册表；`read_file / write_file / edit_file / list_dir / glob / grep / bash`（带超时）；并行执行；错误回传；输出截断；中断时补结果；`max_steps` | Function calling、ReAct 循环、错误自愈 |
+| | **M3 权限 + 会话 + Headless** | allow/ask/deny 规则、工作目录边界、危险命令识别；JSONL 会话和 `sa --resume`；`sa run "..."` 单次无人值守执行 | 人在回路、状态持久化、无人值守的安全边界 |
+| | **M4 个人自动化 v1** ⭐ | `sa daemon`（croniter）；`schedules.toml` 定义任务（prompt / profile / allowed_tools / notify）；`web_fetch`、`notify`（macOS 通知 + 飞书/Telegram webhook）、`schedule_add/list/remove` 工具；运行日志；可选 launchd 常驻 | 事件驱动 agent、无人值守的权限策略 |
+| | **M5 MCP 客户端** | 手写 stdio JSON-RPC（`initialize` → `tools/list` → `tools/call`）；工具名 `mcp__<server>__<tool>`；子进程生命周期管理；先接 `@modelcontextprotocol/server-filesystem` 验证，再接日历/邮件/IM；远程 HTTP 和 OAuth 以后引入官方 `mcp` SDK | MCP 协议、工具生态接入 |
+| | **M6 上下文工程** | token 预算（上次 usage + 字符估算）；三级策略：写入时截断 → 清理旧 tool 结果 → LLM 摘要压缩（不拆开 tool_call 和它的结果）；`/compact`；保持 system prompt 和工具列表稳定以命中前缀缓存 | 上下文窗口管理、缓存友好的 prompt 设计 |
+| | **M7 记忆 + Skills + 项目指令** | `memory/` 文件记忆 + `MEMORY.md` 索引注入 prompt，配 memory 工具；Skills 只把 frontmatter 描述放进 prompt，正文由 `load_skill` 按需加载；自动注入 cwd 下的 `AGENTS.md` | 长期记忆、渐进式披露 |
+| | **M8 子 agent + 外部 agent + Hooks** | `task` 工具启动子 agent（独立上下文、受限工具集、只返回结论）；Claude Code / OpenCode 包装成工具（无头 CLI 流式输出，保存 session id 以便追问）；`todo` 工具；pre/post tool hooks（外部命令） | 上下文隔离、任务分解、多 agent 协作 |
+| | **M9 实验区（持续）** | `evals/`：真实任务加校验脚本，对比不同模型和 feature 开关；新 feature 通过开关接入，结论写进 notes | 用评测驱动迭代 |
+| | **W 个人 AI 工作台** | 桌面客户端 + 常驻后台引擎（本地 API、通知路由、客户端审批）。功能清单和客户端技术栈**待设计** | 客户端/服务端分离、事件推送 |
+
+M4 完成后就是一个每天能真正用上的自动化 agent；M5–M8 在此基础上逐步增强。工作台的前置条件是 M2 的接口约定（见 [ARCHITECTURE.md](ARCHITECTURE.md#m2-起就要守住的接口约定)）和 M4 的后台常驻进程，具体时间点等设计完再定。
+
+## 各里程碑验证方式
+
+- **M2**：用 FakeLLM 测多轮 tool_calls、并行调用、非法 JSON、中断补结果；用真实模型实测“统计当前目录下 .py 文件的总行数”
+- **M3**：拒绝权限后模型能收到拒绝原因；`sa --resume` 恢复后能接着聊；`sa run` 碰到需要 ask 的工具自动拒绝
+- **M4**：添加一个每分钟触发的任务，启动 `sa daemon`，确认收到 macOS 通知并生成运行日志
+- **M5**：接上 filesystem MCP server，模型能调用 `mcp__filesystem__*` 工具
+- **M6**：用 FakeLLM 构造超出预算的历史，断言压缩后 tool_call 和结果配对完整、总 token 数在预算内

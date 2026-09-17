@@ -1,0 +1,56 @@
+# SimpleAgent 配置文件
+# 位置：~/.simpleagent/config.toml（可用环境变量 SIMPLEAGENT_HOME 改数据目录）
+# api_key_env 只写环境变量名，不要把 key 本身写进来。
+# key 的值二选一：export 成环境变量，或写到同目录的 .env 文件（每行 NAME=VALUE，建议 chmod 600）：
+#   DEEPSEEK_API_KEY=sk-...
+# 模型 ID 会随厂商更新变化，以各家官方文档为准。
+
+default_profile = "deepseek"
+show_reasoning = true
+# system_prompt = "你是 SimpleAgent，一个运行在用户本地电脑上的个人助手。回答简洁、准确。"
+
+[trace]
+enabled = true      # 每次请求/响应写到 ~/.simpleagent/traces/<session>/
+raw_chunks = false  # 想研究 SSE 流式协议时打开
+
+# ---------------------------------------------------------------- DeepSeek
+[profiles.deepseek]
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-flash"  # 可用模型：GET https://api.deepseek.com/models
+context_window = 128000
+
+[profiles.deepseek.quirks]
+reasoning_field = "reasoning_content"
+# 思考模式下的工具调用需要回传本轮的 reasoning_content（以官方文档为准）
+reasoning_echo = "current_turn"
+# 前缀缓存命中数在 usage.prompt_cache_hit_tokens，客户端已兼容
+
+# ---------------------------------------------------------------- 智谱 GLM
+[profiles.glm]
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+api_key_env = "ZHIPU_API_KEY"
+model = "glm-4.6"  # 换成官方最新模型 ID
+context_window = 128000
+
+[profiles.glm.extra_body]
+thinking = { type = "enabled" }  # 厂商私有参数：思考开关
+
+# ---------------------------------------------------------------- 通义千问（DashScope 兼容模式）
+[profiles.qwen]
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key_env = "DASHSCOPE_API_KEY"
+model = "qwen-plus"
+context_window = 128000
+
+[profiles.qwen.extra_body]
+enable_thinking = true
+
+# ---------------------------------------------------------------- 本地 Ollama
+[profiles.local]
+base_url = "http://localhost:11434/v1"
+model = "qwen3:8b"
+context_window = 32000
+
+[profiles.local.quirks]
+reasoning_field = "reasoning"  # 新版 Ollama 的思考内容字段名

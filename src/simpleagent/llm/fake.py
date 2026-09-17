@@ -1,0 +1,92 @@
+"""FakeLLM：按脚本返回响应的假模型，用于不联网的确定性测试。
+
+脚本里每一项对应一次 stream() 调用，可以是：
+- str：纯文本回复
+- dict：{"content", "reasoning", "tool_calls": [{"id", "name", "arguments"}], "usage", "delay"}
+- Exception：调用时抛出（模拟 API 错误）
+
+响应会被切成 chunk，再经过和真实客户端相同的 StreamAccumulator 拼接。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+from collections.abc import AsyncIterator
+from typing import Any
+
+from simpleagent.config import Profile
+from simpleagent.events import Event, MessageDone, Usage
+from simpleagent.llm.client import REASONING_KEY, StreamAccumulator
+
+Script = str | dict[str, Any] | Exception
+
+
+def _pieces(text: str, size: int) -> list[str]:
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+def script_to_chunks(response: dict[str, Any], chunk_size: int = 4) -> list[dict[str, Any]]:
+    def chunk(delta: dict[str, Any], finish_reason: str | None = None) -> dict[str, Any]:
+        choice = {"index": 0, "delta": delta, "finish_reason": finish_reason}
+        return {"choices": [choice]}
+
+    chunks = [chunk({REASONING_KEY: p}) for p in _pieces(response.get("reasoning", ""), chunk_size)]
+    chunks += [chunk({"content": p}) for p in _pieces(response.get("content", ""), chunk_size)]
+    tool_calls = response.get("tool_calls") or []
+    for index, call in enumerate(tool_calls):
+        arguments = call.get("arguments", {})
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        head = {"index": index, "id": call.get("id", f"call_{index}"), "type": "function"}
+        chunks.append(chunk({"tool_calls": [{**head, "function": {"name": call["name"]}}]}))
+        for piece in _pieces(arguments, chunk_size):
+            delta = {"index": index, "function": {"arguments": piece}}
+            chunks.append(chunk({"tool_calls": [delta]}))
+    chunks.append(chunk({}, "tool_calls" if tool_calls else "stop"))
+    if "usage" in response:
+        chunks.append({"choices": [], "usage": response["usage"]})
+    return chunks
+
+
+class FakeLLM:
+    def __init__(
+        self,
+        responses: list[Script],
+        name: str = "fake",
+        profile: Profile | None = None,
+        chunk_size: int = 4,
+    ):
+        self.name = name
+        self.profile = profile or Profile(base_url="http://fake.invalid/v1", model="fake-model")
+        self.responses = list(responses)
+        self.chunk_size = chunk_size
+        self.requests: list[dict[str, Any]] = []  # 每次调用收到的 messages 和 tools
+        self.closed = False
+
+    async def stream(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None
+    ) -> AsyncIterator[Event]:
+        self.requests.append({"messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools)})
+        if not self.responses:
+            raise AssertionError("FakeLLM 的脚本已经用完")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        if isinstance(response, str):
+            response = {"content": response}
+
+        accumulator = StreamAccumulator(REASONING_KEY)
+        for chunk in script_to_chunks(response, self.chunk_size):
+            await asyncio.sleep(response.get("delay", 0))
+            for event in accumulator.feed(chunk):
+                yield event
+        yield MessageDone(
+            message=accumulator.message(),
+            finish_reason=accumulator.finish_reason,
+            usage=Usage.from_dict(accumulator.usage) if accumulator.usage else None,
+        )
+
+    async def close(self) -> None:
+        self.closed = True
