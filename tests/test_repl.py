@@ -148,6 +148,14 @@ async def test_cancel_keeps_partial_reply(config: Config):
     assert len(h.repl.session.messages) == 2
 
 
+async def test_tools_command_lists_builtin_tools(config: Config):
+    h = Harness(config, {"a": ["ok"]})
+    assert await h.repl.handle("/tools")
+    for name in ("list_dir", "read_file", "write_file", "edit_file", "glob", "grep", "bash"):
+        assert name in h.output
+    assert "读取文本文件内容" in h.output  # 描述也列出来
+
+
 async def test_commands(config: Config):
     h = Harness(config, {"a": ["ok"]})
     await h.repl.handle("hi")
@@ -228,3 +236,10 @@ async def test_max_steps_message(config: Config, tmp_path, monkeypatch):
     h = Harness(config, {"a": [{"tool_calls": [{"name": "list_dir", "arguments": {}}]}]})
     await h.repl.handle("看看")
     assert "[达到 max_steps=1，本轮停止" in h.output
+
+
+async def test_repl_hides_api_key_env_from_tools(config: Config):
+    config.profiles["a"].api_key_env = "SA_TEST_KEY_A"
+    config.profiles["b"].api_key_env = "SA_TEST_KEY_B"
+    h = Harness(config, {})
+    assert h.repl.agent.hidden_env == frozenset({"SA_TEST_KEY_A", "SA_TEST_KEY_B"})

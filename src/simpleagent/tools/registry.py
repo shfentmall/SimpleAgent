@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
 from pydantic import ValidationError
 
 from simpleagent.events import ToolResult
 from simpleagent.tools.base import Tool, ToolContext, ToolError
+from simpleagent.tools.output import (
+    DEFAULT_MAX_CHARS,
+    DEFAULT_MAX_LINES,
+    truncate,
+)
 
 
 def format_validation_error(error: ValidationError) -> str:
@@ -21,10 +27,17 @@ def format_validation_error(error: ValidationError) -> str:
 
 
 class ToolRegistry:
-    def __init__(self, tools: Iterable[Tool] = ()) -> None:
+    def __init__(
+        self,
+        tools: Iterable[Tool] = (),
+        max_output_chars: int = DEFAULT_MAX_CHARS,
+        max_output_lines: int = DEFAULT_MAX_LINES,
+    ) -> None:
         self._tools: dict[str, Tool] = {}
         for item in tools:
             self.register(item)
+        self.max_output_chars = max_output_chars
+        self.max_output_lines = max_output_lines
 
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
@@ -34,6 +47,11 @@ class ToolRegistry:
     def schemas(self) -> list[dict[str, Any]]:
         # 按注册顺序输出：工具列表在会话内保持不变，请求前缀才能命中缓存
         return [item.schema() for item in self._tools.values()]
+
+    def is_readonly(self, name: str) -> bool:
+        """未知工具当只读处理：它只会得到一条错误结果，不会有副作用。"""
+        tool = self._tools.get(name)
+        return True if tool is None else tool.readonly
 
     async def execute(self, tool_call: dict[str, Any], ctx: ToolContext) -> ToolResult:
         """执行一个 tool_call。任何失败都转成 is_error 的结果回给模型，不抛异常。
@@ -67,4 +85,32 @@ class ToolRegistry:
             return error(str(e))
         except Exception as e:  # 工具自身的 bug 也回给模型，不让整个 loop 崩掉
             return error(f"工具执行异常 {type(e).__name__}: {e}")
+        if tool.truncate_output:
+            content = self.trim(content, name, ctx)
         return ToolResult(call_id, name, content)
+
+    async def execute_many(
+        self, tool_calls: list[dict[str, Any]], ctx: ToolContext
+    ) -> AsyncIterator[list[ToolResult]]:
+        """执行同一条消息里的多个 tool_call，按 tool_calls 的顺序分批产出结果。
+
+        全是只读工具就并行（省时间），所有结果作为一批产出；只要有一个写操作就按原顺序
+        逐个执行，每执行完一个就产出一批——模型常常“先读 A 再写 A”，并行的话可能读到
+        旧内容，或者两个写互相覆盖。逐个产出是为了中途被中断时，已经执行完的写操作
+        能如实记进历史，而不是被当成“没有结果”，让模型重做一遍。
+        """
+        names = [(call.get("function") or {}).get("name") or "" for call in tool_calls]
+        if all(self.is_readonly(name) for name in names):
+            yield list(await asyncio.gather(*(self.execute(call, ctx) for call in tool_calls)))
+            return
+        for call in tool_calls:
+            yield [await self.execute(call, ctx)]
+
+    def trim(self, content: str, name: str, ctx: ToolContext) -> str:
+        """过长的输出只留开头，完整内容落盘。"""
+        return truncate(
+            content,
+            self.max_output_chars,
+            self.max_output_lines,
+            save=lambda text: ctx.save_output(text, name),
+        )

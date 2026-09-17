@@ -14,6 +14,11 @@ show_reasoning = true
 enabled = true      # 每次请求/响应写到 ~/.simpleagent/traces/<session>/
 raw_chunks = false  # 想研究 SSE 流式协议时打开
 
+[tool_output]
+max_chars = 30000   # 工具结果回给模型的字符上限，超出只留开头
+max_lines = 500     # 行数上限（两个上限都要满足）；完整内容存 ~/.simpleagent/tool_outputs/，保留 7 天
+# read_file 自己分页（约 3 万字符或 limit 行），不受这里限制
+
 # ---------------------------------------------------------------- DeepSeek
 [profiles.deepseek]
 base_url = "https://api.deepseek.com"

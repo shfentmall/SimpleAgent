@@ -6,9 +6,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import os
+import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, get_type_hints
 
@@ -16,16 +20,56 @@ from pydantic import BaseModel
 
 ToolFn = Callable[[Any, "ToolContext"], Awaitable[str]]
 
+OUTPUT_RETENTION_SECONDS = 7 * 24 * 3600  # 落盘的工具输出保留 7 天，每次落盘时顺手清理
+
 
 @dataclass
 class ToolContext:
     """工具执行时拿到的环境。后续加入审批器（M3）、进度上报、取消信号。"""
 
     cwd: Path
+    # 过长输出落盘的目录；None 表示不落盘（截断时模型只能看到开头）
+    output_dir: Path | None = None
+    # 启动子进程时要去掉的环境变量（配置里各 profile 的 api_key_env），
+    # 否则用户 export 的 key 会被 bash 继承，`env` 一下就进了模型上下文和 trace
+    hidden_env: frozenset[str] = field(default_factory=frozenset)
 
     def resolve(self, path: str) -> Path:
         """相对路径基于 ctx.cwd 解析，不用进程的当前目录（daemon 里两者不一样）。"""
         return (self.cwd / Path(path).expanduser()).resolve()
+
+    def subprocess_env(self) -> dict[str, str]:
+        """子进程用的环境变量：当前进程的环境去掉 hidden_env。"""
+        return {name: value for name, value in os.environ.items() if name not in self.hidden_env}
+
+    def save_output(self, content: str, prefix: str = "output") -> Path | None:
+        """把完整输出写到 <output_dir>/<prefix>-<时间>-<摘要>.txt，返回路径。
+
+        写失败返回 None：落盘只是兜底，不能让工具调用失败。
+        """
+        if self.output_dir is None:
+            return None
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:8]
+        path = self.output_dir / f"{prefix}-{stamp}-{digest}.txt"
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except OSError:
+            return None
+        self._prune_outputs(keep=path)
+        return path
+
+    def _prune_outputs(self, keep: Path) -> None:
+        """删掉超过保留期的落盘输出，免得目录无限增长；清理失败不影响本次调用。"""
+        assert self.output_dir is not None
+        deadline = time.time() - OUTPUT_RETENTION_SECONDS
+        try:
+            for old in self.output_dir.glob("*.txt"):
+                if old != keep and old.stat().st_mtime < deadline:
+                    old.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class ToolError(Exception):
@@ -59,6 +103,11 @@ class Tool:
     description: str
     args_model: type[BaseModel]
     fn: ToolFn
+    # 只读工具（不改动文件系统、不产生副作用）可以并行执行；
+    # 含写操作时同一批调用要按原顺序依次执行，避免互相覆盖。M3 会再加 permission。
+    readonly: bool = True
+    # 是否由注册表统一截断过长输出；自己会分页的工具（read_file）设成 False
+    truncate_output: bool = True
 
     def schema(self) -> dict[str, Any]:
         """请求体 tools 字段里的一项（OpenAI function calling 格式）。"""
@@ -72,10 +121,14 @@ class Tool:
         }
 
 
-def tool(name: str, description: str) -> Callable[[ToolFn], Tool]:
+def tool(
+    name: str, description: str, *, readonly: bool = True, truncate_output: bool = True
+) -> Callable[[ToolFn], Tool]:
     """把 `async def fn(args: SomeArgs, ctx: ToolContext) -> str` 包装成 Tool。
 
-    参数模型从第一个参数的类型注解推出。
+    参数模型从第一个参数的类型注解推出。readonly=False 表示这个工具会改动文件或
+    执行命令（write_file / edit_file / bash）；truncate_output=False 表示工具自己控制
+    输出长度，注册表不再截断。
     """
 
     def decorate(fn: ToolFn) -> Tool:
@@ -85,6 +138,6 @@ def tool(name: str, description: str) -> Callable[[ToolFn], Tool]:
         args_model = get_type_hints(fn).get(params[0]) if params else None
         if not (isinstance(args_model, type) and issubclass(args_model, BaseModel)):
             raise TypeError(f"工具 {name} 的第一个参数必须标注为 pydantic BaseModel 子类")
-        return Tool(name, description, args_model, fn)
+        return Tool(name, description, args_model, fn, readonly, truncate_output)
 
     return decorate

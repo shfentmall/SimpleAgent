@@ -13,25 +13,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from simpleagent.tools.base import ToolContext, ToolError, tool
-
-# 列出但不展开：通常体积很大，对了解目录结构没有帮助
-IGNORED_DIRS = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        "node_modules",
-        "__pycache__",
-        ".venv",
-        "venv",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".tox",
-    }
-)
-# 完全不显示
-HIDDEN_FILES = frozenset({".DS_Store"})
+from simpleagent.tools.walk import HIDDEN_FILES, IGNORED_DIRS
 
 DESCRIPTION = (
     "列出目录内容，用来了解目录结构。输出是树形缩进："

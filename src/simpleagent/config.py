@@ -120,6 +120,19 @@ class TraceConfig(BaseModel):
     raw_chunks: bool = False
 
 
+class ToolOutputConfig(BaseModel):
+    """工具结果回给模型之前的大小上限；超出的部分只留开头，完整内容落盘。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_chars: int = Field(30_000, ge=1000)  # 约 8k token
+    max_lines: int = Field(500, ge=10)
+
+
+# 过长的工具输出完整保存在 <home>/<TOOL_OUTPUT_DIRNAME>/
+TOOL_OUTPUT_DIRNAME = "tool_outputs"
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -129,6 +142,7 @@ class Config(BaseModel):
     show_reasoning: bool = True
     # 一轮对话里最多请求模型几次，防止模型无限调用工具
     max_steps: int = Field(20, ge=1)
+    tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig)
     trace: TraceConfig = Field(default_factory=TraceConfig)
 
     @model_validator(mode="after")
@@ -136,6 +150,10 @@ class Config(BaseModel):
         if self.default_profile not in self.profiles:
             raise ValueError(f"default_profile '{self.default_profile}' 不在 profiles 中")
         return self
+
+    def api_key_env_names(self) -> frozenset[str]:
+        """所有 profile 用到的 key 环境变量名：工具启动子进程时要从环境里去掉。"""
+        return frozenset(p.api_key_env for p in self.profiles.values() if p.api_key_env)
 
 
 def config_path() -> Path:

@@ -23,8 +23,9 @@ uv run sa                        # 进入对话
 uv run sa -m local               # 指定 profile，比如本地 Ollama
 ```
 
-REPL 命令：`/model [name]` 切换模型、`/clear` 清空历史、`/usage` 查看用量、`/help`、`/exit`。
-模型可以自己调用工具（目前有 `list_dir`），终端里灰色显示调用和结果预览；一轮对话最多请求模型 `max_steps` 次（默认 20）。
+REPL 命令：`/model [name]` 切换模型、`/tools` 列出可用工具、`/clear` 清空历史、`/usage` 查看用量、`/help`、`/exit`。
+模型可以自己调用工具（`list_dir`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`、`bash`），终端里灰色显示调用和结果预览；
+一轮对话最多请求模型 `max_steps` 次（默认 20）；过长的工具输出只把开头回给模型，完整内容存在 `~/.simpleagent/tool_outputs/`。
 每次请求的完整请求体和响应都记录在 `~/.simpleagent/traces/` 下。
 
 ## 开发

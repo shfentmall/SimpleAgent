@@ -67,8 +67,9 @@ async def run(self, session, user_input) -> AsyncIterator[Event]:
 - 流式 `tool_calls` 按 `index` 分片到达，要自己拼（`StreamAccumulator` 已实现）
 - 模型给出非法 JSON 参数时，把错误作为 tool 结果回给模型自我纠正，不抛异常（`ToolRegistry.execute`：未知工具、非法 JSON、参数校验失败、工具异常都转成 `错误：...` 文本）
 - Ctrl+C 或 API 出错时，给还没返回结果的 tool_call 补“执行被中断”结果，否则下一次请求会被 API 拒绝；已输出的部分正文保留，这一轮什么都没留下就撤回用户消息（`Agent._repair`）
-- 同一条消息里的多个 tool_call 用 `asyncio.gather` 并行执行；以后有了写操作工具，再按只读/非只读区分并行和依次执行
-- 工具输出过长：完整内容落盘，只给模型返回开头部分和文件路径（待做）
+- 同一条消息里的多个 tool_call：全是只读工具就 `asyncio.gather` 并行；只要有一个写操作（`Tool.readonly=False`，目前是 `write_file` / `edit_file` / `bash`）就按原顺序依次执行，避免“先写 A 再读 A”读到旧内容或两个写互相覆盖。判断在 `ToolRegistry.execute_many` 里
+- 工具输出过长：完整内容落盘（`~/.simpleagent/tool_outputs/`，保留 7 天），只给模型返回开头部分和文件路径，截断统一在 `ToolRegistry.trim` 里做，行数和字符数两个上限都要满足；自己分页的工具（`read_file`）用 `truncate_output=False` 跳过
+- 含写操作的一批调用串行执行时，每完成一个就写进历史：中途被中断，已经执行完的调用保留真实结果
 
 ### Tool 抽象（M2）
 
@@ -85,14 +86,16 @@ async def list_dir(args: ListDirArgs, ctx: ToolContext) -> str: ...
 ```
 - schema 由 `Args.model_json_schema()` 生成，去掉 pydantic 自动加的 `title`，包装成 `{"type": "function", "function": {...}}`
 - 可以预期的失败抛 `ToolError`，消息原样回给模型；相对路径用 `ctx.resolve()` 基于 `ctx.cwd` 解析
-- `ToolContext` 目前只有 cwd；后续加 session、approver（审批器）、进度上报、中断信号
+- `ToolContext` 有 `cwd` 和 `output_dir`；`ctx.save_output(content, name)` 把完整输出落盘。后续加 session、approver（审批器）、进度上报、中断信号
+- `Tool.readonly` 标记这个工具会不会改动外部状态，决定同一批调用是并行还是串行
+- 内置 7 个工具：`list_dir` / `read_file`（带行号、offset+limit，流式读取，按行数和约 3 万字符自己分页）/ `write_file`（整篇写入、自动建目录）/ `edit_file`（唯一匹配或 `replace_all`，保留原换行符，返回 unified diff）/ `glob`（`*`、`?`、`**` 自己转正则）/ `grep`（正则搜内容，跳过二进制和大文件）/ `bash`（`create_subprocess_shell`、自成进程组，超时 / 输出超过 10MB / Ctrl+C 时杀掉整组；stderr 合并进 stdout、stdin 是 DEVNULL；环境变量去掉各 profile 的 `api_key_env`）。目录遍历、忽略清单、按 `\n` 分行、可取消的线程执行共用 `tools/walk.py`
 - 审批器由前端注入：REPL 版询问用户（y / n / always）；headless 版按任务的 `allowed_tools` 白名单判断，需要 ask 的一律拒绝，并把拒绝原因回给模型
 
 ### LLM Client 与配置（M1，已实现）
 
 配置文件 `~/.simpleagent/config.toml`，由 `sa init` 生成，模板见 [`config.example.toml`](../src/simpleagent/config.example.toml)。每个 profile 包含：
 
-- `base_url` / `model` / `api_key_env`（只写环境变量名，不写 key 本身）。key 的值先查环境变量，再查 `~/.simpleagent/.env`。`.env` 只读进内存、不写入 `os.environ`，所以工具启动的子进程不会继承 key
+- `base_url` / `model` / `api_key_env`（只写环境变量名，不写 key 本身）。key 的值先查环境变量，再查 `~/.simpleagent/.env`。`.env` 只读进内存、不写入 `os.environ`；用户自己 export 的 key 会进 `os.environ`，所以工具启动子进程时还要显式去掉所有 profile 的 `api_key_env`（`Config.api_key_env_names()` → `ToolContext.hidden_env`）
 - `extra_body`：厂商私有参数，原样合并进请求体，用于试验新 feature（比如思考开关）
 - `quirks`：
   - `reasoning_field`：思考内容所在字段（`reasoning_content` / `reasoning`）
@@ -166,7 +169,12 @@ src/simpleagent/
   agent/loop.py           ✅ Agent loop：工具调用循环、max_steps、中断后修复历史
   agent/session.py        ✅ 会话状态：消息历史、用量（M3 加 JSONL 持久化、恢复会话）
   agent/context.py           token 预算、结果清理、压缩（M6）
-  tools/                  🚧 Tool 抽象、注册表、list_dir（其余内置工具待做）
+  tools/                  ✅ Tool 抽象、注册表、7 个内置工具
+  tools/base.py           ✅ ToolContext（cwd / output_dir / hidden_env / save_output）、ToolError、Tool（readonly / truncate_output）、@tool
+  tools/registry.py       ✅ schema 生成、execute（失败转错误文本）、execute_many（只读并行 / 含写串行，分批产出）、输出截断
+  tools/walk.py           ✅ 忽略清单、带剪枝的目录遍历、二进制判断、按行读取、可取消的线程执行（glob / grep / read_file / list_dir 共用）
+  tools/output.py         ✅ 输出截断：按行数和字符数截断 + 落盘提示
+  tools/{list_dir,read_file,write_file,edit_file,glob,grep,bash}.py  ✅ 内置工具
   permissions.py             规则匹配、工作目录边界（M3）
   scheduler/                 定时 daemon（M4）
   mcp/client.py              stdio JSON-RPC MCP 客户端（M5）

@@ -4,6 +4,7 @@ import pytest
 
 from simpleagent.cli import main
 from simpleagent.config import (
+    Config,
     ConfigError,
     Profile,
     config_path,
@@ -100,3 +101,17 @@ def test_cli_init_and_config_error(sa_home: Path, capsys: pytest.CaptureFixture[
     assert "sa init" in capsys.readouterr().err
     assert main(["init"]) == 0
     assert (sa_home / "config.toml").exists()
+
+
+def test_api_key_env_names_collects_all_profiles():
+    config = Config.model_validate(
+        {
+            "default_profile": "a",
+            "profiles": {
+                "a": {"base_url": "http://a", "model": "m", "api_key_env": "A_KEY"},
+                "b": {"base_url": "http://b", "model": "m", "api_key_env": "B_KEY"},
+                "local": {"base_url": "http://localhost", "model": "m"},
+            },
+        }
+    )
+    assert config.api_key_env_names() == frozenset({"A_KEY", "B_KEY"})

@@ -19,7 +19,14 @@ import openai
 from simpleagent.agent.loop import Agent
 from simpleagent.agent.prompt import build_system_prompt
 from simpleagent.agent.session import Session
-from simpleagent.config import ENV_FILENAME, Config, ConfigError, Profile, home_dir
+from simpleagent.config import (
+    ENV_FILENAME,
+    TOOL_OUTPUT_DIRNAME,
+    Config,
+    ConfigError,
+    Profile,
+    home_dir,
+)
 from simpleagent.events import (
     MaxStepsReached,
     MessageDone,
@@ -41,6 +48,7 @@ DIM, RED, BOLD, RESET = "\033[2m", "\033[31m", "\033[1m", "\033[0m"
 
 HELP = '''命令：
   /model [name]   查看或切换模型 profile（对话历史保留）
+  /tools          列出当前可用的工具
   /clear          清空对话历史
   /usage          本会话的 token 用量
   /help           显示帮助
@@ -172,12 +180,19 @@ class Repl:
         )
         self.llm_factory = llm_factory or (lambda name, p: LLMClient(name, p, tracer=self.tracer))
         cwd = Path.cwd()
+        output_dir = home_dir() / TOOL_OUTPUT_DIRNAME
         self.agent = Agent(
             llm=self._make_llm(profile or config.default_profile),
-            tools=ToolRegistry(builtin_tools()),
+            tools=ToolRegistry(
+                builtin_tools(),
+                max_output_chars=config.tool_output.max_chars,
+                max_output_lines=config.tool_output.max_lines,
+            ),
             system_prompt=build_system_prompt(config.system_prompt, cwd=cwd),
             cwd=cwd,
             max_steps=config.max_steps,
+            output_dir=output_dir,
+            hidden_env=config.api_key_env_names(),
         )
 
     def _make_llm(self, name: str) -> LLM:
@@ -282,6 +297,11 @@ class Repl:
                 )
             case "model":
                 await self._switch_model(arg)
+            case "tools":
+                for item in self.agent.tools.schemas():
+                    function = item["function"]
+                    self.print(f"  {function['name']}", BOLD)
+                    self.print(f"      {function['description']}")
             case _:
                 self.print(f"未知命令 /{name}，输入 /help 查看")
         return True

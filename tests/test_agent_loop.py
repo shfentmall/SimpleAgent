@@ -85,7 +85,16 @@ async def test_tool_call_round_trip(tmp_path: Path):
         {"role": "system", "content": "系统提示"},
         *session.messages[:3],
     ]
-    assert [t["function"]["name"] for t in llm.requests[0]["tools"]] == ["list_dir"]
+    # 现在有 7 个内置工具，这里只断言顺序和稳定性（工具列表不变才能命中前缀缓存）
+    assert [t["function"]["name"] for t in llm.requests[0]["tools"]] == [
+        "list_dir",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "bash",
+    ]
     assert llm.requests[0]["tools"] == llm.requests[1]["tools"]
     assert session.requests == 2
 
@@ -120,7 +129,7 @@ async def test_multiple_calls_keep_order(tmp_path: Path):
     assert tool_messages[1]["content"].endswith("x.txt 0B")
 
 
-async def test_multiple_calls_run_concurrently(tmp_path: Path):
+async def test_readonly_calls_run_concurrently(tmp_path: Path):
     both_started = asyncio.Event()
     running = 0
 
@@ -138,6 +147,28 @@ async def test_multiple_calls_run_concurrently(tmp_path: Path):
     agent, _ = make_agent(tmp_path, [{"tool_calls": calls}, "done"], tools=[wait])
     events = await collect(agent, Session("s"))
     assert [e.content for e in events if isinstance(e, ToolResult)] == ["ok", "ok"]
+
+
+async def test_write_calls_run_in_order(tmp_path: Path):
+    """同一批里有写操作时逐个执行：模型常常“先写 A 再读 A”，并行会读到旧内容。"""
+    order: list[str] = []
+
+    @tool(name="reader", description="读")
+    async def reader(args: NoArgs, ctx: ToolContext) -> str:
+        order.append("read")  # 不 await：并行执行时它会先完成
+        return "read"
+
+    @tool(name="writer", description="写", readonly=False)
+    async def writer(args: NoArgs, ctx: ToolContext) -> str:
+        await asyncio.sleep(0.01)
+        order.append("write")
+        return "write"
+
+    calls = [{"id": "c1", "name": "writer", "arguments": {}}, {"id": "c2", "name": "reader"}]
+    agent, _ = make_agent(tmp_path, [{"tool_calls": calls}, "done"], tools=[writer, reader])
+    events = await collect(agent, Session("s"))
+    assert [e.content for e in events if isinstance(e, ToolResult)] == ["write", "read"]
+    assert order == ["write", "read"]  # 并行的话会是 ["read", "write"]
 
 
 async def test_max_steps_stops_loop(tmp_path: Path):
@@ -208,4 +239,33 @@ async def test_api_error_after_tool_step_keeps_tool_results(tmp_path: Path):
         "assistant",
         "tool",
         "user",
+    ]
+
+
+async def test_cancel_mid_batch_keeps_finished_write_results(tmp_path: Path):
+    """含写操作的一批调用逐个执行：中途被中断时，已经执行完的写操作要如实记进历史。"""
+
+    @tool(name="writer", description="写", readonly=False)
+    async def writer(args: NoArgs, ctx: ToolContext) -> str:
+        return "已写入"
+
+    calls = [{"id": "w", "name": "writer", "arguments": {}}, {"id": "s", "name": "slow"}]
+    agent, _ = make_agent(tmp_path, [{"tool_calls": calls}], tools=[writer, slow])
+    session = Session("s")
+    seen: list = []
+
+    async def consume() -> None:
+        async for event in agent.run(session, "hi"):
+            seen.append(event)
+
+    task = asyncio.create_task(consume())
+    while not any(isinstance(e, ToolResult) for e in seen):
+        await asyncio.sleep(0.005)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert session.messages[2:] == [
+        {"role": "tool", "tool_call_id": "w", "content": "已写入"},  # 以前会被报成“执行被中断”
+        {"role": "tool", "tool_call_id": "s", "content": INTERRUPTED_RESULT},
     ]

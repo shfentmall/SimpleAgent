@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -26,18 +25,22 @@ class Agent:
         system_prompt: str,
         cwd: Path,
         max_steps: int = 20,
+        output_dir: Path | None = None,
+        hidden_env: frozenset[str] = frozenset(),
     ):
         self.llm = llm
         self.tools = tools
         self.system_prompt = system_prompt
         self.cwd = cwd
         self.max_steps = max_steps
+        self.output_dir = output_dir  # 过长的工具输出落盘到这里
+        self.hidden_env = hidden_env  # 工具启动子进程时去掉的环境变量（API key）
 
     async def run(self, session: Session, user_input: str) -> AsyncIterator[Event]:
         """处理一条用户输入。中断或出错时先把历史修成合法状态，再把异常原样抛出。"""
         turn_start = len(session.messages)
         session.messages.append({"role": "user", "content": user_input})
-        ctx = ToolContext(cwd=self.cwd)
+        ctx = ToolContext(cwd=self.cwd, output_dir=self.output_dir, hidden_env=self.hidden_env)
         partial: list[str] = []  # 本次请求已经输出的正文，中断时保存
         try:
             for _ in range(self.max_steps):
@@ -67,13 +70,12 @@ class Agent:
                         function.get("name") or "",
                         function.get("arguments") or "",
                     )
-                # 同一条消息里的多个调用并行执行；结果按 tool_calls 的顺序回传
-                results = await asyncio.gather(
-                    *(self.tools.execute(call, ctx) for call in tool_calls)
-                )
-                session.messages.extend(result.as_message() for result in results)
-                for result in results:
-                    yield result
+                # 结果按 tool_calls 的顺序回传；全是只读就并行，含写操作就依次执行。
+                # 每批结果先记进历史再往外发：中途被中断时，已执行完的调用保留真实结果
+                async for batch in self.tools.execute_many(tool_calls, ctx):
+                    session.messages.extend(result.as_message() for result in batch)
+                    for result in batch:
+                        yield result
             yield MaxStepsReached(self.max_steps)
         except BaseException:  # Ctrl+C（CancelledError）、API 错误、消费方提前退出
             self._repair(session, turn_start, "".join(partial))
