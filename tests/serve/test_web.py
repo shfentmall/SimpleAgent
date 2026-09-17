@@ -389,6 +389,10 @@ def test_meta(config):
     assert execs["simpleagent"]["models"] == ["a", "b"]
     assert execs["claude-code"]["external"] is True
     assert execs["claude-code"]["models"] == []
+    # 权限两档由后端给，向导里直接渲染
+    assert [p["name"] for p in execs["claude-code"]["permissions"]] == ["safe", "full"]
+    assert execs["claude-code"]["default_permission"] == "safe"
+    assert execs["simpleagent"]["permissions"] == []
 
 
 # ------------------------------------------------- 2b. 新建空间：四种组合与校验
@@ -452,20 +456,34 @@ def test_create_space_rejects_bad_combinations(config, sa_home):
     assert _get_json(f"{base}/api/spaces") == []
 
 
-def test_external_executor_fails_loudly(config, sa_home):
-    """选了外部 agent 但还没接入：发消息必须明确报错，不能静默用内置 loop 跑。"""
+def test_external_executor_never_falls_back_to_builtin_loop(config, sa_home):
+    """选了外部 agent 就必须走 CLI 路径，**不能**静默用内置 loop 跑。
+
+    外部 CLI 用一个不存在的可执行文件：该报错就报错，但内置 loop 一次都不许被碰
+    （llm_factory 被调用就说明回退了）。
+    """
     from simpleagent.serve.app import Server
     from simpleagent.serve.runner import Runner
 
     store = SpaceStore(sa_home)
     space = store.create_space(
-        SpaceSpec(name="claude空间", kind="agent", executor="claude-code", cwd=str(sa_home))
+        SpaceSpec(
+            name="claude空间",
+            kind="agent",
+            executor="claude-code",
+            cwd=str(sa_home),
+            command="/nonexistent/sa-cli",
+        )
     )
     session = store.create_session(space.id)
 
-    server = Server(
-        config, store=store, runner=Runner(config, store=store, llm_factory=_fake_factory([]))
-    )
+    llm_calls: list[str] = []
+
+    def factory(name, profile):
+        llm_calls.append(name)
+        return _fake_factory([])(name, profile)
+
+    server = Server(config, store=store, runner=Runner(config, store=store, llm_factory=factory))
     server.start()
     q, _ = server.runner.bus.subscribe(session.id)
     server.handle(
@@ -474,12 +492,14 @@ def test_external_executor_fails_loudly(config, sa_home):
 
     first = q.get(timeout=5)
     assert first.type == "error"
-    assert "claude-code" in first.payload["message"]
+    assert "找不到可执行文件" in first.payload["message"]
     second = q.get(timeout=5)
     assert second.type == "status" and second.payload["status"] == "error"
-    # 会话被落成 error，而不是悄悄跑起来
+    assert llm_calls == []  # 内置 loop 完全没参与
+    # 会话被落成 error，而不是悄悄跑起来；用户那句话留着，配好之后还能重跑
     assert store.get_session_meta(space.id, session.id).status == "error"
     assert store.load_session(space.id, session.id).messages == [{"role": "user", "content": "hi"}]
+    server.runner.shutdown()
 
 
 # --------------------------------------------------------------- 3. sessions limit

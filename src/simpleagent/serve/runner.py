@@ -1,9 +1,11 @@
 """Runner：后台 asyncio 线程，把一次用户输入交给对应空间的 Agent 执行。
 
 职责：
-- 按空间配置（目录 / profile / 验证命令）构造 Agent，注入审批器。
-- 跑 agent.run()，把事件实时发到事件总线，同时把消息和元信息落盘。
-- 支持取消（取消底层 asyncio 任务，loop 会先修好历史再抛出）。
+- 按空间的执行者分两条路径：`simpleagent` 用内置 loop（按目录 / profile 构造 Agent、注入审批器）；
+  `claude-code` / `opencode` 起无头 CLI，把它的 NDJSON 翻译成同一套事件（见 agents/）。
+- 两条路径的产出汇合在 `_on_event`：先落盘再广播。
+- 跑 agent.run() / CLI，把事件实时发到事件总线，同时把消息和元信息落盘。
+- 支持取消（内置 loop 取消底层 asyncio 任务；外部 CLI 直接 terminate 进程）。
 - 支持手动触发验证命令，并把结果写成 verification 帧 + 落盘。
 
 线程模型：Runner 自己起一个线程跑 asyncio 事件循环；HTTP 层在另一个线程，通过
@@ -13,6 +15,8 @@ run_coroutine_threadsafe / call_soon_threadsafe 与它通信，两者用总线�
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -24,6 +28,7 @@ from typing import Any
 from simpleagent.agent.loop import Agent
 from simpleagent.agent.prompt import build_system_prompt
 from simpleagent.agent.session import Session
+from simpleagent.agents import adapter_for
 from simpleagent.config import TOOL_OUTPUT_DIRNAME, Config, home_dir
 from simpleagent.events import Event, MessageDone, ToolResult
 from simpleagent.panel.store import PanelStore
@@ -86,6 +91,9 @@ class Runner:
         self._thread: threading.Thread | None = None
         self._tasks: dict[str, asyncio.Task] = {}
         self._agents: dict[str, Agent] = {}
+        # 外部 CLI 执行者：正在跑的子进程，以及「这次是用户主动取消的」标记
+        self._procs: dict[str, Any] = {}
+        self._cancelled: set[str] = set()
 
     # ----------------------------------------------------------------- 生命周期
     def start(self) -> None:
@@ -124,6 +132,37 @@ class Runner:
         agent = self._agents.get(session_id)
         if agent is not None:
             self._loop.call_soon_threadsafe(agent.cancel)
+            return
+        # 外部 CLI：杀进程就是取消。进程死了读循环自然结束，再按 cancelled 收口。
+        proc = self._procs.get(session_id)
+        if proc is not None:
+            self._cancelled.add(session_id)
+            self._loop.call_soon_threadsafe(self._terminate, proc)
+
+    def _terminate(self, proc: Any) -> None:
+        """杀**整个进程组**，不是只杀父进程。
+
+        CLI 自己会再 fork（opencode 每次 run 都会起一个本地 server），只 terminate 父进程的话
+        子进程还攥着 stdout 管道，我们这边就等不到 EOF、取消像没生效一样。
+        """
+        self._killpg(proc, signal.SIGTERM)
+
+        def force() -> None:
+            if proc.returncode is None:  # 3 秒还不走就强杀
+                self._killpg(proc, signal.SIGKILL)
+
+        assert self._loop is not None
+        self._loop.call_later(3.0, force)
+
+    @staticmethod
+    def _killpg(proc: Any, sig: int) -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.send_signal(sig)
+            except ProcessLookupError:
+                pass
 
     def approve(self, approval_id: str, action: str) -> bool:
         if self._loop is None:
@@ -146,8 +185,8 @@ class Runner:
             # 还没接入）也要把用户说的这句留下来，否则刷新页面它就不见了。
             self.store.append_message(space_id, session_id, {"role": "user", "content": user_input})
             self.store.update_meta(space_id, session_id, status="running")
-            agent = self._build_agent(space, session)
-            self._agents[session_id] = agent
+            if space.executor == "simpleagent":
+                self._agents[session_id] = self._build_agent(space, session)
         except Exception as e:  # noqa: BLE001
             # 起不来必须让客户端知道：这一段在原来是在 try 之外，异常会被 asyncio future
             # 吞掉，表现是「发了消息没有任何反应，且永远停在运行中」。典型触发：没配 API key、
@@ -162,8 +201,14 @@ class Runner:
         if task is not None:
             self._tasks[session_id] = task
         try:
-            async for event in agent.run(session, user_input):
-                self._on_event(space_id, session_id, event)
+            if space.executor == "simpleagent":
+                agent = self._agents[session_id]
+                async for event in agent.run(session, user_input):
+                    self._on_event(space_id, session_id, event)
+                status = "done"
+            else:
+                # 外部 CLI 走完全不同的执行路径，但生成的是同一套事件
+                status = await self._run_cli(space, session, user_input)
         except asyncio.CancelledError:
             self.bus.publish(status_frame(session_id, "cancelled"))
             self._finalize(space_id, session_id, session, "cancelled")
@@ -172,7 +217,7 @@ class Runner:
             self.bus.publish(error_frame(session_id, f"{type(e).__name__}: {e}"))
             self._finalize(space_id, session_id, session, "error")
         else:
-            self._finalize(space_id, session_id, session, "done")
+            self._finalize(space_id, session_id, session, status)
         finally:
             self._tasks.pop(session_id, None)
             self._agents.pop(session_id, None)
@@ -236,13 +281,117 @@ class Runner:
             ref={"space_id": space_id, "session_id": session_id},
         )
 
+    async def _run_cli(self, space: Space, session: Session, user_input: str) -> str:
+        """把一次输入交给外部 CLI（claude / opencode），返回这次运行的收口状态。
+
+        和内置 loop 的路径**汇合在同一套事件上**：翻译出来的 TextDelta / ToolCallStart /
+        ToolResult / MessageDone 照常走 `_on_event`（先落盘再广播），所以总线、存储、
+        前端一行都不用改——区别只是「谁在生成这些事件」。
+
+        对面的会话历史由它自己维护（我们只存 session id 用于 resume），
+        我们的 jsonl 是给人看的展示层，不是喂给它的上下文。
+        """
+        meta = self.store.get_session_meta(space.id, session.id)
+        resume = (meta.agent_session_id if meta else None) or None
+        adapter = adapter_for(space.executor)
+        argv = adapter.command(
+            user_input,
+            command=space.agent.command if space.agent else None,
+            model=space.cli_model,
+            resume=resume,
+            mode=space.permission,
+        )
+        cwd = self.cwd_for(space)
+        # 本机默认 = 只继承现有环境；adapter.env() 只在需要注入配置时才有内容
+        env = {**os.environ, **adapter.env(space.permission)}
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(cwd),
+                env=env,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                # 独立进程组：取消时要连它 fork 出来的子进程一起收（见 _terminate）
+                start_new_session=True,
+                # 一行的默认上限只有 64KB，工具结果（大文件、base64）很容易超过它
+                limit=4 * 1024 * 1024,
+            )
+        except FileNotFoundError:
+            self.bus.publish(error_frame(session.id, f"找不到可执行文件：{argv[0]}"))
+            return "error"
+        except OSError as e:
+            self.bus.publish(error_frame(session.id, f"启动 {argv[0]} 失败：{e}"))
+            return "error"
+
+        self._procs[session.id] = proc
+        ok: bool | None = None
+        error: str | None = None
+        stderr_task = asyncio.create_task(self._drain(proc.stderr))
+        try:
+            async for raw in proc.stdout:  # type: ignore[union-attr]
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    turn = adapter.parse(line)
+                except Exception as e:  # noqa: BLE001  一行解析失败不该毁掉整轮
+                    print(f"[runner] 解析 {space.executor} 事件失败：{e}", file=sys.stderr)
+                    continue
+                if adapter.session_id and adapter.session_id != resume:
+                    # 第一次拿到对面的会话 id：存下来，下次追问带 resume 参数
+                    self.store.update_meta(
+                        space.id, session.id, agent_session_id=adapter.session_id
+                    )
+                    resume = adapter.session_id
+                for event in turn.events:
+                    self._on_event(space.id, session.id, event)
+                if turn.error:
+                    error = turn.error
+                if turn.finished:
+                    ok = turn.ok
+            code = await proc.wait()
+        finally:
+            self._procs.pop(session.id, None)
+            stderr_tail = await stderr_task
+
+        session.usage = adapter.usage
+        if session.id in self._cancelled:
+            self._cancelled.discard(session.id)
+            return "cancelled"
+        if ok is None:
+            # 对面没给结束事件（进程被信号打死、崩了）：只能拿退出码兜底
+            ok = code == 0
+            if not ok and not error:
+                error = f"{space.executor} 退出码 {code}"
+                if stderr_tail:
+                    error += f"：{stderr_tail}"
+        if not ok:
+            self.bus.publish(error_frame(session.id, error or f"{space.executor} 运行失败"))
+            return "error"
+        return "done"
+
+    @staticmethod
+    async def _drain(stream: Any, keep: int = 4000) -> str:
+        """把 stderr 读干净（不读会写满管道把子进程卡死），只留最后一段用于报错。"""
+        if stream is None:
+            return ""
+        buf = bytearray()
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if len(buf) > keep * 2:
+                del buf[:-keep]
+        return buf.decode("utf-8", "replace")[-keep:]
+
     def _build_agent(self, space: Space, session: Session) -> Agent:
-        # 选了外部 CLI 就必须显式失败，**不能**静默回退到内置 loop：那会让用户以为
-        # 在跑 claude code。外部 CLI 的启动器规划在 M8，这里只是把话说清楚。
+        # 外部执行者走 _run_cli，不在这里造 Agent。走到这儿说明调用方忘了分支——
+        # 宁可炸掉也不能静默用内置 loop 跑，那会让用户以为在跑 claude。
         if space.executor != "simpleagent":
             raise RuntimeError(
-                f"执行者 {space.executor} 还没接入（规划在 M8），"
-                "先把这个空间的执行者改成内置 SimpleAgent"
+                f"{space.executor} 要走 CLI 路径（_run_cli），_build_agent 只服务内置 loop"
             )
         if space.profile not in self.config.profiles:
             raise RuntimeError(

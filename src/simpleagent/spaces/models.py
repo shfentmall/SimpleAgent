@@ -15,6 +15,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC
 from typing import Any, Literal
 
+from simpleagent.agents.base import PERMISSIONS, SAFE
+
 
 def _now() -> str:
     from datetime import datetime
@@ -174,6 +176,7 @@ class SpaceSpec:
     executor: str = "simpleagent"
     profile: str = "default"  # executor=simpleagent 时用
     cli_model: str | None = None  # executor 是外部 CLI 时用；None = 不注入配置
+    permission: str = SAFE  # 外部 CLI 的权限档：safe 只读 / full 全放行
     pin_dir: str | None = None
     cwd: str | None = None
     command: str | None = None
@@ -193,6 +196,7 @@ class Space:
     executor: str = "simpleagent"  # 只管谁跑：simpleagent | claude-code | opencode
     profile: str = "default"  # executor=simpleagent 时的模型
     cli_model: str | None = None  # 外部 CLI 的模型 preset；None = 用本机默认配置
+    permission: str = SAFE  # 外部 CLI 的权限档（safe 只读 / full 全放行）
     cwd: str | None = None  # kind=agent 时必填；kind=generic 时为空（用 tmp）
     opened: bool = True  # 是否在左栏显示（关闭只是不显示，不删数据）
     pinned: bool = False
@@ -213,8 +217,12 @@ class Space:
         if spec.executor == "simpleagent":
             if spec.cli_model:
                 raise ValueError("内置执行者的模型用 profile 选，不要填 cli_model")
+            if spec.permission != SAFE:
+                raise ValueError("内置执行者的权限由审批器管，不要填 permission")
         elif spec.command is None and spec.executor not in DEFAULT_CLI_COMMAND:
             raise ValueError(f"执行者 {spec.executor} 没有默认命令，请显式填 command")
+        if spec.permission not in PERMISSIONS:
+            raise ValueError(f"未知的权限档：{spec.permission}")
         if spec.kind == "agent" and not spec.cwd:
             raise ValueError("绑定目录的空间必须填工作目录")
         if spec.kind == "generic" and spec.cwd:
@@ -243,6 +251,7 @@ class Space:
             executor=spec.executor,
             profile=spec.profile,
             cli_model=spec.cli_model,
+            permission=spec.permission,
             cwd=spec.cwd,
             created_at=created,
             last_opened_at=created,

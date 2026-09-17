@@ -133,6 +133,10 @@ function renderSpaces() {
   for (const sp of state.spaces) {
     const [label, cls] = badgeFor(sp);
     const dir = sp.cwd || null;
+    const danger =
+      (sp.executor || "simpleagent") !== "simpleagent" && sp.permission === "full"
+        ? `<span class="warn-chip" title="这个空间的外部 agent 不经确认就会改文件、跑命令">全放行</span>`
+        : "";
     const vs = sp.sessions || [];
     const vsum = vs.length
       ? `<span class="vsum" title="最近 ${vs.length} 个会话里通过验证的数量">✓ ${
@@ -146,6 +150,7 @@ function renderSpaces() {
       <div class="space-head">
         <span class="space-name">${escapeHtml(sp.name)}</span>
         <span class="badge ${cls}">${label}</span>
+        ${danger}
         ${vsum}
         <span class="space-actions">
           <button class="icon-btn" title="在这个空间新建会话" data-act="new-session">＋</button>
@@ -261,6 +266,10 @@ function renderHeader() {
     const [label, cls] = badgeFor(sp);
     badge.className = `badge ${cls}`;
     badge.textContent = label;
+    badge.title =
+      (sp.executor || "simpleagent") !== "simpleagent" && sp.permission === "full"
+        ? "这个空间的外部 agent 不经确认就会改文件、跑命令"
+        : "";
     badge.classList.remove("hidden");
   } else {
     badge.classList.add("hidden");
@@ -1247,9 +1256,11 @@ function openModal() {
    所以先点开向导、再切来切去都不会出现「上次选的东西被悄悄换掉」。 */
 function syncModalFields() {
   const kind = $("f-kind").value;
-  const external = $("f-executor").value !== "simpleagent";
+  const executor = $("f-executor").value;
+  const external = executor !== "simpleagent";
   $("f-cwd-wrap").classList.toggle("hidden", kind !== "agent");
   $("f-model-hint").classList.toggle("hidden", !external);
+  $("f-perm-wrap").classList.toggle("hidden", !external);
   $("f-model-label").textContent = external ? "模型" : "模型 profile";
 
   const sel = $("f-profile");
@@ -1260,6 +1271,15 @@ function syncModalFields() {
     sel.innerHTML = state.profiles.map((p) => `<option value="${p}">${p}</option>`).join("");
     sel.value = state.defaultProfile || state.profiles[0] || "";
   }
+
+  const perm = $("f-permission");
+  const info = state.executors.find((e) => e.name === executor);
+  if (external && info && info.permissions.length) {
+    perm.innerHTML = info.permissions
+      .map((p) => `<option value="${p.name}">${p.label}</option>`).join("");
+    perm.value = info.default_permission || info.permissions[0].name;
+  }
+  $("f-perm-hint").classList.toggle("hidden", perm.value !== "full");
 }
 
 async function createSpace() {
@@ -1278,6 +1298,7 @@ async function createSpace() {
     // 本机默认 = 不传 cli_model；以后有 preset 时这里换成选中的 preset 名
     const cliModel = $("f-profile").value;
     if (cliModel) body.cli_model = cliModel;
+    body.permission = $("f-permission").value;
   }
   const v = $("f-verify").value.trim();
   if (v) { body.verify_command = v; body.verify_trigger = "on_stop"; }
@@ -1304,6 +1325,7 @@ async function boot() {
   $("f-create").onclick = createSpace;
   $("f-kind").onchange = syncModalFields;
   $("f-executor").onchange = syncModalFields;
+  $("f-permission").onchange = syncModalFields;
   $("btn-send").onclick = send;
   $("btn-new-session").onclick = () => state.spaceId && newSession(state.spaceId);
   $("btn-stop").onclick = async () => {

@@ -29,6 +29,8 @@ from simpleagent.spaces.models import (
 )
 
 SPACES_DIRNAME = "spaces"
+# 旧文件没有 permission 字段时按「只读」处理：宁可少给权限
+DEFAULT_PERMISSION = "safe"
 
 
 def new_id(prefix: str) -> str:
@@ -63,6 +65,8 @@ def _space_to_toml(space: Space) -> str:
     ]
     if space.cli_model:
         out.append(f"cli_model = {_toml_str(space.cli_model)}")
+    if space.executor != "simpleagent":
+        out.append(f"permission = {_toml_str(space.permission)}")
     if space.kind == "agent" and space.cwd:
         out.append(f"cwd = {_toml_str(space.cwd)}")
     out += [
@@ -108,6 +112,7 @@ def _space_from_toml(data: dict[str, Any], space_id: str) -> Space:
         executor=executor,
         profile=data.get("profile", "default"),
         cli_model=data.get("cli_model") or None,
+        permission=data.get("permission") or DEFAULT_PERMISSION,
         cwd=data.get("cwd") or agent_data.get("cwd"),
         opened=bool(data.get("opened", True)),
         pinned=bool(data.get("pinned", False)),

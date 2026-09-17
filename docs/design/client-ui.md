@@ -76,7 +76,7 @@ Space（空间）──1:N── Session（会话/一次运行实例）
 
 | 入口 | 作用 | 状态 |
 |---|---|---|
-| **新建空间**（主按钮） | 打开新建空间向导：① 名字 ② 任务形态（通用 / 绑定目录）③ 执行者（simpleagent / claude-code / opencode）④ 模型（随执行者切换：profile 或外部 CLI 的 preset）⑤ 工作目录（仅绑定目录）⑥ 可选验证命令 | 本次设计 |
+| **新建空间**（主按钮） | 打开新建空间向导：① 名字 ② 任务形态（通用 / 绑定目录）③ 执行者（simpleagent / claude-code / opencode）④ 模型（随执行者切换：profile 或外部 CLI 的模型）⑤ 权限（仅外部执行者：只读 / 全放行）⑥ 工作目录（仅绑定目录）⑦ 可选验证命令 | 本次设计 |
 | **控制面板** | 全局视图：正在跑的 session（跨空间聚合）、定时任务（`schedules.toml`，M4）、模型 profile 与用量统计、最近错误 / trace 入口、设置 | 骨架本次设计，内容随 M4/M6 填 |
 | **知识库** | 记忆（`memory/` + `MEMORY.md`，M7）、skills 列表、导入的文档与索引 | M7 再实现，本次只留入口和空态 |
 
@@ -137,8 +137,11 @@ Space（空间）──1:N── Session（会话/一次运行实例）
 
 - 绑定**一个真实项目目录**（`cwd`，顶层字段），进入该目录执行；不填就落回 tmp（API 会拦）。
 - 执行者可以是内置 `simpleagent`（在项目里用自己的 loop），也可以是外部 CLI：
-  `claude-code` / `opencode`。外部 CLI 用无头模式（ARCHITECTURE 已定：`claude -p --output-format
-  stream-json`、`opencode run --format json`），保存 agent 返回的 session id，下次接着追问。
+  `claude-code` / `opencode`。外部 CLI 用无头模式（`claude -p --output-format stream-json
+  --verbose`、`opencode run --format json`），保存对面的 session id，下次追问带 `--resume` /
+  `--session` 接上；事件翻译见 10.10。
+- 外部 CLI 的 `cwd` 是**进程的工作目录**。注意 opencode 会从 cwd 往上找 git 根当作项目根，
+  所以把 cwd 指在仓库的子目录时，它实际操作的是仓库根目录。
 - 右栏头部与左栏卡片都显示「当前是谁在跑」（SA / CC / OC 徽标），切换执行者时 session id 一起换掉。
 - 同一个目录可以开多个空间（例如一个跑 claude code、一个跑 opencode 做对比），互不干扰。
 
@@ -517,3 +520,52 @@ W2 给核心 loop 加了三个注入点，**不传则完全保持旧行为**（R
 → 解析成我们的事件帧 → resume，以及最要紧的**审批策略**：claude 无头模式的 `--permission-mode`
 一开，我们自己的审批卡就形同虚设。`[profiles.*]` 里挂外部 CLI 映射（`ANTHROPIC_*` 那套、
 key 仍只写 `api_key_env`）也留到那时一起设计，届时 `cli_model` 才有可选项。
+
+### 10.10 外部 CLI 执行者（claude-code / opencode 真正跑起来了）
+
+上面那段「没做的」做掉了。新增 `src/simpleagent/agents/`：把两家无头模式的 NDJSON
+翻译成我们自己的 `Event`，**Runner 之下的东西一行没改**——总线、存储、SSE、前端全都不知道
+对面是谁。
+
+```
+agents/base.py     CliAdapter 协议 + CliTurn + 权限档（safe / full）
+agents/claude.py   claude -p --output-format stream-json --verbose 的事件翻译
+agents/opencode.py opencode run --format json 的事件翻译
+```
+
+**事件映射**（两家的差异都在适配器里消化掉了）：
+
+| 我们的帧 | claude | opencode |
+|---|---|---|
+| 记 `agent_session_id` | `system/init` 的 `session_id` | 任意事件的 `sessionID` |
+| `text_delta` | `stream_event` 增量块（`--include-partial-messages`）；没有增量时用 `assistant` 整段 | `text` 事件的 `part.text` |
+| `reasoning_delta` | `assistant` 里的 `thinking` 块 | 无（`--thinking` 才输出，暂未接） |
+| `tool_call_start` | `assistant` 里的 `tool_use` 块 | `tool_use` 事件（`part.tool` + `state.input`） |
+| `tool_result` | 藏在 **`user` 消息**里的 `tool_result` 块 | 同一个 `tool_use` 事件的 `state.output`（`status=completed`） |
+| `message_done` + usage | `result` 事件（`usage` + `total_cost_usd`） | `step_finish`（**增量** token / cost，要自己累加） |
+
+**几条实测踩出来的规则**（都有样本兜着，见 `tests/fixtures/cli/`）：
+
+1. claude 的 `result.subtype` 是 `"success"` 时 `is_error` 也可能是 `true`（没登录就是），
+   **成败只能看 `is_error`**。
+2. claude 的 `--output-format stream-json` **必须**配 `--verbose`，否则硬报错。
+3. opencode 的 token / cost 是**本步增量**，`tokens.cache.read` 要算进 prompt tokens。
+4. opencode 的退出码不可靠，成败看事件；`run [message..]` 是变长参数，prompt 前要加 `--`。
+5. 取消要**杀整个进程组**：CLI 会自己 fork（opencode 每次都起一个本地 server），
+   只 terminate 父进程的话子进程还攥着 stdout，取消像没生效。
+
+**权限档**（`Space.permission`，只在外部执行者上有意义，默认 `safe`）：
+
+| 档 | claude | opencode | 效果 |
+|---|---|---|---|
+| `safe`（默认） | `--tools Read,Glob,Grep --permission-mode dontAsk --permission-prompts none` | `OPENCODE_CONFIG_CONTENT` 注入 `permission: {"*": "deny", read/glob/grep/lsp: "allow"}` | 能看不能改，且**不会挂住等人** |
+| `full` | `--dangerously-skip-permissions` | `--auto` | 想干什么干什么；左栏卡片会挂一个红色的「全放行」标记 |
+
+选 safe 是因为两家的无头模式都没法把「要不要批准」实时问回给我们（claude 得走
+`--permission-prompt-tool` 外接一个 MCP server，opencode 只能预置 allow/deny），
+所以 v1 只能预先定档。**真正的实时审批**留到接了 MCP 之后。
+
+**还没有的**：claude 那条只有失败路径是实测过的（本机 claude 没登录，`Not logged in`），
+`stream_event` 增量块和工具块的事件形状是照文档写的，登录后要补一份成功样本重录；
+`cli_model` 现在只是透传给 `--model` / `-m` 的字符串，「用我们 config.toml 里的 profile
+跑 claude / opencode」（注入 `ANTHROPIC_BASE_URL` 那套）还没做。

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from simpleagent.agents.base import PERMISSION_LABELS, PERMISSIONS, SAFE
 from simpleagent.config import Config
 from simpleagent.panel.store import PanelStore
 from simpleagent.panel.summary import one_line, summarize
@@ -175,8 +176,13 @@ class Server:
                 "name": name,
                 "label": EXECUTOR_LABELS[name],
                 "external": name != "simpleagent",
-                # 外部 CLI 本次只支持「本机默认（不注入配置）」，所以模型列表是空的
+                # 外部 CLI 的模型本次只支持「本机默认（不注入配置）」，所以是空列表；
+                # 权限档两份，向导里的下拉直接照这个渲染
                 "models": [] if name != "simpleagent" else profiles,
+                "permissions": []
+                if name == "simpleagent"
+                else [{"name": p, "label": PERMISSION_LABELS[p]} for p in PERMISSIONS],
+                "default_permission": SAFE,
             }
             for name in EXECUTORS
         ]
@@ -214,6 +220,7 @@ class Server:
             "executor",
             "profile",
             "cli_model",
+            "permission",
             "pin_dir",
             "cwd",
             "command",

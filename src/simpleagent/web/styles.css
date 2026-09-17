@@ -125,6 +125,11 @@ body {
 .badge.b-oc { background: var(--green-soft); color: var(--green); }
 .badge.b-sa { background: var(--blue-soft); color: var(--blue); }
 .vsum { font-size: 10.5px; color: var(--text-3); font-family: var(--mono); }
+/* 外部 agent 的「全放行」档：卡片上必须一眼能看出来，它不受我们的审批卡约束 */
+.warn-chip {
+  font-size: 10px; padding: 1px 5px; border-radius: 4px; white-space: nowrap;
+  background: var(--red-soft); color: var(--red);
+}
 
 .sessions { margin-top: 6px; display: flex; flex-direction: column; gap: 1px; }
 .session {
