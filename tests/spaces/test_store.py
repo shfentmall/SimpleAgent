@@ -1,5 +1,6 @@
 """W1 持久化层测试：空间与会话的落盘、最近 5 规则、标题截断、重载。"""
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -150,3 +151,34 @@ def test_update_meta_rejects_unknown_field(tmp_path: Path):
         pytest.fail("应当拒绝未知字段")
     except ValueError:
         pass
+
+
+def test_meta_readers_never_see_partial_write(tmp_path: Path):
+    # serve 里 runner 线程写 meta、HTTP 线程同时读；写入必须是原子的，读者不能读到空文件
+    st = store(tmp_path)
+    sp = st.create_space(SpaceSpec(name="sp", kind="generic"))
+    m = st.create_session(sp.id)
+    stop = threading.Event()
+    errors: list[Exception] = []
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                st.get_session_meta(sp.id, m.id)
+                st.list_sessions(sp.id)
+            except Exception as e:
+                errors.append(e)
+                return
+
+    t = threading.Thread(target=reader)
+    t.start()
+    try:
+        for i in range(500):
+            st.update_meta(sp.id, m.id, title=f"t{i}")
+            if errors:
+                break
+    finally:
+        stop.set()
+        t.join()
+    assert errors == []
+    assert list((tmp_path / "spaces" / sp.id / "sessions").glob("*.tmp")) == []

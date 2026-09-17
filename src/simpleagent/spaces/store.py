@@ -37,6 +37,17 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{int(time.time() * 1000)}_{os.urandom(3).hex()}"
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """先写临时文件再 os.replace 替换，读者只会看到旧内容或新内容。
+
+    serve 里 HTTP 线程读 meta / space.toml 时，runner 线程可能正在写；直接 write_text
+    会先清空文件，读者读到空文件就 JSONDecodeError。临时文件名不能匹配 *.meta.json。
+    """
+    tmp = path.with_name(f"{path.name}.{os.urandom(3).hex()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _toml_str(s: str) -> str:
     s = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
     return f'"{s}"'
@@ -176,7 +187,7 @@ class SpaceStore:
         return space
 
     def _write_space_toml(self, space: Space) -> None:
-        self._space_toml(space.id).write_text(_space_to_toml(space), encoding="utf-8")
+        _write_atomic(self._space_toml(space.id), _space_to_toml(space))
 
     def update_space(self, space_id: str, **fields: Any) -> Space:
         space = self.get_space(space_id)
@@ -269,9 +280,9 @@ class SpaceStore:
         return None
 
     def _write_meta(self, space_id: str, meta: SessionMeta) -> None:
-        self._session_meta(space_id, meta.id).write_text(
+        _write_atomic(
+            self._session_meta(space_id, meta.id),
             json.dumps(meta.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
 
     def load_session(self, space_id: str, session_id: str):
