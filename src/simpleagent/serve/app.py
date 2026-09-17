@@ -11,6 +11,7 @@ import json
 import queue
 import re
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
@@ -20,6 +21,28 @@ from simpleagent.serve.bus import frame_to_sse
 from simpleagent.serve.runner import Runner
 from simpleagent.spaces.models import SpaceSpec
 from simpleagent.spaces.store import SpaceStore
+
+# 控制面板的"近期活动流"：任务跑完不在面板上立刻消失，而是在 recent 里留存一段时间。
+# 不留存的话，用户看到的是"列表少了一条"而不是"这条跑完了"，等于看不到状态变化。
+RECENT_DONE_LIMIT = 10
+RECENT_DONE_WINDOW_MINUTES = 24 * 60
+FINAL_STATUSES = frozenset({"done", "error", "cancelled"})
+
+
+def _within_window(ts: str, cutoff: float) -> bool:
+    """时间戳是否晚于 cutoff。解析不出来就当它不在窗口内，别让脏数据把接口打挂。"""
+    try:
+        return datetime.fromisoformat(ts).timestamp() > cutoff
+    except (TypeError, ValueError):
+        return False
+
+
+def _verification_status(meta: Any) -> str:
+    """取验证状态。meta 里既可能是 Verification 对象，也可能是手写进去的 dict。"""
+    v = getattr(meta, "verification", None)
+    if isinstance(v, dict):
+        return v.get("status", "unknown")
+    return getattr(v, "status", "unknown")
 
 
 class Response:
@@ -254,15 +277,37 @@ class Server:
 
     # ----------------------------------------------------------------- 控制面板
     def _panel_summary(self) -> Response:
-        running = []
-        for sp in self.store.list_spaces(opened_only=False):
-            for m in self.store.list_sessions(sp.id, limit=50, include_pinned=False):
-                if m.status == "running":
-                    running.append({"space_id": sp.id, "session_id": m.id, "title": m.title})
+        """控制面板：正在跑的 + 最近完成的（近期活动流）。
+
+        以前只筛 status == "running"，且只返回 space_id / session_id / title：
+        任务一结束就从列表消失，用户看到的是"少了一条"而不是"跑完了"，加上总线里
+        本来就没有完成帧，于是完全看不到状态变化。现在完成的带终态、验证结果和
+        updated_at 在 recent 里留存 24 小时，前端据此显示"刚完成 ✓ / ✗ 未通过"。
+        """
+        cutoff = datetime.now(UTC).timestamp() - RECENT_DONE_WINDOW_MINUTES * 60
+        running: list[dict[str, Any]] = []
+        recent: list[dict[str, Any]] = []
+        for space in self.store.list_spaces(opened_only=False):
+            for meta in self.store.list_sessions(space.id, limit=50, include_pinned=False):
+                item = {
+                    "space_id": space.id,
+                    "space_name": space.name,
+                    "session_id": meta.id,
+                    "title": meta.title,
+                    "status": meta.status,
+                    "updated_at": meta.updated_at,
+                    "verification": _verification_status(meta),
+                }
+                if meta.status == "running":
+                    running.append(item)
+                elif meta.status in FINAL_STATUSES and _within_window(meta.updated_at, cutoff):
+                    recent.append(item)
+        recent.sort(key=lambda item: item["updated_at"], reverse=True)
         return Response(
             200,
             {
                 "running": running,
+                "recent": recent[:RECENT_DONE_LIMIT],
                 "opened_spaces": len(self.store.list_spaces(opened_only=True)),
             },
         )
