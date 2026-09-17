@@ -50,6 +50,7 @@
 
 ## 索引
 
+- [2026-09-17 工作台 W1 + W2：Space/会话持久化 + 本地 HTTP + SSE API](2026-09-17-workbench-spaces-and-local-api.md)
 - [2026-09-17 M2 完成：其余 6 个内置工具 + 输出截断落盘 + 只读并行/含写串行](2026-09-17-m2-tools-truncation-and-fixes.md)
 - [2026-09-17 M2 第一段：工具抽象 + list_dir + 带工具调用的 Agent loop](2026-09-17-m2-tool-calling-list-dir.md)
 - [2026-09-17 新增 changelog-writer 子 agent，用于推送前写变更记录](2026-09-17-changelog-writer-agent.md)
