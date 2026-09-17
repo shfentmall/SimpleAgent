@@ -1,4 +1,4 @@
-"""事件类型：LLM 客户端（以及后续的 agent loop）产出的事件流。
+"""事件类型：LLM 客户端和 agent loop 产出的事件流。
 
 前端（REPL / headless / daemon）只消费事件，不关心事件从哪来。
 """
@@ -61,4 +61,33 @@ class MessageDone:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-Event = TextDelta | ReasoningDelta | MessageDone
+@dataclass
+class ToolCallStart:
+    """模型要求调用一个工具，马上执行。"""
+
+    call_id: str
+    name: str
+    arguments: str  # 模型给的原始 JSON 字符串，怎么显示由前端决定
+
+
+@dataclass
+class ToolResult:
+    """一次工具调用的结果；content 就是回给模型的文本。"""
+
+    call_id: str
+    name: str
+    content: str
+    is_error: bool = False
+
+    def as_message(self) -> dict[str, Any]:
+        return {"role": "tool", "tool_call_id": self.call_id, "content": self.content}
+
+
+@dataclass
+class MaxStepsReached:
+    """一轮对话请求模型的次数达到上限，loop 停止。"""
+
+    max_steps: int
+
+
+Event = TextDelta | ReasoningDelta | MessageDone | ToolCallStart | ToolResult | MaxStepsReached

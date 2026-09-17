@@ -1,7 +1,8 @@
-"""交互式 REPL：读取输入 → 流式调用模型 → 渲染事件。
+"""交互式 REPL：读取输入 → 交给 Agent 执行 → 渲染事件。
 
+状态（消息历史、用量、当前模型）在 Agent / Session 里，REPL 只负责输入输出。
 用 asyncio.Runner 在多轮之间复用同一个事件循环（AsyncOpenAI 的连接池绑定在循环上）。
-Runner 会把 Ctrl+C 转成当前任务的 CancelledError，于是中断时可以在 chat() 里收尾。
+Runner 会把 Ctrl+C 转成当前任务的 CancelledError，Agent.run() 收到后修好历史再抛出。
 """
 
 from __future__ import annotations
@@ -10,14 +11,25 @@ import asyncio
 import os
 import sys
 from collections.abc import Callable
-from typing import Any, TextIO
+from pathlib import Path
+from typing import TextIO
 
 import openai
 
+from simpleagent.agent.loop import Agent
 from simpleagent.agent.prompt import build_system_prompt
+from simpleagent.agent.session import Session
 from simpleagent.config import ENV_FILENAME, Config, ConfigError, Profile, home_dir
-from simpleagent.events import MessageDone, ReasoningDelta, TextDelta, Usage
+from simpleagent.events import (
+    MaxStepsReached,
+    MessageDone,
+    ReasoningDelta,
+    TextDelta,
+    ToolCallStart,
+    ToolResult,
+)
 from simpleagent.llm.client import LLM, LLMClient
+from simpleagent.tools import ToolRegistry, builtin_tools
 from simpleagent.trace import Tracer, new_session_id
 
 try:
@@ -35,6 +47,8 @@ HELP = '''命令：
   /exit           退出
 多行输入：单独一行输入 """ 开始，再输入 """ 结束。
 Ctrl+C 中断当前回复，Ctrl+D 退出。'''
+
+TOOL_PREVIEW_LINES = 5  # 工具结果在终端里预览的行数；完整内容在 trace 里
 
 LLMFactory = Callable[[str, Profile], LLM]
 
@@ -77,22 +91,30 @@ def describe_error(error: openai.APIError, profile: Profile) -> str:
     return text
 
 
+def _clip(line: str, width: int = 200) -> str:
+    return line if len(line) <= width else line[:width] + "…"
+
+
 class Renderer:
-    """把事件流渲染到终端：思考内容灰色显示，正文正常显示。"""
+    """把事件流渲染到终端：思考内容和工具调用灰色显示，正文正常显示，工具出错红色显示。"""
 
     def __init__(self, out: TextIO, color: bool, show_reasoning: bool):
         self.out = out
         self.color = color
         self.show_reasoning = show_reasoning
         self.mode: str | None = None  # None / "reasoning" / "text"
-        self.text = ""
+        self.last_call_id: str | None = None  # 刚显示过调用行、还没显示结果的 tool_call
 
     def _write(self, text: str, style: str = "") -> None:
         self.out.write(f"{style}{text}{RESET}" if style and self.color else text)
         self.out.flush()
 
-    def on_event(self, event: TextDelta | ReasoningDelta) -> None:
-        if isinstance(event, ReasoningDelta):
+    def on_event(self, event: TextDelta | ReasoningDelta | ToolCallStart | ToolResult) -> None:
+        if isinstance(event, ToolCallStart):
+            self.tool_start(event)
+        elif isinstance(event, ToolResult):
+            self.tool_result(event)
+        elif isinstance(event, ReasoningDelta):
             if not self.show_reasoning:
                 return
             if self.mode != "reasoning":
@@ -103,8 +125,23 @@ class Renderer:
             if self.mode == "reasoning":
                 self._write("\n\n")
             self.mode = "text"
-            self.text += event.text
             self._write(event.text)
+
+    def tool_start(self, event: ToolCallStart) -> None:
+        self.end()
+        self._write(f"→ {event.name} {_clip(event.arguments)}\n", DIM)
+        self.last_call_id = event.call_id
+
+    def tool_result(self, event: ToolResult) -> None:
+        # 一次并行调用多个工具时，结果不紧跟在自己的调用行后面，加一行标明是谁的结果
+        if event.call_id != self.last_call_id:
+            self._write(f"← {event.name}\n", DIM)
+        self.last_call_id = None
+        lines = event.content.splitlines() or [""]
+        shown = [_clip(line) for line in lines[:TOOL_PREVIEW_LINES]]
+        if len(lines) > TOOL_PREVIEW_LINES:
+            shown.append(f"…（共 {len(lines)} 行）")
+        self._write("".join(f"  {line}\n" for line in shown), RED if event.is_error else DIM)
 
     def end(self) -> None:
         if self.mode is not None:
@@ -126,19 +163,22 @@ class Repl:
         self.out = out or sys.stdout
         self.color = _supports_color(self.out)
         self.input_fn = input_fn
-        self.session_id = new_session_id()
+        self.session = Session(new_session_id())
         self.tracer = Tracer(
             home_dir() / "traces",
-            self.session_id,
+            self.session.id,
             enabled=config.trace.enabled,
             raw_chunks=config.trace.raw_chunks,
         )
         self.llm_factory = llm_factory or (lambda name, p: LLMClient(name, p, tracer=self.tracer))
-        self.system_prompt = build_system_prompt(config.system_prompt)
-        self.messages: list[dict[str, Any]] = []
-        self.usage = Usage()
-        self.requests = 0
-        self.llm = self._make_llm(profile or config.default_profile)
+        cwd = Path.cwd()
+        self.agent = Agent(
+            llm=self._make_llm(profile or config.default_profile),
+            tools=ToolRegistry(builtin_tools()),
+            system_prompt=build_system_prompt(config.system_prompt, cwd=cwd),
+            cwd=cwd,
+            max_steps=config.max_steps,
+        )
 
     def _make_llm(self, name: str) -> LLM:
         if name not in self.config.profiles:
@@ -154,7 +194,8 @@ class Repl:
     # ------------------------------------------------------------------ 主循环
 
     def run(self) -> int:
-        self.print(f"SimpleAgent · {self.llm.name}（{self.llm.profile.model}）", BOLD)
+        llm = self.agent.llm
+        self.print(f"SimpleAgent · {llm.name}（{llm.profile.model}）", BOLD)
         if self.config.trace.enabled:
             self.print(f"trace：{self.tracer.dir}", DIM)
         self.print("输入 /help 查看命令", DIM)
@@ -177,7 +218,7 @@ class Repl:
                     except KeyboardInterrupt:
                         self.print("[已中断]", DIM)
             finally:
-                runner.run(self.llm.close())
+                runner.run(self.agent.llm.close())
         return 0
 
     def _read_input(self) -> str:
@@ -199,37 +240,25 @@ class Repl:
     # ------------------------------------------------------------------ 对话
 
     async def chat(self, text: str) -> None:
-        self.messages.append({"role": "user", "content": text})
+        # 历史的维护（包括中断、出错后的修复）都在 Agent.run() 里，这里只负责显示
         renderer = Renderer(self.out, self.color, self.config.show_reasoning)
-        request = [{"role": "system", "content": self.system_prompt}, *self.messages]
-        done: MessageDone | None = None
         try:
-            async for event in self.llm.stream(request):
+            async for event in self.agent.run(self.session, text):
                 if isinstance(event, MessageDone):
-                    done = event
+                    renderer.end()
+                    self.print(format_stats(event, self.agent.llm.profile.model), DIM)
+                elif isinstance(event, MaxStepsReached):
+                    self.print(
+                        f"[达到 max_steps={event.max_steps}，本轮停止；输入“继续”可以接着做]", DIM
+                    )
                 else:
                     renderer.on_event(event)
         except asyncio.CancelledError:
             renderer.end()
-            # 保留已经输出的部分，让下一轮对话能接上；什么都没输出就撤回这条用户消息
-            if renderer.text:
-                self.messages.append({"role": "assistant", "content": renderer.text})
-            else:
-                self.messages.pop()
             raise
         except openai.APIError as e:
             renderer.end()
-            self.messages.pop()
-            self.print(f"请求失败：{describe_error(e, self.llm.profile)}", RED)
-            return
-
-        renderer.end()
-        assert done is not None, "stream 结束时必须产出 MessageDone"
-        self.messages.append(done.message)
-        self.requests += 1
-        if done.usage:
-            self.usage += done.usage
-        self.print(format_stats(done, self.llm.profile.model), DIM)
+            self.print(f"请求失败：{describe_error(e, self.agent.llm.profile)}", RED)
 
     # ------------------------------------------------------------------ 命令
 
@@ -242,12 +271,12 @@ class Repl:
             case "help":
                 self.print(HELP)
             case "clear":
-                self.messages.clear()
+                self.session.messages.clear()
                 self.print("已清空对话历史")
             case "usage":
-                u = self.usage
+                u = self.session.usage
                 self.print(
-                    f"请求 {self.requests} 次"
+                    f"请求 {self.session.requests} 次"
                     f" · 输入 {u.prompt_tokens:,}（缓存 {u.cached_tokens:,}）"
                     f" · 输出 {u.completion_tokens:,}（思考 {u.reasoning_tokens:,}）"
                 )
@@ -260,7 +289,7 @@ class Repl:
     async def _switch_model(self, name: str) -> None:
         if not name:
             for profile_name, profile in self.config.profiles.items():
-                mark = "*" if profile_name == self.llm.name else " "
+                mark = "*" if profile_name == self.agent.llm.name else " "
                 self.print(f" {mark} {profile_name:<12} {profile.model}  {profile.base_url}")
             return
         try:
@@ -268,6 +297,6 @@ class Repl:
         except ConfigError as e:
             self.print(f"切换失败：{e}", RED)
             return
-        await self.llm.close()
-        self.llm = llm
+        await self.agent.llm.close()
+        self.agent.llm = llm
         self.print(f"已切换到 {name}（{llm.profile.model}），对话历史保留")

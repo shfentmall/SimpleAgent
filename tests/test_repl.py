@@ -60,7 +60,7 @@ async def test_chat_turn_records_history_and_prints_stats(config: Config):
     await h.repl.handle("你好")
     await h.repl.handle("再来")
 
-    assert h.repl.messages == [
+    assert h.repl.session.messages == [
         {"role": "user", "content": "你好"},
         {"role": "assistant", "content": "你好！", "reasoning_content": "用户在打招呼"},
         {"role": "user", "content": "再来"},
@@ -69,13 +69,13 @@ async def test_chat_turn_records_history_and_prints_stats(config: Config):
     second_request = h.fakes["a"].requests[1]["messages"]
     assert second_request[0]["role"] == "system"
     assert "工作目录" in second_request[0]["content"]
-    assert second_request[1:] == h.repl.messages[:3]
+    assert second_request[1:] == h.repl.session.messages[:3]
 
     assert "思考：用户在打招呼" in h.output
     assert "你好！" in h.output
     assert "[model-a · 输入 20 · 输出 8" in h.output
-    assert h.repl.requests == 2
-    assert h.repl.usage.prompt_tokens == 20
+    assert h.repl.session.requests == 2
+    assert h.repl.session.usage.prompt_tokens == 20
 
 
 async def test_model_switch_keeps_history(config: Config):
@@ -86,7 +86,7 @@ async def test_model_switch_keeps_history(config: Config):
 
     await h.repl.handle("/model b")
     assert h.fakes["a"].closed
-    assert h.repl.llm.name == "b"
+    assert h.repl.agent.llm.name == "b"
     await h.repl.handle("q2")
     assert h.fakes["b"].requests[0]["messages"][1:] == [
         {"role": "user", "content": "q1"},
@@ -99,7 +99,7 @@ async def test_model_switch_failures_keep_current_model(config: Config):
     h = Harness(config, {}, broken={"b"})
     await h.repl.handle("/model nope")
     await h.repl.handle("/model b")
-    assert h.repl.llm.name == "a"
+    assert h.repl.agent.llm.name == "a"
     assert "没有名为 'nope' 的 profile" in h.output
     assert "b 缺少 API key" in h.output
 
@@ -108,7 +108,7 @@ async def test_api_error_rolls_back_user_message(config: Config):
     error = openai.APIConnectionError(request=httpx2.Request("POST", "http://a.invalid/v1"))
     h = Harness(config, {"a": [error]})
     await h.repl.handle("hi")
-    assert h.repl.messages == []
+    assert h.repl.session.messages == []
     assert "请求失败" in h.output
     assert "检查 API key" not in h.output
 
@@ -139,13 +139,13 @@ async def test_cancel_keeps_partial_reply(config: Config):
 
     # 已有输出：保留部分回复
     await cancel_when(lambda: "这是" in h.output)
-    assert h.repl.messages[0] == {"role": "user", "content": "hi"}
-    assert h.repl.messages[1]["role"] == "assistant"
-    assert h.repl.messages[1]["content"].startswith("这是")
+    assert h.repl.session.messages[0] == {"role": "user", "content": "hi"}
+    assert h.repl.session.messages[1]["role"] == "assistant"
+    assert h.repl.session.messages[1]["content"].startswith("这是")
 
     # 还没输出：撤回这条用户消息
     await cancel_when(lambda: len(h.fakes["a"].requests) == 2)
-    assert len(h.repl.messages) == 2
+    assert len(h.repl.session.messages) == 2
 
 
 async def test_commands(config: Config):
@@ -154,7 +154,7 @@ async def test_commands(config: Config):
     assert await h.repl.handle("/usage")
     assert "请求 1 次" in h.output
     assert await h.repl.handle("/clear")
-    assert h.repl.messages == []
+    assert h.repl.session.messages == []
     assert await h.repl.handle("/whatever")
     assert "未知命令 /whatever" in h.output
     assert await h.repl.handle("/exit") is False
@@ -169,3 +169,62 @@ def test_run_loop_with_multiline_input(config: Config):
     }
     assert "/model [name]" in h.output
     assert h.fakes["a"].closed
+
+
+async def test_tool_call_is_rendered(config: Config, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # REPL 创建时取当前目录作为工具的工作目录
+    for i in range(8):
+        (tmp_path / f"f{i}.txt").write_text("hello")
+    h = Harness(
+        config,
+        {"a": [{"tool_calls": [{"name": "list_dir", "arguments": {"depth": 1}}]}, "一共 8 个文件"]},
+    )
+    await h.repl.handle("当前目录有什么？")
+
+    lines = h.output.splitlines()
+    start = lines.index('→ list_dir {"depth": 1}')
+    assert lines[start + 1 : start + 7] == [
+        f"  {tmp_path.resolve()}",
+        "  f0.txt 5B",
+        "  f1.txt 5B",
+        "  f2.txt 5B",
+        "  f3.txt 5B",
+        "  …（共 9 行）",
+    ]
+    assert "一共 8 个文件" in h.output
+    assert h.output.count("[model-a") == 2
+    assert [m["role"] for m in h.repl.session.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+
+
+async def test_parallel_results_are_labeled_and_errors_shown(config: Config, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    calls = [
+        {"id": "c1", "name": "list_dir", "arguments": {"path": "nope"}},
+        {"id": "c2", "name": "list_dir", "arguments": {}},
+    ]
+    h = Harness(config, {"a": [{"tool_calls": calls}, "好的"]})
+    await h.repl.handle("看看")
+
+    lines = h.output.splitlines()
+    start = lines.index('→ list_dir {"path": "nope"}')
+    assert lines[start + 1 : start + 7] == [
+        "→ list_dir {}",
+        "← list_dir",
+        f"  错误：路径不存在：{tmp_path.resolve() / 'nope'}",
+        "← list_dir",
+        f"  {tmp_path.resolve()}",
+        "  (空目录)",
+    ]
+
+
+async def test_max_steps_message(config: Config, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config.max_steps = 1
+    h = Harness(config, {"a": [{"tool_calls": [{"name": "list_dir", "arguments": {}}]}]})
+    await h.repl.handle("看看")
+    assert "[达到 max_steps=1，本轮停止" in h.output

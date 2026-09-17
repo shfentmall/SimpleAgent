@@ -40,7 +40,9 @@
   └──────────────┘
 ```
 
-### Agent loop（M2，目标约 150 行）
+### Agent loop（M2，主体已实现，见 `agent/loop.py`）
+
+下面是设计草图；`context.build`（预算和压缩）到 M6 才加入，目前直接拼 system prompt + 历史。
 
 ```python
 async def run(self, session, user_input) -> AsyncIterator[Event]:
@@ -63,24 +65,27 @@ async def run(self, session, user_input) -> AsyncIterator[Event]:
 
 要点：
 - 流式 `tool_calls` 按 `index` 分片到达，要自己拼（`StreamAccumulator` 已实现）
-- 模型给出非法 JSON 参数时，把错误作为 tool 结果回给模型自我纠正，不抛异常
-- Ctrl+C 中断时，给还没返回结果的 tool_call 补“已取消”结果，否则下一次请求会被 API 拒绝
-- 工具输出过长：完整内容落盘，只给模型返回开头部分和文件路径
+- 模型给出非法 JSON 参数时，把错误作为 tool 结果回给模型自我纠正，不抛异常（`ToolRegistry.execute`：未知工具、非法 JSON、参数校验失败、工具异常都转成 `错误：...` 文本）
+- Ctrl+C 或 API 出错时，给还没返回结果的 tool_call 补“执行被中断”结果，否则下一次请求会被 API 拒绝；已输出的部分正文保留，这一轮什么都没留下就撤回用户消息（`Agent._repair`）
+- 同一条消息里的多个 tool_call 用 `asyncio.gather` 并行执行；以后有了写操作工具，再按只读/非只读区分并行和依次执行
+- 工具输出过长：完整内容落盘，只给模型返回开头部分和文件路径（待做）
 
 ### Tool 抽象（M2）
 
 ```python
-class ReadFileArgs(BaseModel):
-    path: str = Field(description="文件绝对路径")
-    offset: int = 0
-    limit: int = 2000
+class ListDirArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(".", description="要列出的目录，绝对路径或相对工作目录的路径")
+    depth: int = Field(2, ge=1, le=5, description="展开层数，1 表示只列直接子项")
 
 
-@tool(name="read_file", description="...", permission="allow")  # allow / ask / deny
-async def read_file(args: ReadFileArgs, ctx: ToolContext) -> str: ...
+@tool(name="list_dir", description="...")  # M3 再加 permission="allow" / "ask" / "deny"
+async def list_dir(args: ListDirArgs, ctx: ToolContext) -> str: ...
 ```
-- schema 由 `Args.model_json_schema()` 生成，包装成 `{"type": "function", "function": {...}}`
-- `ToolContext` 带上 cwd、session、approver（审批器）、中断信号
+- schema 由 `Args.model_json_schema()` 生成，去掉 pydantic 自动加的 `title`，包装成 `{"type": "function", "function": {...}}`
+- 可以预期的失败抛 `ToolError`，消息原样回给模型；相对路径用 `ctx.resolve()` 基于 `ctx.cwd` 解析
+- `ToolContext` 目前只有 cwd；后续加 session、approver（审批器）、进度上报、中断信号
 - 审批器由前端注入：REPL 版询问用户（y / n / always）；headless 版按任务的 `allowed_tools` 白名单判断，需要 ask 的一律拒绝，并把拒绝原因回给模型
 
 ### LLM Client 与配置（M1，已实现）
@@ -138,7 +143,7 @@ async def read_file(args: ReadFileArgs, ctx: ToolContext) -> str: ...
 
 为了让终端、桌面客户端、定时任务共用同一个核心：
 
-1. **状态归 `Agent` / `Session`**：消息历史、用量、当前模型不放在任何界面层（M1 暂时在 `Repl` 里，M2 迁出）
+1. **状态归 `Agent` / `Session`**：消息历史、用量、当前模型不放在任何界面层（M1 暂时在 `Repl` 里，M2 已迁到 `Agent` / `Session`）
 2. **审批器是异步接口**：`async def approve(...)`，终端、客户端、无人值守各自实现
 3. **工具能上报进度**：`ToolContext.emit(event)`，长时间运行的工具（比如外部 agent）靠它流式反馈
 4. **取消是显式调用**：`agent.cancel()`；Ctrl+C、客户端的停止按钮都只是调用方
@@ -146,7 +151,7 @@ async def read_file(args: ReadFileArgs, ctx: ToolContext) -> str: ...
 
 ## 代码结构
 
-✅ 表示已实现，其余按里程碑逐步加入。
+✅ 表示已实现，🚧 表示部分实现，其余按里程碑逐步加入。
 
 ```
 src/simpleagent/
@@ -158,10 +163,10 @@ src/simpleagent/
   llm/client.py           ✅ 流式调用、chunk 拼接、思考内容、quirks
   llm/fake.py             ✅ 测试用的脚本化模型
   agent/prompt.py         ✅ system prompt 组装（后续加 AGENTS.md、记忆、skills 列表）
-  agent/loop.py              Agent loop（M2）
-  agent/session.py           JSONL 持久化、恢复会话（M3）
+  agent/loop.py           ✅ Agent loop：工具调用循环、max_steps、中断后修复历史
+  agent/session.py        ✅ 会话状态：消息历史、用量（M3 加 JSONL 持久化、恢复会话）
   agent/context.py           token 预算、结果清理、压缩（M6）
-  tools/                     Tool 抽象、注册表、内置工具（M2 起）
+  tools/                  🚧 Tool 抽象、注册表、list_dir（其余内置工具待做）
   permissions.py             规则匹配、工作目录边界（M3）
   scheduler/                 定时 daemon（M4）
   mcp/client.py              stdio JSON-RPC MCP 客户端（M5）

@@ -8,7 +8,7 @@
 |---|---|---|---|
 | ✅ | **M0 脚手架** | uv 项目、配置加载、trace 落盘、FakeLLM、pytest + ruff | 项目骨架、可测试性 |
 | ✅ | **M1 流式对话** | `sa` REPL；OpenAI 兼容流式客户端；`/model` 切换 profile；思考内容显示；usage 统计；Ctrl+C 中断 | Chat Completions 协议、SSE、各家兼容差异 |
-| | **M2 工具调用 + Agent Loop** | Tool 抽象和注册表；`read_file / write_file / edit_file / list_dir / glob / grep / bash`（带超时）；并行执行；错误回传；输出截断；中断时补结果；`max_steps` | Function calling、ReAct 循环、错误自愈 |
+| 🚧 | **M2 工具调用 + Agent Loop** | Tool 抽象和注册表；`read_file / write_file / edit_file / list_dir / glob / grep / bash`（带超时）；并行执行；错误回传；输出截断；中断时补结果；`max_steps` | Function calling、ReAct 循环、错误自愈 |
 | | **M3 权限 + 会话 + Headless** | allow/ask/deny 规则、工作目录边界、危险命令识别；JSONL 会话和 `sa --resume`；`sa run "..."` 单次无人值守执行 | 人在回路、状态持久化、无人值守的安全边界 |
 | | **M4 个人自动化 v1** ⭐ | `sa daemon`（croniter）；`schedules.toml` 定义任务（prompt / profile / allowed_tools / notify）；`web_fetch`、`notify`（macOS 通知 + 飞书/Telegram webhook）、`schedule_add/list/remove` 工具；运行日志；可选 launchd 常驻 | 事件驱动 agent、无人值守的权限策略 |
 | | **M5 MCP 客户端** | 手写 stdio JSON-RPC（`initialize` → `tools/list` → `tools/call`）；工具名 `mcp__<server>__<tool>`；子进程生命周期管理；先接 `@modelcontextprotocol/server-filesystem` 验证，再接日历/邮件/IM；远程 HTTP 和 OAuth 以后引入官方 `mcp` SDK | MCP 协议、工具生态接入 |
@@ -17,6 +17,8 @@
 | | **M8 子 agent + 外部 agent + Hooks** | `task` 工具启动子 agent（独立上下文、受限工具集、只返回结论）；Claude Code / OpenCode 包装成工具（无头 CLI 流式输出，保存 session id 以便追问）；`todo` 工具；pre/post tool hooks（外部命令） | 上下文隔离、任务分解、多 agent 协作 |
 | | **M9 实验区（持续）** | `evals/`：真实任务加校验脚本，对比不同模型和 feature 开关；新 feature 通过开关接入，结论写进 notes | 用评测驱动迭代 |
 | | **W 个人 AI 工作台** | 桌面客户端 + 常驻后台引擎（本地 API、通知路由、客户端审批）。功能清单和客户端技术栈**待设计** | 客户端/服务端分离、事件推送 |
+
+M2 进度：已完成 Tool 抽象和注册表、`list_dir`、带工具调用的 loop（并行执行、错误回传、中断补结果、`max_steps`）；待做其余 6 个内置工具和输出截断落盘。
 
 M4 完成后就是一个每天能真正用上的自动化 agent；M5–M8 在此基础上逐步增强。工作台的前置条件是 M2 的接口约定（见 [ARCHITECTURE.md](ARCHITECTURE.md#m2-起就要守住的接口约定)）和 M4 的后台常驻进程，具体时间点等设计完再定。
 

@@ -7,6 +7,7 @@
 
 default_profile = "deepseek"
 show_reasoning = true
+# max_steps = 20   # 一轮对话最多请求模型几次，防止模型无限调用工具
 # system_prompt = "你是 SimpleAgent，一个运行在用户本地电脑上的个人助手。回答简洁、准确。"
 
 [trace]

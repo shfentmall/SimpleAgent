@@ -127,6 +127,8 @@ class Config(BaseModel):
     profiles: dict[str, Profile]
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     show_reasoning: bool = True
+    # 一轮对话里最多请求模型几次，防止模型无限调用工具
+    max_steps: int = Field(20, ge=1)
     trace: TraceConfig = Field(default_factory=TraceConfig)
 
     @model_validator(mode="after")
