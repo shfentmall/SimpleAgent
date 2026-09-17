@@ -144,7 +144,8 @@ def test_cli_missing_binary_reports_clearly(config, sa_home, tmp_path, monkeypat
 
     runner.run_input(space.id, session.id, "你好")
     frames = _run_until_settled(runner, session.id)
-    assert "找不到可执行文件" in frames[0].payload["message"]
+    errors = [f for f in frames if f.type == "error"]  # 前面可能还有一帧 status=running
+    assert "找不到可执行文件" in errors[0].payload["message"]
     assert frames[-1].payload["status"] == "error"
     runner.shutdown()
 

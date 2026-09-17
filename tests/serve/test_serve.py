@@ -10,6 +10,7 @@ import json
 import threading
 import time
 import urllib.request
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from simpleagent.llm.fake import FakeLLM
@@ -230,3 +231,130 @@ def test_serve_http_sse(config, sa_home):
 
     httpd.shutdown()
     srv.join(timeout=3)
+
+
+# ------------------------------------------------- 7. 正常结束必须广播 status: done
+def test_runner_emits_status_done(config, sa_home):
+    """跑完要发 status: done —— 控制面板靠这一帧知道任务结束了。
+
+    改动前只有 cancelled / error 发帧，正常结束只写 meta，所以"跑完了"从来没出过总线。
+    """
+    store = SpaceStore(sa_home)
+    space = store.create_space(SpaceSpec(name="t", kind="generic", profile="a"))
+    session = store.create_session(space.id)
+    runner = Runner(config, store=store, llm_factory=_fake_factory([{"content": "干完了"}]))
+    runner.start()
+    q, _ = runner.bus.subscribe(session.id)
+
+    runner.run_input(space.id, session.id, "hi")
+
+    frames: list[Frame] = []
+    while True:
+        f = q.get(timeout=5)
+        frames.append(f)
+        if f.type == "status" and f.payload["status"] == "done":
+            break
+
+    # 开场先发 running，面板才知道"开始了"
+    assert frames[0].type == "status"
+    assert frames[0].payload["status"] == "running"
+    assert frames[0].payload["space_id"] == space.id
+    # 收尾帧排在最后一条 message_done 之后，且带上 usage
+    last_message_done = max(i for i, f in enumerate(frames) if f.type == "message_done")
+    assert last_message_done < len(frames) - 1
+    assert frames[-1].payload["space_id"] == space.id
+    assert "usage" in frames[-1].payload
+    # 落盘终态
+    assert store.get_session_meta(space.id, session.id).status == "done"
+    runner.shutdown()
+
+
+# ------------------------------------------------- 8. 取消仍要广播 status: cancelled
+def test_runner_emits_status_cancelled(config, sa_home):
+    """取消也走 _finalize 发帧 —— 重构收口点时不能把这条弄丢。"""
+    store = SpaceStore(sa_home)
+    space = store.create_space(SpaceSpec(name="t", kind="generic", profile="a"))
+    session = store.create_session(space.id)
+    # delay 让这一轮停在半路，好在它跑完之前取消
+    runner = Runner(
+        config, store=store, llm_factory=_fake_factory([{"content": "慢吞吞", "delay": 5}])
+    )
+    runner.start()
+    q, _ = runner.bus.subscribe(session.id)
+
+    runner.run_input(space.id, session.id, "hi")
+    while True:
+        f = q.get(timeout=5)
+        if f.type == "status" and f.payload["status"] == "running":
+            break
+
+    runner.cancel(session.id)
+    statuses = []
+    while True:
+        f = q.get(timeout=5)
+        if f.type == "status":
+            statuses.append(f.payload["status"])
+            if f.payload["status"] == "cancelled":
+                break
+
+    assert "cancelled" in statuses
+    assert store.get_session_meta(space.id, session.id).status == "cancelled"
+    runner.shutdown()
+
+
+# ------------------------------------------------- 9. 面板把完成的会话留在 recent 里
+def test_panel_summary_lists_recent_done(config, sa_home):
+    """跑完的任务要留在面板的 recent 里，而不是从列表消失。"""
+    from simpleagent.serve.app import Server
+
+    store = SpaceStore(sa_home)
+    space = store.create_space(SpaceSpec(name="整理", kind="generic", profile="a"))
+    session = store.create_session(space.id)
+    runner = Runner(config, store=store, llm_factory=_fake_factory([{"content": "ok"}]))
+    runner.start()
+    q, _ = runner.bus.subscribe(session.id)
+
+    runner.run_input(space.id, session.id, "hi")
+    while True:
+        f = q.get(timeout=5)
+        if f.type == "status" and f.payload["status"] == "done":
+            break
+    runner.shutdown()
+
+    app = Server(config, store=store, runner=runner)
+    body = app.handle("GET", "/api/panel/summary", {}, b"").body
+
+    assert body["running"] == []
+    assert len(body["recent"]) == 1
+    item = body["recent"][0]
+    assert item["session_id"] == session.id
+    assert item["space_id"] == space.id
+    assert item["space_name"] == "整理"
+    assert item["status"] == "done"
+    assert item["verification"] == "unknown"
+    assert item["updated_at"]
+
+
+# ------------------------------------------------- 10. 超出留存窗口的完成记录会掉出
+def test_panel_summary_drops_stale_recent(config, sa_home):
+    """超过留存窗口的完成记录要从 recent 消失，别让面板无限长。"""
+    from simpleagent.serve.app import Server
+
+    store = SpaceStore(sa_home)
+    space = store.create_space(SpaceSpec(name="t", kind="generic", profile="a"))
+    session = store.create_session(space.id)
+    store.update_meta(space.id, session.id, status="done")
+    app = Server(config, store=store, runner=Runner(config, store=store))
+
+    def recent_ids() -> list[str]:
+        body = app.handle("GET", "/api/panel/summary", {}, b"").body
+        return [item["session_id"] for item in body["recent"]]
+
+    assert recent_ids() == [session.id]
+
+    # 手动把 updated_at 推回 25 小时前
+    meta = store.get_session_meta(space.id, session.id)
+    meta.updated_at = (datetime.now(UTC) - timedelta(hours=25)).isoformat(timespec="milliseconds")
+    store._write_meta(space.id, meta)
+
+    assert recent_ids() == []

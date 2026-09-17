@@ -490,6 +490,8 @@ def test_external_executor_never_falls_back_to_builtin_loop(config, sa_home):
         "POST", f"/api/sessions/{session.id}/input", {}, json.dumps({"text": "hi"}).encode()
     )
 
+    started = q.get(timeout=5)
+    assert started.type == "status" and started.payload["status"] == "running"
     first = q.get(timeout=5)
     assert first.type == "error"
     assert "找不到可执行文件" in first.payload["message"]

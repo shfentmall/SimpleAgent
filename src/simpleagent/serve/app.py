@@ -11,6 +11,7 @@ import json
 import queue
 import re
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,28 @@ from simpleagent.tools.walk import IGNORED_DIRS
 # SSE 空闲时多久发一次 keepalive 注释帧。它同时承担「探测客户端是否还活着」的职责：
 # 写入失败是服务端发现对方已经走了的唯一信号（TCP 不会主动告诉我们）。
 KEEPALIVE_INTERVAL = 15.0
+
+# 控制面板的"近期活动流"：任务跑完不在面板上立刻消失，而是在 recent 里留存一段时间。
+# 不留存的话，用户看到的是"列表少了一条"而不是"这条跑完了"，等于看不到状态变化。
+RECENT_DONE_LIMIT = 10
+RECENT_DONE_WINDOW_MINUTES = 24 * 60
+FINAL_STATUSES = frozenset({"done", "error", "cancelled"})
+
+
+def _within_window(ts: str, cutoff: float) -> bool:
+    """时间戳是否晚于 cutoff。解析不出来就当它不在窗口内，别让脏数据把接口打挂。"""
+    try:
+        return datetime.fromisoformat(ts).timestamp() > cutoff
+    except (TypeError, ValueError):
+        return False
+
+
+def _verification_status(meta: Any) -> str:
+    """取验证状态。meta 里既可能是 Verification 对象，也可能是手写进去的 dict。"""
+    v = getattr(meta, "verification", None)
+    if isinstance(v, dict):
+        return v.get("status", "unknown")
+    return getattr(v, "status", "unknown")
 
 
 class Response:
@@ -389,29 +412,41 @@ class Server:
 
     # ----------------------------------------------------------------- 控制面板
     def _panel_summary(self) -> Response:
-        """控制面板顶部那条状态带 + 指挥台要用的运行中列表。"""
-        running = []
+        """控制面板顶部那条状态带 + 指挥台要用的运行中列表 + 近期活动流。
+
+        只列 running 的话，任务一结束就从列表消失，用户看到的是"少了一条"而不是"跑完了"。
+        所以完成的（done / error / cancelled）带终态、验证结果和 updated_at 在 recent 里
+        留存 24 小时，前端据此显示"刚完成 ✓ / ✗ 未通过"。
+        """
+        cutoff = datetime.now(UTC).timestamp() - RECENT_DONE_WINDOW_MINUTES * 60
+        running: list[dict[str, Any]] = []
+        recent: list[dict[str, Any]] = []
         total_tokens = 0
-        for sp in self.store.list_spaces(opened_only=False):
-            for m in self.store.list_sessions(sp.id, limit=50, include_pinned=False):
-                usage = m.usage or {}
+        for space in self.store.list_spaces(opened_only=False):
+            for meta in self.store.list_sessions(space.id, limit=50, include_pinned=False):
+                usage = meta.usage or {}
                 total_tokens += (usage.get("prompt_tokens") or 0) + (
                     usage.get("completion_tokens") or 0
                 )
-                if m.status == "running":
-                    running.append(
-                        {
-                            "space_id": sp.id,
-                            "space_name": sp.name,
-                            "session_id": m.id,
-                            "title": m.title,
-                            "updated_at": m.updated_at,
-                        }
-                    )
+                item = {
+                    "space_id": space.id,
+                    "space_name": space.name,
+                    "session_id": meta.id,
+                    "title": meta.title,
+                    "status": meta.status,
+                    "updated_at": meta.updated_at,
+                    "verification": _verification_status(meta),
+                }
+                if meta.status == "running":
+                    running.append(item)
+                elif meta.status in FINAL_STATUSES and _within_window(meta.updated_at, cutoff):
+                    recent.append(item)
+        recent.sort(key=lambda item: item["updated_at"], reverse=True)
         return Response(
             200,
             {
                 "running": running,
+                "recent": recent[:RECENT_DONE_LIMIT],
                 "opened_spaces": len(self.store.list_spaces(opened_only=True)),
                 "today_tokens": total_tokens,  # 目前是累计口径，等 M4 用量统计再按天切
                 "unread": self.panel.unread_count(),

@@ -191,11 +191,16 @@ class Runner:
             # 起不来必须让客户端知道：这一段在原来是在 try 之外，异常会被 asyncio future
             # 吞掉，表现是「发了消息没有任何反应，且永远停在运行中」。典型触发：没配 API key、
             # profile 不存在、cwd 不存在。CancelledError 继承自 BaseException，不会被这里吃掉。
+            message = f"启动失败：{type(e).__name__}: {e}"
             self.store.update_meta(space_id, session_id, status="error")
-            self.bus.publish(error_frame(session_id, f"启动失败：{type(e).__name__}: {e}"))
-            self.bus.publish(status_frame(session_id, "error"))
+            self.bus.publish(error_frame(session_id, message))
+            self.bus.publish(
+                status_frame(session_id, "error", {"space_id": space_id, "reason": message})
+            )
             self._agents.pop(session_id, None)
             return
+        # 广播一帧 running，面板才知道"开始了"
+        self.bus.publish(status_frame(session_id, "running", {"space_id": space_id}))
 
         task = asyncio.current_task()
         if task is not None:
@@ -210,12 +215,12 @@ class Runner:
                 # 外部 CLI 走完全不同的执行路径，但生成的是同一套事件
                 status = await self._run_cli(space, session, user_input)
         except asyncio.CancelledError:
-            self.bus.publish(status_frame(session_id, "cancelled"))
             self._finalize(space_id, session_id, session, "cancelled")
             raise
         except Exception as e:  # noqa: BLE001  任何异常都转成 error 帧并落盘状态
-            self.bus.publish(error_frame(session_id, f"{type(e).__name__}: {e}"))
-            self._finalize(space_id, session_id, session, "error")
+            message = f"{type(e).__name__}: {e}"
+            self.bus.publish(error_frame(session_id, message))
+            self._finalize(space_id, session_id, session, "error", reason=message)
         else:
             self._finalize(space_id, session_id, session, status)
         finally:
@@ -254,10 +259,26 @@ class Runner:
         self.store.update_meta(space_id, session_id, verification=verification)
         self.bus.publish(verification_frame(session_id, verification))
 
-    def _finalize(self, space_id: str, session_id: str, session: Session, status: str) -> None:
-        self.store.update_meta(space_id, session_id, status=status, usage=session.usage.__dict__)
-        # 收口处统一广播状态：正常结束时没有 error 帧，客户端要靠这帧把「运行中」切回空闲
-        self.bus.publish(status_frame(session_id, status))
+    def _finalize(
+        self,
+        space_id: str,
+        session_id: str,
+        session: Session,
+        status: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """一轮结束的唯一收口点：落盘终态 + 广播一帧 status + 往控制面板发通知。
+
+        正常结束时没有 error 帧，客户端和控制面板都要靠这帧把「运行中」切成终态，
+        所以三个终态（done / error / cancelled）统一在这里广播。
+        """
+        usage = session.usage.__dict__
+        self.store.update_meta(space_id, session_id, status=status, usage=usage)
+        extra: dict[str, Any] = {"space_id": space_id, "usage": usage}
+        if reason is not None:
+            extra["reason"] = reason
+        self.bus.publish(status_frame(session_id, status, extra))
         if status in ("done", "error", "cancelled"):
             self._notify(space_id, session_id, session, status)
 
