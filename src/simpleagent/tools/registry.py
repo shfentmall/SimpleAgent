@@ -10,6 +10,12 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from simpleagent.events import ToolResult
+from simpleagent.permissions import (
+    ApprovalRequest,
+    Decision,
+    Judgment,
+    Scope,
+)
 from simpleagent.tools.base import Tool, ToolContext, ToolError
 from simpleagent.tools.output import (
     DEFAULT_MAX_CHARS,
@@ -20,7 +26,7 @@ from simpleagent.tools.output import (
 if TYPE_CHECKING:
     # 只用于类型标注。不能在这里做运行时导入：serve/__init__ 会拉起 runner，
     # runner 又回来导入本模块的调用方 agent.loop，形成循环导入。
-    from simpleagent.serve.approval import Approver
+    from simpleagent.permissions import Approver, Policy
 
 
 def format_validation_error(error: ValidationError) -> str:
@@ -38,14 +44,17 @@ class ToolRegistry:
         max_output_chars: int = DEFAULT_MAX_CHARS,
         max_output_lines: int = DEFAULT_MAX_LINES,
         approver: Approver | None = None,
+        policy: Policy | None = None,
     ) -> None:
         self._tools: dict[str, Tool] = {}
         for item in tools:
             self.register(item)
         self.max_output_chars = max_output_chars
         self.max_output_lines = max_output_lines
-        # 写操作执行前的审批器；None 表示不审批（沿用旧行为，REPL 默认走这条路径）
+        # 写操作执行前的审批器；None 表示没人可以问（headless 默认按拒绝处理）
         self.approver = approver
+        # 权限判定器；None 表示不判定，所有工具直接放行（M2 的旧行为）
+        self.policy = policy
 
     def register(self, tool: Tool) -> None:
         if tool.name in self._tools:
@@ -60,6 +69,20 @@ class ToolRegistry:
         """未知工具当只读处理：它只会得到一条错误结果，不会有副作用。"""
         tool = self._tools.get(name)
         return True if tool is None else tool.readonly
+
+    def judge(self, tool: Tool, args: Any, ctx: ToolContext) -> Judgment:
+        """判定这次调用该怎么处理：allow / ask / deny，理由在 Judgment.reason 里。
+
+        policy 为 None 时一律放行。scope 提取出错也不甩异常，退化成 ask——
+        判断不了的时候交给能决定的人，不替用户做主。
+        """
+        if self.policy is None:
+            return Judgment(Decision.ALLOW)
+        try:
+            scope = tool.scope(args, ctx) if tool.scope is not None else Scope()
+        except Exception:  # noqa: BLE001  工具的 scope 写错不该让整个 loop 崩掉
+            return Judgment(Decision.ASK, f"无法判断 `{tool.name}` 的影响范围，需要人工确认")
+        return self.policy.decide(tool.permission, scope)
 
     async def execute(self, tool_call: dict[str, Any], ctx: ToolContext) -> ToolResult:
         """执行一个 tool_call。任何失败都转成 is_error 的结果回给模型，不抛异常。
@@ -87,15 +110,25 @@ class ToolRegistry:
             args = tool.args_model.model_validate(data)
         except ValidationError as e:
             return error(f"参数校验失败：{format_validation_error(e)}")
-        # 写操作（readonly=False）执行前先问审批器；只读工具直接放行
-        if self.approver is not None and not tool.readonly:
+        judgment = self.judge(tool, args, ctx)
+        if judgment.decision is Decision.DENY:
+            return ToolResult(call_id, name, judgment.reason, is_error=True)
+        if judgment.decision is Decision.ASK:
+            reason = judgment.reason or f"工具 {name} 会改动文件或执行命令"
+            if self.approver is None:
+                # 无人值守：需要问但没有可以问的人，一律按拒绝处理。
+                # 宁可让模型自己想办法，也不要假装被批准。
+                return error(f"{reason}；当前处于无人值守模式，未被授权，默认拒绝")
             decision = await self.approver.request(
-                session_id=ctx.session_id or "",
-                tool_name=name,
-                arguments=raw_arguments,
+                ApprovalRequest(
+                    session_id=ctx.session_id or "",
+                    tool_name=name,
+                    arguments=raw_arguments,
+                    reason=reason,
+                )
             )
             if not decision.allow:
-                return error(f"工具 {name} 需要人工审批，已被拒绝")
+                return error(f"{reason}；已被拒绝")
         try:
             content = await tool.fn(args, ctx)
         except ToolError as e:

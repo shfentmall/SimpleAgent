@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SimpleAgent 工作台</title>
+<link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+<div class="app">
+  <!-- ───────────────────────── 左栏：功能区 ───────────────────────── -->
+  <aside class="sidebar">
+    <div class="brand"><span class="dot"></span>SimpleAgent</div>
+    <div class="side-scroll">
+      <button id="btn-new-space" class="btn-new">+ 新建空间</button>
+      <div class="nav">
+        <div class="nav-item" data-nav="panel" id="nav-panel"><span class="ico">◎</span>控制面板</div>
+        <div class="nav-item is-disabled" title="M7 实现"><span class="ico">❏</span>知识库<span class="tail">M7</span></div>
+      </div>
+      <input id="search" class="search" type="search" placeholder="搜索会话标题…" autocomplete="off">
+      <div class="section-title">打开的空间<span id="space-count" class="tail"></span></div>
+      <div id="space-list" class="space-list"></div>
+    </div>
+  </aside>
+
+  <!-- ───────────────────────── 右栏：工作区 ───────────────────────── -->
+  <main class="main">
+    <header class="ws-header" id="ws-header">
+      <div class="ws-title">
+        <span id="ws-crumb" class="crumb">未选择会话</span>
+        <span id="ws-badge" class="badge hidden"></span>
+      </div>
+      <div class="ws-meta">
+        <span id="ws-dir" class="ws-dir"></span>
+        <span id="ws-verify" class="chip hidden"></span>
+        <span id="ws-usage" class="chip hidden"></span>
+      </div>
+      <div class="ws-actions">
+        <button id="btn-new-session" class="btn" disabled>新建会话</button>
+        <button id="btn-rerun" class="btn" disabled title="用最后一条用户消息再跑一次">重跑</button>
+        <button id="btn-export" class="btn" disabled title="导出为 Markdown">导出</button>
+        <button id="btn-stop" class="btn" disabled>停止</button>
+        <button id="btn-verify" class="btn" disabled>验证</button>
+      </div>
+    </header>
+
+    <nav class="tabs" id="tabs">
+      <button class="tab is-active" data-tab="chat">对话</button>
+      <button class="tab" data-tab="changes">变更<span id="changes-count" class="tab-badge hidden"></span></button>
+      <button class="tab" data-tab="files">文件</button>
+      <button class="tab" data-tab="logs">日志</button>
+    </nav>
+
+    <div id="pane-chat" class="stream">
+      <div class="empty" id="empty-state">
+        <div class="empty-title">工作台</div>
+        <div class="empty-sub">在左侧选一个会话，或新建一个空间开始。</div>
+      </div>
+    </div>
+    <div id="pane-changes" class="stream hidden"></div>
+    <div id="pane-files" class="stream hidden"></div>
+    <div id="pane-logs" class="stream hidden"></div>
+
+    <!-- ───────── 控制面板（W5）：点左栏「控制面板」时整个右栏换成这个 ───────── -->
+    <div id="pane-panel" class="panel hidden">
+      <div class="panel-stats" id="panel-stats"></div>
+      <div class="panel-grid">
+        <section class="panel-card panel-console">
+          <div class="panel-head">指挥台
+            <span class="panel-sub">@空间名 下发任务，只 @ 则查看状态</span></div>
+          <div class="panel-body" id="dispatch-list"></div>
+          <div class="panel-foot">
+            <textarea id="dispatch-input" rows="2" placeholder="@空间名 任务描述…（输入 @ 出候选）"></textarea>
+            <div class="composer-bar">
+              <div id="dispatch-hint" class="hint"></div>
+              <button id="btn-dispatch" class="btn btn-primary">下发</button>
+            </div>
+          </div>
+        </section>
+        <div class="panel-right">
+          <section class="panel-card panel-inbox">
+            <div class="panel-head">消息
+              <span class="panel-sub"><span id="inbox-filter" class="link">全部</span> ·
+                未读 <span id="inbox-unread">0</span> ·
+                <span id="inbox-readall" class="link">全部已读</span></span></div>
+            <div class="panel-body" id="inbox-list"></div>
+          </section>
+          <section class="panel-card panel-todos">
+            <div class="panel-head">备忘
+              <span class="panel-sub"><span id="todo-add" class="link">+ 添加</span></span></div>
+            <div class="panel-body" id="todo-list"></div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <footer class="composer" id="composer">
+      <textarea id="input" rows="3" placeholder="输入消息…（Enter 发送 · Shift+Enter 换行）" disabled></textarea>
+      <div class="composer-bar">
+        <select id="profile" class="select" disabled></select>
+        <span class="hint" id="status-hint"></span>
+        <button id="btn-send" class="btn btn-primary" disabled>发送</button>
+      </div>
+    </footer>
+  </main>
+</div>
+
+<!-- ───────────────────────── 新建空间向导 ───────────────────────── -->
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">新建空间</div>
+    <label class="field"><span>名称</span><input id="f-name" placeholder="例如：整理下载目录"></label>
+    <label class="field"><span>任务形态</span>
+      <select id="f-kind">
+        <option value="generic">通用任务（自动分配 tmp 目录）</option>
+        <option value="agent">绑定目录（进入已有项目）</option>
+      </select>
+    </label>
+    <label class="field"><span>执行者</span><select id="f-executor"></select></label>
+    <label class="field"><span id="f-model-label">模型</span><select id="f-profile"></select></label>
+    <div class="field-hint hidden" id="f-model-hint">
+      本机默认：不注入任何配置，等同于在那个目录下直接运行 claude / opencode
+    </div>
+    <label class="field hidden" id="f-cwd-wrap"><span>工作目录</span>
+      <input id="f-cwd" placeholder="/Users/…/project"></label>
+    <label class="field"><span>验证命令（可选）</span><input id="f-verify" placeholder="uv run pytest -q"></label>
+    <div class="modal-err" id="modal-err"></div>
+    <div class="modal-foot">
+      <button id="f-cancel" class="btn">取消</button>
+      <button id="f-create" class="btn btn-primary">创建</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/assets/app.js"></script>
+</body>
+</html>

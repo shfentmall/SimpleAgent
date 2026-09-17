@@ -10,13 +10,20 @@
 依赖：仅标准库 + 项目内模块；无新第三方依赖（符合设计文档 A 方案）。
 """
 
-from simpleagent.serve.approval import APIApprover, ApprovalDecision, Approver, PendingApprovals
+from simpleagent.serve.approval import (
+    APIApprover,
+    ApprovalDecision,
+    ApprovalRequest,
+    Approver,
+    PendingApprovals,
+)
 from simpleagent.serve.bus import EventBus, Frame
 from simpleagent.serve.runner import Runner
 
 __all__ = [
     "APIApprover",
     "ApprovalDecision",
+    "ApprovalRequest",
     "Approver",
     "EventBus",
     "Frame",

@@ -13,7 +13,8 @@ import urllib.request
 from typing import Any
 
 from simpleagent.llm.fake import FakeLLM
-from simpleagent.serve.approval import APIApprover, ApprovalDecision, PendingApprovals
+from simpleagent.permissions import ApprovalDecision, ApprovalRequest
+from simpleagent.serve.approval import APIApprover, PendingApprovals
 from simpleagent.serve.bus import EventBus, Frame
 from simpleagent.serve.runner import Runner
 from simpleagent.spaces.models import SpaceSpec
@@ -54,7 +55,7 @@ async def test_approval_roundtrip():
 
     async def requester() -> ApprovalDecision:
         return await approver.request(
-            session_id="se1", tool_name="bash", arguments='{"command":"rm -rf /"}'
+            ApprovalRequest(session_id="se1", tool_name="bash", arguments='{"command":"rm -rf /"}')
         )
 
     task = asyncio.create_task(requester())  # noqa: F821
@@ -68,7 +69,9 @@ async def test_approval_roundtrip():
     assert decision.always is True
 
     # always 生效：同 session 同工具再次请求直接放行，不再推帧
-    decision2 = await approver.request(session_id="se1", tool_name="bash", arguments='{"x":1}')
+    decision2 = await approver.request(
+        ApprovalRequest(session_id="se1", tool_name="bash", arguments='{"x":1}')
+    )
     assert decision2.allow is True
 
 

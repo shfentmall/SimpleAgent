@@ -14,6 +14,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from simpleagent.permissions import Scope
 from simpleagent.tools.base import ToolContext, ToolError, tool
 from simpleagent.tools.walk import is_binary
 
@@ -91,7 +92,13 @@ def _edit(path: Path, old: str, new: str, replace_all: bool) -> str:
     return f"{where}\n{_diff(before, after, path)}"
 
 
-@tool(name="edit_file", description=DESCRIPTION, readonly=False)
+@tool(
+    name="edit_file",
+    description=DESCRIPTION,
+    readonly=False,
+    permission="ask",
+    scope=lambda args, ctx: Scope(paths=(ctx.resolve(args.path),)),
+)
 async def edit_file(args: EditFileArgs, ctx: ToolContext) -> str:
     path = ctx.resolve(args.path)
     if not path.exists():

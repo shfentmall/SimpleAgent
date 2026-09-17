@@ -11,6 +11,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from simpleagent.permissions import Scope
 from simpleagent.tools.base import ToolContext, ToolError, tool
 
 DESCRIPTION = (
@@ -31,7 +32,13 @@ def _write(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-@tool(name="write_file", description=DESCRIPTION, readonly=False)
+@tool(
+    name="write_file",
+    description=DESCRIPTION,
+    readonly=False,
+    permission="ask",
+    scope=lambda args, ctx: Scope(paths=(ctx.resolve(args.path),)),
+)
 async def write_file(args: WriteFileArgs, ctx: ToolContext) -> str:
     path = ctx.resolve(args.path)
     if path.is_dir():

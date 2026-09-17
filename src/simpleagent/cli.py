@@ -3,19 +3,97 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import errno
 import sys
+from pathlib import Path
 
-from simpleagent.config import ConfigError, init_config, load_config
+from simpleagent.agent.session import SESSION_DIRNAME, Session, SessionStore
+from simpleagent.config import ConfigError, home_dir, init_config, load_config
+
+# --resume 不给值时的哨兵：argparse 用 const 填进来，好区分「没传」和「传了但没给 id」
+LATEST = "__latest__"
+
+
+class CliError(Exception):
+    """命令行用法层面的错误：打印一句人话就退出，不像 ConfigError 那样带配置前缀。"""
+
+
+def session_store() -> SessionStore:
+    return SessionStore(home_dir() / SESSION_DIRNAME)
+
+
+def parse_allowed(text: str) -> list[str]:
+    """`--allow "bash, write_file"` → `["bash", "write_file"]`。"""
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def resolve_resume(store: SessionStore, value: str | None) -> Session | None:
+    """把 --resume [<id>] 解析成一个已存在的会话；None 表示这次不恢复，照常新开。"""
+    if value is None:
+        return None
+    session_id = store.latest() if value in (LATEST, "") else value
+    if session_id is None:
+        raise CliError("没有可以恢复的会话（还没保存过任何会话）。")
+    session = store.load(session_id)
+    if session is None:
+        raise CliError(f"找不到会话 {session_id}；用 `sa sessions` 列出已有的会话。")
+    return session
+
+
+def list_sessions(store: SessionStore, limit: int) -> int:
+    rows = store.list(limit=limit)
+    if not rows:
+        print("还没有保存的会话。")
+        return 0
+    for info in rows:
+        print(f"{info.id}   {info.title or '(无标题)'}")
+        detail = [f"{info.messages} 条消息", f"{info.requests} 次请求"]
+        if info.profile:
+            detail.append(info.profile)
+        if info.updated_at:
+            detail.append(f"更新于 {info.updated_at}")
+        print(f"    {' · '.join(detail)}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sa", description="SimpleAgent：自用、可学习的本地 agent")
     parser.add_argument("-m", "--profile", help="模型 profile，默认取配置里的 default_profile")
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const=LATEST,
+        default=None,
+        metavar="ID",
+        help="从已保存的会话继续；不给 id 就接着最近那次",
+    )
     commands = parser.add_subparsers(dest="command", metavar="<command>")
     commands.add_parser("init", help="生成默认配置文件 ~/.simpleagent/config.toml")
     serve = commands.add_parser("serve", help="启动本地 API（HTTP + SSE），供桌面客户端连接")
     serve.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
     serve.add_argument("--port", type=int, default=8384, help="监听端口（默认 8384）")
+    run = commands.add_parser("run", help="headless：执行一个任务后退出，不与人交互")
+    run.add_argument("prompt", help="要做的任务")
+    run.add_argument("--cwd", default=None, help="工作目录，默认当前目录")
+    run.add_argument(
+        "--allow",
+        default="",
+        metavar="TOOLS",
+        help="允许自动执行的工具名，逗号分隔（如 bash,write_file）；没列的一律拒绝",
+    )
+    run.add_argument(
+        "--resume",
+        nargs="?",
+        const=LATEST,
+        default=argparse.SUPPRESS,
+        metavar="ID",
+        help="接着某个已有会话跑",
+    )
+    # 用 SUPPRESS 而不是 None：子解析器没传时不要把父级 -m/--profile 的值覆盖掉
+    run.add_argument("-m", "--profile", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    sessions = commands.add_parser("sessions", help="列出已保存的会话")
+    sessions.add_argument("--limit", type=int, default=20, help="最多显示几条，默认 20")
     args = parser.parse_args(argv)
 
     try:
@@ -25,21 +103,60 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "serve":
             from simpleagent.serve.app import make_server
 
-            httpd = make_server(load_config(), host=args.host, port=args.port)
+            try:
+                httpd = make_server(load_config(), host=args.host, port=args.port)
+            except OSError as e:
+                if e.errno != errno.EADDRINUSE:
+                    raise
+                print(f"端口 {args.port} 已被占用，启动失败。", file=sys.stderr)
+                print("  多半是上一次的 sa serve 还在后台跑——关浏览器不会停掉它。", file=sys.stderr)
+                print(f"  查占用者：lsof -nP -iTCP:{args.port} -sTCP:LISTEN", file=sys.stderr)
+                print("  确认是自己的进程后 kill <PID>，或者换个端口：", file=sys.stderr)
+                print(f"    sa serve --port {args.port + 1}", file=sys.stderr)
+                return 1
             print(f"SimpleAgent 本地 API 已启动：http://{args.host}:{args.port}")
+            print(f"浏览器打开工作台：http://{args.host}:{args.port}/")
             print("按 Ctrl+C 停止。")
             try:
                 httpd.serve_forever()
             except KeyboardInterrupt:
                 print("\n已停止。")
+            finally:
+                httpd.server_close()  # 立刻把端口还回去，不等进程回收
             return 0
+        if args.command == "sessions":
+            return list_sessions(session_store(), args.limit)
+        if args.command == "run":
+            from simpleagent.ui.headless import Headless
+
+            store = session_store()
+            session = resolve_resume(store, getattr(args, "resume", None))
+            cwd = Path(args.cwd).expanduser().resolve() if args.cwd else Path.cwd()
+            frontend = Headless(
+                load_config(),
+                profile=args.profile,
+                cwd=cwd,
+                allowed_tools=parse_allowed(args.allow),
+                session=session,
+                store=store,
+            )
+            with asyncio.Runner() as runner:
+                try:
+                    return runner.run(frontend.run(args.prompt))
+                finally:
+                    runner.run(frontend.agent.llm.close())
         from simpleagent.ui.repl import Repl  # 延迟导入：init 不需要加载 openai
 
-        return Repl(load_config(), profile=args.profile).run()
+        store = session_store()
+        return Repl(
+            load_config(),
+            profile=args.profile,
+            session=resolve_resume(store, args.resume),
+            store=store,
+        ).run()
+    except CliError as e:
+        print(str(e), file=sys.stderr)
+        return 1
     except ConfigError as e:
         print(f"配置错误：{e}", file=sys.stderr)
         return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())

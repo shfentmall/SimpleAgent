@@ -18,7 +18,7 @@ import openai
 
 from simpleagent.agent.loop import Agent
 from simpleagent.agent.prompt import build_system_prompt
-from simpleagent.agent.session import Session
+from simpleagent.agent.session import Session, SessionStore
 from simpleagent.config import (
     ENV_FILENAME,
     TOOL_OUTPUT_DIRNAME,
@@ -36,8 +36,10 @@ from simpleagent.events import (
     ToolResult,
 )
 from simpleagent.llm.client import LLM, LLMClient
+from simpleagent.permissions import Approver, Policy
 from simpleagent.tools import ToolRegistry, builtin_tools
 from simpleagent.trace import Tracer, new_session_id
+from simpleagent.ui.approve import ConsoleApprover
 
 try:
     import readline  # noqa: F401  让 input() 支持方向键和输入历史
@@ -166,12 +168,18 @@ class Repl:
         llm_factory: LLMFactory | None = None,
         out: TextIO | None = None,
         input_fn: Callable[[str], str] = input,
+        session: Session | None = None,
+        store: SessionStore | None = None,
+        approver: Approver | None = None,
+        policy: Policy | None = None,
     ):
         self.config = config
         self.out = out or sys.stdout
         self.color = _supports_color(self.out)
         self.input_fn = input_fn
-        self.session = Session(new_session_id())
+        self.store = store
+        self.session = session or Session(new_session_id())
+        self.resumed = session is not None
         self.tracer = Tracer(
             home_dir() / "traces",
             self.session.id,
@@ -181,12 +189,20 @@ class Repl:
         self.llm_factory = llm_factory or (lambda name, p: LLMClient(name, p, tracer=self.tracer))
         cwd = Path.cwd()
         output_dir = home_dir() / TOOL_OUTPUT_DIRNAME
+        name = profile or config.default_profile
+        if name not in config.profiles:
+            raise ConfigError(f"没有名为 '{name}' 的 profile")
+        # 新开的会话立刻挂上存储：之后的每条消息都会写进 sessions/<id>.jsonl
+        if store is not None and session is None:
+            store.start(self.session, profile=name, cwd=str(cwd))
         self.agent = Agent(
-            llm=self._make_llm(profile or config.default_profile),
+            llm=self._make_llm(name),
             tools=ToolRegistry(
                 builtin_tools(),
                 max_output_chars=config.tool_output.max_chars,
                 max_output_lines=config.tool_output.max_lines,
+                approver=approver or ConsoleApprover(input_fn=input_fn, out=self.out),
+                policy=policy or Policy(cwd),
             ),
             system_prompt=build_system_prompt(config.system_prompt, cwd=cwd),
             cwd=cwd,
@@ -211,6 +227,10 @@ class Repl:
     def run(self) -> int:
         llm = self.agent.llm
         self.print(f"SimpleAgent · {llm.name}（{llm.profile.model}）", BOLD)
+        if self.resumed:
+            self.print(
+                f"继续会话 {self.session.id}（已恢复 {len(self.session.messages)} 条历史）", DIM
+            )
         if self.config.trace.enabled:
             self.print(f"trace：{self.tracer.dir}", DIM)
         self.print("输入 /help 查看命令", DIM)

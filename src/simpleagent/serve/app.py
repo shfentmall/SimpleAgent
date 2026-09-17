@@ -12,14 +12,23 @@ import queue
 import re
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from simpleagent.config import Config
+from simpleagent.panel.store import PanelStore
+from simpleagent.panel.summary import one_line, summarize
 from simpleagent.serve.bus import frame_to_sse
 from simpleagent.serve.runner import Runner
-from simpleagent.spaces.models import SpaceSpec
+from simpleagent.serve.static import asset_bytes
+from simpleagent.spaces.models import EXECUTOR_LABELS, EXECUTORS, SpaceSpec
 from simpleagent.spaces.store import SpaceStore
+from simpleagent.tools.walk import IGNORED_DIRS
+
+# SSE 空闲时多久发一次 keepalive 注释帧。它同时承担「探测客户端是否还活着」的职责：
+# 写入失败是服务端发现对方已经走了的唯一信号（TCP 不会主动告诉我们）。
+KEEPALIVE_INTERVAL = 15.0
 
 
 class Response:
@@ -47,6 +56,7 @@ class Server:
     ) -> None:
         self.config = config
         self.store = store or SpaceStore()
+        self.panel = PanelStore()
         self.runner = runner or Runner(config, store=self.store, llm_factory=llm_factory)
 
     def start(self) -> None:
@@ -56,6 +66,14 @@ class Server:
     def handle(self, method: str, path: str, headers: dict[str, str], body: bytes) -> Response:
         # 去掉 query string
         path_only = urlparse(path).path
+        # 前端页面与静态资源（W3）：放在最前面，避免被 /api 之外的兜底 404 吃掉
+        if method == "GET" and path_only in ("/", "/index.html"):
+            return self._static("index.html")
+        m = re.match(r"^/assets/([^/]+)$", path_only)
+        if m and method == "GET":
+            return self._static(m.group(1))
+        if method == "GET" and path_only == "/api/meta":
+            return self._meta()
         if method == "GET" and path_only == "/api/spaces":
             return self._list_spaces(headers)
         if method == "POST" and path_only == "/api/spaces":
@@ -73,18 +91,27 @@ class Server:
         if m:
             space_id = m.group(1)
             if method == "GET":
-                return self._list_sessions(space_id)
+                return self._list_sessions(space_id, headers)
             if method == "POST":
                 return self._create_session(space_id, body)
+        m = re.match(r"^/api/spaces/([^/]+)/files$", path_only)
+        if m and method == "GET":
+            return self._space_files(m.group(1))
         m = re.match(r"^/api/sessions/([^/]+)$", path_only)
         if m and method == "GET":
             return self._session_messages(m.group(1))
+        m = re.match(r"^/api/sessions/([^/]+)$", path_only)
+        if m and method == "PATCH":
+            return self._update_session(m.group(1), body)
         m = re.match(r"^/api/sessions/([^/]+)/input$", path_only)
         if m and method == "POST":
             return self._session_input(m.group(1), body)
         m = re.match(r"^/api/sessions/([^/]+)/cancel$", path_only)
         if m and method == "POST":
             return self._session_cancel(m.group(1))
+        m = re.match(r"^/api/sessions/([^/]+)/rerun$", path_only)
+        if m and method == "POST":
+            return self._session_rerun(m.group(1))
         m = re.match(r"^/api/sessions/([^/]+)/verify$", path_only)
         if m and method == "POST":
             return self._session_verify(m.group(1))
@@ -101,7 +128,67 @@ class Server:
             return self._resolve_approval(m.group(1), body)
         if method == "GET" and path_only == "/api/panel/summary":
             return self._panel_summary()
+        m = re.match(r"^/api/sessions/([^/]+)/summary$", path_only)
+        if m and method == "GET":
+            return self._session_summary(m.group(1))
+        if method == "GET" and path_only == "/api/inbox":
+            return self._inbox_list(headers)
+        if method == "POST" and path_only == "/api/inbox":
+            return self._inbox_add(body)
+        m = re.match(r"^/api/inbox/([^/]+)/read$", path_only)
+        if m and method == "POST":
+            return self._inbox_read(m.group(1))
+        if path_only == "/api/todos":
+            if method == "GET":
+                return self._todo_list()
+            if method == "POST":
+                return self._todo_add(body)
+        m = re.match(r"^/api/todos/([^/]+)$", path_only)
+        if m:
+            if method == "PATCH":
+                return self._todo_update(m.group(1), body)
+            if method == "DELETE":
+                return self._todo_delete(m.group(1))
         return Response(404, {"error": "not found", "path": path_only})
+
+    # ------------------------------------------------------------ 静态资源 / 元信息
+    def _static(self, name: str) -> Response:
+        got = asset_bytes(name)
+        if got is None:
+            return Response(404, {"error": "asset not found", "name": name})
+        data, content_type = got
+        return Response(
+            200,
+            body=data,
+            headers={"Content-Type": content_type, "Content-Length": str(len(data))},
+        )
+
+    def _meta(self) -> Response:
+        """前端启动时要知道的东西：有哪些 profile、默认哪个、能选哪些执行者、max_steps。
+
+        executors 由后端给，前端不硬编码 agent 名单——以后加外部 agent 的模型 preset，
+        只改这里的数据，不用动 app.js。
+        """
+        profiles = sorted(self.config.profiles)
+        executors = [
+            {
+                "name": name,
+                "label": EXECUTOR_LABELS[name],
+                "external": name != "simpleagent",
+                # 外部 CLI 本次只支持「本机默认（不注入配置）」，所以模型列表是空的
+                "models": [] if name != "simpleagent" else profiles,
+            }
+            for name in EXECUTORS
+        ]
+        return Response(
+            200,
+            {
+                "profiles": profiles,
+                "default_profile": self.config.default_profile,
+                "executors": executors,
+                "max_steps": self.config.max_steps,
+            },
+        )
 
     # ----------------------------------------------------------------- 空间
     def _list_spaces(self, headers: dict[str, str]) -> Response:
@@ -124,9 +211,10 @@ class Server:
         allowed = {
             "name",
             "kind",
+            "executor",
             "profile",
+            "cli_model",
             "pin_dir",
-            "agent_name",
             "cwd",
             "command",
             "args",
@@ -136,9 +224,10 @@ class Server:
         }
         try:
             spec = SpaceSpec(**{k: v for k, v in data.items() if k in allowed})
+            space = self.store.create_space(spec)
         except (TypeError, ValueError) as e:
+            # 组合非法（如绑定目录却不给 cwd）要变成 400，不能让它逃出去把连接掐断
             return Response(400, {"error": f"参数错误：{e}"})
-        space = self.store.create_space(spec)
         return Response(201, self._space_view(space))
 
     def _space_detail(self, space_id: str) -> Response:
@@ -163,11 +252,21 @@ class Server:
         return Response(200, {"deleted": space_id})
 
     # ----------------------------------------------------------------- 会话
-    def _list_sessions(self, space_id: str) -> Response:
+    def _list_sessions(self, space_id: str, headers: dict[str, str]) -> Response:
         if self.store.get_space(space_id) is None:
             return Response(404, {"error": "space not found"})
-        metas = self.store.list_sessions(space_id, limit=5)
+        metas = self.store.list_sessions(space_id, limit=self._limit(headers))
         return Response(200, [m.to_dict() for m in metas])
+
+    @staticmethod
+    def _limit(headers: dict[str, str]) -> int:
+        """从 query 取 limit：默认 5（左栏只显示最近 5 条），上限 200（「查看全部」用）。"""
+        raw = parse_qs(headers.get("x-query", "")).get("limit", [""])[0]
+        try:
+            n = int(raw)
+        except ValueError:
+            return 5
+        return max(1, min(n, 200))
 
     def _create_session(self, space_id: str, body: bytes) -> Response:
         if self.store.get_space(space_id) is None:
@@ -184,6 +283,23 @@ class Server:
         session = self.store.load_session(space_id, session_id)
         return Response(200, {"session_id": session_id, "messages": session.messages})
 
+    def _update_session(self, session_id: str, body: bytes) -> Response:
+        """改会话的可变元信息：目前开放重命名（title）与置顶（pinned）。"""
+        space_id = self.store.find_session_space(session_id)
+        if space_id is None:
+            return Response(404, {"error": "session not found"})
+        data = self._safe_json(body) or {}
+        fields = {k: v for k, v in data.items() if k in ("title", "pinned")}
+        if not fields:
+            return Response(400, {"error": "只能改 title / pinned"})
+        if "title" in fields and not str(fields["title"]).strip():
+            return Response(400, {"error": "title 不能为空"})
+        try:
+            meta = self.store.update_meta(space_id, session_id, **fields)
+        except (KeyError, ValueError) as e:
+            return Response(400, {"error": str(e)})
+        return Response(200, meta.to_dict())
+
     def _session_input(self, session_id: str, body: bytes) -> Response:
         space_id = self.store.find_session_space(session_id)
         if space_id is None:
@@ -194,6 +310,29 @@ class Server:
             return Response(400, {"error": "text 不能为空"})
         self.runner.run_input(space_id, session_id, str(text))
         return Response(202, {"accepted": True})
+
+    def _space_files(self, space_id: str) -> Response:
+        """工作目录的文件树（右栏「文件」tab）。只看两层，够定位文件就行。"""
+        space = self.store.get_space(space_id)
+        if space is None:
+            return Response(404, {"error": "space not found"})
+        cwd = self.runner.cwd_for(space)
+        return Response(200, {"cwd": str(cwd), "tree": file_tree(cwd, depth=2)})
+
+    def _session_rerun(self, session_id: str) -> Response:
+        """重跑最后一条用户消息：改了 prompt / 换了模型后想再试一次时用。"""
+        space_id = self.store.find_session_space(session_id)
+        if space_id is None:
+            return Response(404, {"error": "session not found"})
+        messages = self.store.load_session(space_id, session_id).messages
+        last = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+        if not last:
+            return Response(400, {"error": "这个会话还没有用户消息，没什么可重跑的"})
+        text = last.get("content")
+        if not isinstance(text, str) or not text.strip():
+            return Response(400, {"error": "最后一条用户消息不是纯文本，无法重跑"})
+        self.runner.run_input(space_id, session_id, text)
+        return Response(202, {"accepted": True, "text": text})
 
     def _session_cancel(self, session_id: str) -> Response:
         self.runner.cancel(session_id)
@@ -231,7 +370,7 @@ class Server:
                     yield frame_to_sse(frame)
                 while True:
                     try:
-                        frame = q.get(timeout=15)
+                        frame = q.get(timeout=KEEPALIVE_INTERVAL)
                     except queue.Empty:
                         yield ": keepalive\n\n"
                         continue
@@ -241,9 +380,111 @@ class Server:
 
         return Response(200, stream=stream())
 
+    # ----------------------------------------------------------------- 控制面板
+    def _panel_summary(self) -> Response:
+        """控制面板顶部那条状态带 + 指挥台要用的运行中列表。"""
+        running = []
+        total_tokens = 0
+        for sp in self.store.list_spaces(opened_only=False):
+            for m in self.store.list_sessions(sp.id, limit=50, include_pinned=False):
+                usage = m.usage or {}
+                total_tokens += (usage.get("prompt_tokens") or 0) + (
+                    usage.get("completion_tokens") or 0
+                )
+                if m.status == "running":
+                    running.append(
+                        {
+                            "space_id": sp.id,
+                            "space_name": sp.name,
+                            "session_id": m.id,
+                            "title": m.title,
+                            "updated_at": m.updated_at,
+                        }
+                    )
+        return Response(
+            200,
+            {
+                "running": running,
+                "opened_spaces": len(self.store.list_spaces(opened_only=True)),
+                "today_tokens": total_tokens,  # 目前是累计口径，等 M4 用量统计再按天切
+                "unread": self.panel.unread_count(),
+                "todos": len([t for t in self.panel.list_todos() if not t["done"]]),
+            },
+        )
+
+    def _session_summary(self, session_id: str) -> Response:
+        """任务卡用的结构化摘要（不调模型）。"""
+        space_id = self.store.find_session_space(session_id)
+        if space_id is None:
+            return Response(404, {"error": "session not found"})
+        meta = self.store.get_session_meta(space_id, session_id)
+        messages = self.store.load_session(space_id, session_id).messages
+        summary = summarize(messages, meta)
+        summary["session_id"] = session_id
+        summary["space_id"] = space_id
+        summary["title"] = meta.title if meta else ""
+        summary["status"] = meta.status if meta else "idle"
+        summary["line"] = one_line(summary)
+        return Response(200, summary)
+
+    def _inbox_list(self, headers: dict[str, str]) -> Response:
+        query = parse_qs(headers.get("x-query", ""))
+        limit = int(query.get("limit", ["50"])[0] or 50)
+        unread_only = query.get("unread", [""])[0] in ("1", "true", "yes")
+        return Response(
+            200, self.panel.list_messages(limit=max(1, min(limit, 200)), unread_only=unread_only)
+        )
+
+    def _inbox_add(self, body: bytes) -> Response:
+        """外部消息源（定时任务 / 邮件适配器）投递用。v1 系统事件是服务端自己写的。"""
+        data = self._safe_json(body) or {}
+        title = str(data.get("title", "")).strip()
+        if not title:
+            return Response(400, {"error": "title 不能为空"})
+        item = self.panel.add_message(
+            source=str(data.get("source", "manual")),
+            title=title,
+            body=str(data.get("body", "")),
+            level=str(data.get("level", "info")),
+            ref=data.get("ref") if isinstance(data.get("ref"), dict) else {},
+        )
+        return Response(201, item.to_dict())
+
+    def _inbox_read(self, item_id: str) -> Response:
+        changed = self.panel.mark_read(item_id)
+        return Response(200, {"read": item_id, "changed": changed})
+
+    def _todo_list(self) -> Response:
+        return Response(200, self.panel.list_todos())
+
+    def _todo_add(self, body: bytes) -> Response:
+        data = self._safe_json(body) or {}
+        text = str(data.get("text", "")).strip()
+        if not text:
+            return Response(400, {"error": "备忘内容不能为空"})
+        kind = data.get("kind") if data.get("kind") in ("text", "session") else "text"
+        ref = data.get("ref") if isinstance(data.get("ref"), dict) else {}
+        return Response(201, self.panel.add_todo(text, kind=kind, ref=ref).to_dict())
+
+    def _todo_update(self, todo_id: str, body: bytes) -> Response:
+        data = self._safe_json(body) or {}
+        fields = {k: v for k, v in data.items() if k in ("text", "done")}
+        if not fields:
+            return Response(400, {"error": "只能改 text / done"})
+        todo = self.panel.update_todo(todo_id, **fields)
+        if todo is None:
+            return Response(404, {"error": "todo not found"})
+        return Response(200, todo.to_dict())
+
+    def _todo_delete(self, todo_id: str) -> Response:
+        if not self.panel.delete_todo(todo_id):
+            return Response(404, {"error": "todo not found"})
+        return Response(200, {"deleted": todo_id})
+
     # ----------------------------------------------------------------- 审批
     def _list_approvals(self) -> Response:
-        return Response(200, {"pending": self.runner.pending.pending_ids()})
+        """待审批的详情。客户端刚连上时靠它补出没收到的那张审批卡。"""
+        return Response(200, {"pending": self.runner.pending.details()})
 
     def _resolve_approval(self, approval_id: str, body: bytes) -> Response:
         data = self._safe_json(body) or {}
@@ -251,21 +492,6 @@ class Server:
         if not ok:
             return Response(404, {"error": "approval not found or runner not started"})
         return Response(200, {"resolved": approval_id})
-
-    # ----------------------------------------------------------------- 控制面板
-    def _panel_summary(self) -> Response:
-        running = []
-        for sp in self.store.list_spaces(opened_only=False):
-            for m in self.store.list_sessions(sp.id, limit=50, include_pinned=False):
-                if m.status == "running":
-                    running.append({"space_id": sp.id, "session_id": m.id, "title": m.title})
-        return Response(
-            200,
-            {
-                "running": running,
-                "opened_spaces": len(self.store.list_spaces(opened_only=True)),
-            },
-        )
 
     # ----------------------------------------------------------------- 工具
     @staticmethod
@@ -278,9 +504,61 @@ class Server:
             return None
 
 
+# ----------------------------------------------------------------------- 文件树
+def file_tree(root: Path, depth: int = 2, limit: int = 300) -> list[dict[str, Any]]:
+    """工作目录的浅层文件树。
+
+    只看 depth 层、条目数封顶：右栏「文件」tab 是拿来定位文件的，不是文件管理器，
+    真要深挖让 agent 用 list_dir / glob。
+    """
+    budget = [limit]
+
+    def walk(dir_path: Path, left: int) -> list[dict[str, Any]]:
+        if left <= 1:
+            return []
+        items: list[dict[str, Any]] = []
+        try:
+            entries = sorted(dir_path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        except OSError:
+            return items
+        for p in entries:
+            if budget[0] <= 0:
+                break
+            if p.name.startswith(".") or (p.is_dir() and p.name in IGNORED_DIRS):
+                continue
+            budget[0] -= 1
+            node: dict[str, Any] = {
+                "name": p.name,
+                "path": str(p),
+                "type": "dir" if p.is_dir() else "file",
+            }
+            if p.is_dir():
+                node["children"] = walk(p, left - 1)
+            items.append(node)
+        return items
+
+    if not root.exists():
+        return []
+    top = walk(root, depth)
+    return [{"name": root.name, "path": str(root), "type": "dir", "children": top}]
+
+
 # ----------------------------------------------------------------------- 适配 http.server
 def _make_handler(app: Server):
     class Handler(BaseHTTPRequestHandler):
+        def handle(self) -> None:
+            """兜住「客户端中途消失」。
+
+            关标签页、断网、切 Wi-Fi 都会让已建立的连接突然消失，之后读写它就是
+            ConnectionResetError / BrokenPipeError。http.server 对这些异常不设防，
+            会一路冒到 socketserver 的 handle_error，打一整段 traceback 到 stderr
+            —— 看起来像服务崩了，其实只是有人走了。
+            """
+            try:
+                super().handle()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+
         def _dispatch(self) -> None:
             method = self.command
             parsed = urlparse(self.path)
@@ -297,6 +575,12 @@ def _make_handler(app: Server):
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
+                # 必须放在 send_header("Connection", ...) 之后：BaseHTTPRequestHandler
+                # 会在这个方法里把 close_connection 置成 False。不盖回来，这条连接
+                # 处理完 SSE 后还会回到 rfile.readline() 等下一个请求，线程要多挂一个
+                # keepalive 周期才释放，断开时还会在那儿抛 ConnectionResetError。
+                # SSE 是要么一直流、要么断开的单向连接，没有「下一个请求」可言。
+                self.close_connection = True
                 self.end_headers()
                 try:
                     for chunk in resp.stream:
@@ -305,6 +589,14 @@ def _make_handler(app: Server):
                         self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+                return
+            if isinstance(resp.body, (bytes, bytearray)):  # 静态资源
+                self.send_header(
+                    "Content-Type", resp.headers.get("Content-Type", "application/octet-stream")
+                )
+                self.send_header("Content-Length", str(len(resp.body)))
+                self.end_headers()
+                self.wfile.write(resp.body)
                 return
             if resp.body is not None:
                 out = json.dumps(resp.body, ensure_ascii=False).encode("utf-8")
@@ -336,9 +628,13 @@ def _make_handler(app: Server):
 def make_server(
     config: Config, host: str = "127.0.0.1", port: int = 8384, llm_factory=None
 ) -> ThreadingHTTPServer:
-    """构造并启动本地 API 服务，返回已 start() 的 http server（调用方负责 serve_forever）。"""
+    """构造并启动本地 API 服务，返回已 start() 的 http server（调用方负责 serve_forever）。
+
+    先抢端口再 app.start()：端口被占用时直接抛 OSError，不会留下一个已经跑起来的
+    Runner 线程（调用方拿到异常就没法再关它了）。
+    """
     app = Server(config, llm_factory=llm_factory)
-    app.start()
     handler = _make_handler(app)
     httpd = ThreadingHTTPServer((host, port), handler)
+    app.start()
     return httpd

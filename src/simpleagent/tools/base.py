@@ -14,14 +14,15 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, get_type_hints
+from typing import Any, Literal, get_type_hints
 
 from pydantic import BaseModel
 
-if TYPE_CHECKING:
-    from simpleagent.serve.approval import Approver
+from simpleagent.permissions import Scope
 
 ToolFn = Callable[[Any, "ToolContext"], Awaitable[str]]
+# (参数对象, 上下文) -> 这次调用会改动什么。由工具自己实现，注册表拿它去问 Policy
+ScopeFn = Callable[[Any, "ToolContext"], Scope]
 
 OUTPUT_RETENTION_SECONDS = 7 * 24 * 3600  # 落盘的工具输出保留 7 天，每次落盘时顺手清理
 
@@ -38,8 +39,6 @@ class ToolContext:
     hidden_env: frozenset[str] = field(default_factory=frozenset)
     # 当前会话 id（持久化 / 事件路由用）；默认 None（无会话上下文时）
     session_id: str | None = None
-    # 审批器：写操作（readonly=False）执行前先问它。默认 None 表示不审批（沿用旧行为）
-    approver: Approver | None = None
 
     def resolve(self, path: str) -> Path:
         """相对路径基于 ctx.cwd 解析，不用进程的当前目录（daemon 里两者不一样）。"""
@@ -111,10 +110,16 @@ class Tool:
     args_model: type[BaseModel]
     fn: ToolFn
     # 只读工具（不改动文件系统、不产生副作用）可以并行执行；
-    # 含写操作时同一批调用要按原顺序依次执行，避免互相覆盖。M3 会再加 permission。
+    # 含写操作时同一批调用要按原顺序依次执行，避免互相覆盖。
     readonly: bool = True
     # 是否由注册表统一截断过长输出；自己会分页的工具（read_file）设成 False
     truncate_output: bool = True
+    # 权限等级：allow 直接执行、ask 先问审批器、deny 一律拒绝。见 permissions.Policy
+    permission: Literal["allow", "ask", "deny"] = "allow"
+    # 报告这次调用的作用范围（会改动哪些路径 / 要跑什么命令）。None 表示不涉及修改。
+    # 之所以让工具自己声明而不是注册表统一反射：MCP、Skills 注册进来的工具也能各自标注，
+    # 加工具时不用回头改 Policy。
+    scope: ScopeFn | None = None
 
     def schema(self) -> dict[str, Any]:
         """请求体 tools 字段里的一项（OpenAI function calling 格式）。"""
@@ -129,13 +134,20 @@ class Tool:
 
 
 def tool(
-    name: str, description: str, *, readonly: bool = True, truncate_output: bool = True
+    name: str,
+    description: str,
+    *,
+    readonly: bool = True,
+    truncate_output: bool = True,
+    permission: Literal["allow", "ask", "deny"] = "allow",
+    scope: ScopeFn | None = None,
 ) -> Callable[[ToolFn], Tool]:
     """把 `async def fn(args: SomeArgs, ctx: ToolContext) -> str` 包装成 Tool。
 
     参数模型从第一个参数的类型注解推出。readonly=False 表示这个工具会改动文件或
     执行命令（write_file / edit_file / bash）；truncate_output=False 表示工具自己控制
-    输出长度，注册表不再截断。
+    输出长度，注册表不再截断。permission 是这个工具的默认权限等级，scope 报告本次
+    调用会改动什么，两者都由注册表在执行前拿去问权限 Policy。
     """
 
     def decorate(fn: ToolFn) -> Tool:
@@ -145,6 +157,15 @@ def tool(
         args_model = get_type_hints(fn).get(params[0]) if params else None
         if not (isinstance(args_model, type) and issubclass(args_model, BaseModel)):
             raise TypeError(f"工具 {name} 的第一个参数必须标注为 pydantic BaseModel 子类")
-        return Tool(name, description, args_model, fn, readonly, truncate_output)
+        return Tool(
+            name,
+            description,
+            args_model,
+            fn,
+            readonly,
+            truncate_output,
+            permission,
+            scope,
+        )
 
     return decorate

@@ -1,0 +1,131 @@
+"""headless 前端：`sa run "..."` 跑一个任务就退出，不读 stdin。
+
+和 REPL 的差别只有两处：
+
+- 审批器换成 `WhitelistApprover`：名单外的写操作一律拒绝，**不再试图问人**。
+  没有人在屏幕前的时候，「需要确认」和「拒绝」是同一件事，区别只在要不要把原因告诉模型。
+- 渲染更朴素：正文直出，工具调用一行概要，不带颜色也不做分段。
+
+M4 的 `sa daemon` 会把同一个核心换成「按时间表触发」，前台渲染换成写运行日志，
+审批仍然走这个白名单。所以这里不写任何和交互强绑定的东西。
+"""
+
+from __future__ import annotations
+
+import sys
+from collections.abc import Callable, Iterable
+from pathlib import Path
+from typing import Any, TextIO
+
+import openai
+
+from simpleagent.agent.loop import Agent
+from simpleagent.agent.prompt import build_system_prompt
+from simpleagent.agent.session import Session, SessionStore
+from simpleagent.config import TOOL_OUTPUT_DIRNAME, Config, Profile, home_dir
+from simpleagent.events import (
+    MaxStepsReached,
+    MessageDone,
+    TextDelta,
+    ToolCallStart,
+    ToolResult,
+)
+from simpleagent.llm.client import LLM, LLMClient
+from simpleagent.permissions import Policy, WhitelistApprover
+from simpleagent.tools import ToolRegistry, builtin_tools
+from simpleagent.trace import Tracer, new_session_id
+
+LLMFactory = Callable[[str, Profile], LLM]
+
+TOOL_PREVIEW_LINES = 3  # 工具结果只露这么几行，完整内容在 trace
+
+
+def format_usage(done: MessageDone, model: str) -> str:
+    parts = [model]
+    if done.usage:
+        parts.append(f"输入 {done.usage.prompt_tokens:,}")
+        parts.append(f"输出 {done.usage.completion_tokens:,}")
+    parts.append(f"耗时 {done.elapsed:.2f}s")
+    return "[" + " · ".join(parts) + "]"
+
+
+def _clip(text: Any, limit: int = 300) -> str:
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
+class Headless:
+    def __init__(
+        self,
+        config: Config,
+        profile: str | None = None,
+        *,
+        cwd: Path | None = None,
+        allowed_tools: Iterable[str] = (),
+        llm_factory: LLMFactory | None = None,
+        out: TextIO | None = None,
+        session: Session | None = None,
+        store: SessionStore | None = None,
+    ) -> None:
+        self.config = config
+        self.out = out or sys.stdout
+        self.cwd = cwd or Path.cwd()
+        self.store = store
+        self.session = session or Session(new_session_id())
+        name = profile or config.default_profile
+        if name not in config.profiles:
+            raise ValueError(f"没有名为 '{name}' 的 profile")
+        self.tracer = Tracer(
+            home_dir() / "traces",
+            self.session.id,
+            enabled=config.trace.enabled,
+            raw_chunks=config.trace.raw_chunks,
+        )
+        factory = llm_factory or (lambda n, p: LLMClient(n, p, tracer=self.tracer))
+        tools = ToolRegistry(
+            builtin_tools(),
+            max_output_chars=config.tool_output.max_chars,
+            max_output_lines=config.tool_output.max_lines,
+            approver=WhitelistApprover(allowed_tools),
+            policy=Policy(self.cwd),
+        )
+        self.agent = Agent(
+            llm=factory(name, config.profiles[name]),
+            tools=tools,
+            system_prompt=build_system_prompt(config.system_prompt, cwd=self.cwd),
+            cwd=self.cwd,
+            max_steps=config.max_steps,
+            output_dir=home_dir() / TOOL_OUTPUT_DIRNAME,
+            hidden_env=config.api_key_env_names(),
+        )
+        # 会话由 CLI 恢复时（sa run --resume）已经落过盘了，这里只负责新开的会话
+        if store is not None and session is None:
+            store.start(self.session, profile=name, cwd=str(self.cwd))
+
+    def _write(self, text: str) -> None:
+        self.out.write(text)
+        self.out.flush()
+
+    async def run(self, prompt: str) -> int:
+        """跑一个任务，返回退出码（0 正常，1 请求失败）。"""
+        model = self.agent.llm.profile.model
+        try:
+            async for event in self.agent.run(self.session, prompt):
+                if isinstance(event, TextDelta):
+                    self._write(event.text)
+                elif isinstance(event, ToolCallStart):
+                    self._write(f"\n→ {event.name} {_clip(event.arguments)}\n")
+                elif isinstance(event, ToolResult):
+                    lines = event.content.splitlines() or [""]
+                    for line in lines[:TOOL_PREVIEW_LINES]:
+                        self._write(f"  {_clip(line)}\n")
+                    if len(lines) > TOOL_PREVIEW_LINES:
+                        self._write(f"  …（共 {len(lines)} 行）\n")
+                elif isinstance(event, MessageDone):
+                    self._write(f"\n{format_usage(event, model)}\n")
+                elif isinstance(event, MaxStepsReached):
+                    self._write(f"\n[达到 max_steps={event.max_steps}，本轮停止]\n")
+        except openai.APIError as e:
+            self._write(f"\n请求失败：{type(e).__name__}：{e}\n")
+            return 1
+        return 0

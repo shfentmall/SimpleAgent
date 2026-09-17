@@ -17,23 +17,16 @@ from __future__ import annotations
 import asyncio
 import secrets
 import time
-from dataclasses import dataclass
-from typing import Protocol
 
+from simpleagent.permissions import (  # 协议本身在 permissions 里，这里是它的客户端实现
+    ApprovalDecision,
+    ApprovalRequest,
+    Approver,
+)
 from simpleagent.serve.bus import EventBus
 from simpleagent.serve.frames import approval_request_frame
 
-
-@dataclass
-class ApprovalDecision:
-    allow: bool
-    always: bool = False
-
-
-class Approver(Protocol):
-    async def request(
-        self, *, session_id: str, tool_name: str, arguments: str
-    ) -> ApprovalDecision: ...
+__all__ = ["APIApprover", "ApprovalDecision", "ApprovalRequest", "Approver", "PendingApprovals"]
 
 
 def _new_id(prefix: str) -> str:
@@ -41,24 +34,49 @@ def _new_id(prefix: str) -> str:
 
 
 class PendingApprovals:
-    """在 runner 的 asyncio 线程里管理挂起的审批 Future。"""
+    """在 runner 的 asyncio 线程里管理挂起的审批 Future。
+
+    除了 Future，还留下 ApprovalRequest 本身：审批帧发出去就过去了，晚一点连上来的
+    客户端（比如刚切到这个会话、或者控制面板）收不到那一帧，得靠这里把它补出来，
+    否则任务会一直挂在「运行中」，而界面上没有任何地方可以按批准。
+    """
 
     def __init__(self) -> None:
         self._futures: dict[str, asyncio.Future[ApprovalDecision]] = {}
+        self._requests: dict[str, ApprovalRequest] = {}
 
-    def add(self, approval_id: str) -> asyncio.Future[ApprovalDecision]:
+    def add(self, approval_id: str, req: ApprovalRequest) -> asyncio.Future[ApprovalDecision]:
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
         self._futures[approval_id] = fut
+        self._requests[approval_id] = req
         return fut
 
     def resolve(self, approval_id: str, decision: ApprovalDecision) -> None:
         fut = self._futures.pop(approval_id, None)
+        self._requests.pop(approval_id, None)
         if fut is not None and not fut.done():
             fut.set_result(decision)
 
     def pending_ids(self) -> list[str]:
         return list(self._futures)
+
+    def details(self) -> list[dict[str, str]]:
+        """待审批的详情。`arguments` 是模型给的原始 JSON 字符串，原样带给前端展示。"""
+        out = []
+        for aid, req in self._requests.items():
+            if aid not in self._futures:
+                continue
+            out.append(
+                {
+                    "approval_id": aid,
+                    "session_id": req.session_id,
+                    "tool_name": req.tool_name,
+                    "arguments": req.arguments,
+                    "reason": req.reason,
+                }
+            )
+        return out
 
 
 class APIApprover:
@@ -73,13 +91,15 @@ class APIApprover:
         # session_id -> 已选「始终允许」的工具名集合（跨轮对话共享）
         self.always_store: dict[str, set[str]] = always_store if always_store is not None else {}
 
-    async def request(self, *, session_id: str, tool_name: str, arguments: str) -> ApprovalDecision:
-        if tool_name in self.always_store.get(session_id, set()):
+    async def request(self, req: ApprovalRequest) -> ApprovalDecision:
+        if req.tool_name in self.always_store.get(req.session_id, set()):
             return ApprovalDecision(allow=True)
         approval_id = _new_id("ap")
-        future = self.pending.add(approval_id)
+        future = self.pending.add(approval_id, req)
         # 推一帧给客户端，然后挂起等决策
-        self.bus.publish(approval_request_frame(session_id, approval_id, tool_name, arguments))
+        self.bus.publish(
+            approval_request_frame(req.session_id, approval_id, req.tool_name, req.arguments)
+        )
         try:
             decision = await future
         except asyncio.CancelledError:
@@ -87,5 +107,5 @@ class APIApprover:
             self.pending.resolve(approval_id, ApprovalDecision(allow=False))
             raise
         if decision.always:
-            self.always_store.setdefault(session_id, set()).add(tool_name)
+            self.always_store.setdefault(req.session_id, set()).add(req.tool_name)
         return decision

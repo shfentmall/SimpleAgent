@@ -1,6 +1,8 @@
 # 客户端界面设计（W 里程碑：个人 AI 工作台）
 
-> 状态：W1、W2 已实现；W3 客户端骨架待做。W1/W2 只改 `src/`，不动核心 loop 的默认行为。
+> 状态：W1~W5 已实现（W5 = 控制面板：指挥台 / 消息 / 备忘）。知识库入口留给 M7。
+> 新建空间已拆成「目录形态 × 执行者」两个正交维度（见 4 与 10.9）；外部 CLI 的启动器仍留 M8。
+> W1~W5 只改 `src/`，不动核心 loop 的默认行为。
 > 前置：M3（会话 JSONL 持久化 + 权限），M4（daemon / 定时任务）只影响“控制面板”的填充内容，不阻塞骨架。
 
 ## 1. 目标与非目标
@@ -31,13 +33,15 @@ Space（空间）──1:N── Session（会话/一次运行实例）
 
 | 术语 | 含义 | 对应现在的类/文件 |
 |---|---|---|
-| **Space** | 一类任务的容器：名字 + 目录 + 用哪个 agent 跑 + 验证方式 | 新增 `spaces/space.py` |
+| **Space** | 一类任务的容器：名字 + 目录 + 用哪个 agent 跑 + 验证方式 | `spaces/models.py` |
 | **Session** | 一次具体的运行，等价于现在的 `Session`（消息历史 + 用量） | `agent/session.py` |
 | **Task** | 用户口中的“任务”，在本设计里**不单独建模**，就是 Session。一个空间=一类任务的集合=该空间下所有 session | — |
-| **Agent 绑定** | 空间选谁来执行：`simpleagent`（内置 loop）/ `claude-code` / `opencode` | 新增 `spaces/agent_binding.py` |
-| **验证状态** | 这个 session 跑完后，验证命令的结果：未验证 / 验证中 / 已验证 / 失败 / 已失效 | 新增 `spaces/verify.py` |
+| **kind（目录形态）** | 在哪儿跑：`generic`（自动分配 tmp）/ `agent`（进指定 `cwd`） | `Space.kind` |
+| **executor（执行者）** | 谁跑：`simpleagent`（内置 loop）/ `claude-code` / `opencode` | `Space.executor` + `EXECUTORS` |
+| **模型** | 内置执行者看 `profile`；外部 CLI 看 `cli_model`（`None` = 用它本机默认配置） | `Space.profile` / `Space.cli_model` |
+| **验证状态** | 这个 session 跑完后，验证命令的结果：未验证 / 验证中 / 已验证 / 失败 / 已失效 | `spaces/verify.py` |
 
-**一句话**：空间决定“在哪儿、用什么跑”，session 决定“这一轮具体跑什么、跑得对不对”。
+**一句话**：空间决定“在哪儿、用什么跑”（两个正交维度），session 决定“这一轮具体跑什么、跑得对不对”。
 
 ## 3. 界面结构
 
@@ -72,7 +76,7 @@ Space（空间）──1:N── Session（会话/一次运行实例）
 
 | 入口 | 作用 | 状态 |
 |---|---|---|
-| **新建 Agent**（主按钮） | 打开新建空间向导：① 名字 ② 类型（通用 / 绑定 agent）③ 目录（通用=自动分配 tmp，绑定=选目录）④ agent（claude code / opencode / simpleagent）⑤ profile ⑥ 可选验证命令 | 本次设计 |
+| **新建空间**（主按钮） | 打开新建空间向导：① 名字 ② 任务形态（通用 / 绑定目录）③ 执行者（simpleagent / claude-code / opencode）④ 模型（随执行者切换：profile 或外部 CLI 的 preset）⑤ 工作目录（仅绑定目录）⑥ 可选验证命令 | 本次设计 |
 | **控制面板** | 全局视图：正在跑的 session（跨空间聚合）、定时任务（`schedules.toml`，M4）、模型 profile 与用量统计、最近错误 / trace 入口、设置 | 骨架本次设计，内容随 M4/M6 填 |
 | **知识库** | 记忆（`memory/` + `MEMORY.md`，M7）、skills 列表、导入的文档与索引 | M7 再实现，本次只留入口和空态 |
 
@@ -105,20 +109,37 @@ Space（空间）──1:N── Session（会话/一次运行实例）
 - **消息流**：用户消息、助手文本（流式）、思考内容（可折叠）、工具调用卡（默认折叠，显示工具名+关键参数+结果行数，展开看完整输出）、审批卡（允许 / 拒绝 / 本次会话始终允许）、错误卡。
 - **输入区**：多行输入、模型 profile 切换、`@` 引用文件、`/` 命令（`/compact`、`/model`、`/verify` 等）、发送 / 停止。
 
-## 4. 空间的两类任务定义
+## 4. 空间的两个正交维度
 
-### 4.1 通用任务空间（`kind = "generic"`）
+空间由两个**互不干涉**的选择决定：「在哪儿跑」（`kind`，目录形态）和「谁跑」（`executor`，
+执行者）。四种组合都合法，向导里就是两个独立的下拉框：
+
+| | `executor = "simpleagent"`（默认） | `executor = "claude-code"` / `"opencode"` |
+|---|---|---|
+| `kind = "generic"` | 随手一问（默认组合） | 临时任务交给 claude 跑，产物落 tmp |
+| `kind = "agent"`（进指定目录） | 在项目里用内置 loop | 在项目里让 claude / opencode 干活 |
+
+**模型**这一栏也随执行者分两套口径：
+
+- `executor = "simpleagent"` → 选 `profile`（`config.toml` 里那批），交给内置客户端；
+- `executor` 是外部 CLI → 选 `cli_model`。**缺省（`None`）= 本机默认**：不注入任何 env / args，
+  启动函数只是把 `claude` / `opencode` 在那个目录里拉起来，完全吃它自己的配置。
+  填了 preset 才把「我们的配置」拼进启动参数（preset 机制还没做，见 10.9）。
+
+### 4.1 通用任务（`kind = "generic"`）
 
 - **没有专有目录**：工作目录自动分配为 `~/.simpleagent/spaces/<space-id>/tmp/`，空间创建时建好。
-- 适用：临时整理、一次性计算、随手一问。产物默认留在 tmp 里，随时可清空（`清空工作目录` 按钮）。
-- 执行者固定是内置 `simpleagent` loop，不外调 CLI。
+- 适用：临时整理、一次性计算、随手一问。产物默认留在 tmp 里，随时可清空。
+- 默认执行者是内置 `simpleagent` loop；也可以选外部 CLI（工作目录照样是 tmp）。
 - 可选 `pin_dir`：如果用户想把产物放别处（比如下载目录），单独指定，仍然算通用空间。
 
-### 4.2 绑定外部 agent 的空间（`kind = "agent"`）
+### 4.2 绑定目录（`kind = "agent"`）
 
-- 绑定**一个真实项目目录**（`cwd`），进入该目录执行。
-- 绑定**一个 agent**：`claude-code` / `opencode` / `simpleagent`。v1 用无头 CLI（ARCHITECTURE 已定：`claude -p --output-format stream-json`、`opencode run --format json`），保存 agent 返回的 session id，下次可以接着追问；ACP 协议以后再说。
-- 右栏头部明确显示“当前是谁在跑”，切换 agent 时把 session id 一起换掉（不同 agent 的 session 不互通）。
+- 绑定**一个真实项目目录**（`cwd`，顶层字段），进入该目录执行；不填就落回 tmp（API 会拦）。
+- 执行者可以是内置 `simpleagent`（在项目里用自己的 loop），也可以是外部 CLI：
+  `claude-code` / `opencode`。外部 CLI 用无头模式（ARCHITECTURE 已定：`claude -p --output-format
+  stream-json`、`opencode run --format json`），保存 agent 返回的 session id，下次接着追问。
+- 右栏头部与左栏卡片都显示「当前是谁在跑」（SA / CC / OC 徽标），切换执行者时 session id 一起换掉。
 - 同一个目录可以开多个空间（例如一个跑 claude code、一个跑 opencode 做对比），互不干扰。
 
 ### 4.3 验证状态（verification）
@@ -182,22 +203,24 @@ class Verification:
 ```toml
 id = "sp_a1b2c3"
 name = "SimpleAgent 重构"
-kind = "agent"                 # generic | agent
-profile = "deepseek"           # 用哪个 model profile
+kind = "agent"                 # 目录形态：generic（用 tmp）| agent（进 cwd）
+executor = "claude-code"       # 谁跑：simpleagent | claude-code | opencode
+profile = "deepseek"           # executor=simpleagent 时的模型
+cli_model = "deepseek"         # executor 是外部 CLI 时的模型 preset；缺省 = 本机默认（不注入）
+cwd = "~/dev_code/SimpleAgent" # kind=agent 时必填；generic 不写（用 tmp）
 opened = true                  # 是否在左栏显示
 pinned = false
 created_at = "2026-09-17T14:00:00+08:00"
 last_opened_at = "2026-09-17T14:52:00+08:00"
 keep_sessions = 50
 
+# 仅 executor != simpleagent：外部 CLI 的启动方式
 [agent]
-name = "claude-code"           # claude-code | opencode | simpleagent
 command = "claude"
-args = ["-p", "--output-format", "stream-json"]
-cwd = "~/dev_code/SimpleAgent"
+args = []
 resume_flag = "--resume"       # 用于追问，配合 meta 里的 agent_session_id
 
-# kind = "generic" 时改为：
+# 仅 kind = generic；和 [agent] 可以同时存在（通用任务 + 外部 CLI）
 # [generic]
 # tmp_dir = "auto"             # auto → spaces/<id>/tmp
 # pin_dir = ""                 # 可选，想固定产物位置时填
@@ -207,6 +230,10 @@ command = "uv run pytest -q && uv run ruff check"
 trigger = "on_stop"            # off | on_stop | on_turn
 timeout = 300
 ```
+
+磁盘上的 `space.toml` 就是唯一真值，字段与 `Space` dataclass 一一对应（`agent` 段只放
+「怎么把 CLI 拉起来」，模型和执行者都在顶层）。W1~W5 写的旧文件（执行者藏在 `[agent].name`、
+`cwd` 也在 `[agent]` 里）会被 `_space_from_toml` 自动回填，不用手工迁移。
 
 ### 5.3 `<session-id>.meta.json`
 
@@ -280,13 +307,21 @@ class SpaceStore:
 | POST | `/api/spaces/{id}/sessions` | 新建 session |
 | GET | `/api/sessions/{id}` | 消息历史 |
 | POST | `/api/sessions/{id}/input` | 发一条用户输入，触发 run（202） |
-| POST | `/api/sessions/{id}/cancel` | 对应 `agent.cancel()` |
+| POST | `/api/sessions/{id}/rerun` | 用最后一条用户消息再跑一次 |
+| GET | `/api/spaces/{id}/files` | 工作目录文件树（两层，右栏「文件」tab） |
 | POST | `/api/sessions/{id}/verify` | 手动跑验证 |
+| PATCH | `/api/sessions/{id}` | 重命名 / 置顶（`title` / `pinned`） |
 | PATCH | `/api/sessions/{id}/verification` | 手动标记已验证 |
 | GET | `/api/sessions/{id}/events` | SSE 事件流，支持 `Last-Event-ID` |
 | GET | `/api/approvals?status=pending` | 待审批列表 |
 | POST | `/api/approvals/{id}` | `{action: allow|deny|always}` |
-| GET | `/api/panel/summary` | 控制面板：运行中任务、定时任务、用量 |
+| GET | `/api/panel/summary` | 控制面板：运行中任务、未读数、待办数、累计用量 |
+| GET | `/api/sessions/{id}/summary` | 结构化摘要（改了几个文件 / 工具调用 / 验证状态 / 最后一句） |
+| GET | `/api/inbox` | 消息列表（`?unread=1` 只看未读） |
+| POST | `/api/inbox` | 外部消息源投递（定时任务 / 邮件适配器） |
+| POST | `/api/inbox/{id}/read` | 标记已读，`id` 为 `all` 时全部已读 |
+| GET/POST | `/api/todos` | 备忘列表 / 新增 |
+| PATCH/DELETE | `/api/todos/{id}` | 改（text / done）/ 删 |
 | GET | `/api/knowledge/...` | 知识库（M7） |
 
 审批走异步 `approve()` 接口：后台需要确认时推 `approval_request` 事件并挂起，客户端回 POST 后继续；客户端不在线则按无人值守策略拒绝（M3 已定的行为）。
@@ -310,9 +345,9 @@ class SpaceStore:
 |---|---|---|
 | **W1** | 持久化层：`spaces/` 目录结构、`space.toml`、`meta.json`、`SpaceStore`、session 追加/恢复、最近 5 条规则、置顶 | ✅ 已实现 + 单测（13 个），详见 `src/simpleagent/spaces/` 与 `tests/spaces/test_store.py` |
 | **W2** | 本地 API：`sa serve` + 路由 + SSE 事件帧 + 取消 + 审批回转 | ✅ 已实现 + 单测（6 个）。`src/simpleagent/serve/`：bus（seq+重放）/ frames / approval（审批桥）/ runner（后台 asyncio 线程）/ app（http.server 路由+SSE）。用 FakeLLM 起服务，`curl -N` 看 SSE 帧序；断言审批挂起→POST→继续 均通过 |
-| **W3** | 客户端骨架：两栏布局、左栏三个入口 + 空间列表（最近 5 + 查看全部）、右栏头部/对话/输入，能发消息并流式渲染 | 手动：新建空间→发一句话→看到流式输出；刷新页面后消息还在 |
-| **W4** | 工具调用卡、审批卡、停止/重跑、验证状态（verify 命令执行、stale 判定、三处同源显示） | 手动：跑一个会改文件的任务→验证通过→再改一个文件→徽标变“已失效” |
-| **W5** | 控制面板（运行中任务、定时任务 M4、用量、trace 入口）、知识库（M7）、设置 | 手动：控制面板能看到跨空间正在跑的 session 并能跳转 |
+| **W3** | 客户端骨架：两栏布局、左栏三个入口 + 空间列表（最近 5 + 查看全部）、右栏头部/对话/输入，能发消息并流式渲染 | ✅ 已实现 + 单测（5 个）。`src/simpleagent/web/`（index.html / styles.css / app.js，零依赖原生 JS）+ `serve/static.py`（importlib.resources 读资源）。手动：`sa serve` → 浏览器开 `http://127.0.0.1:8384/` → 新建空间 → 发一句话 → 看到流式输出；刷新页面后消息还在 |
+| **W4** | 工具调用卡、审批卡、停止/重跑、验证状态（verify 命令执行、stale 判定、三处同源显示） | ✅ 已实现 + 单测。`spaces/verify.py`（目录指纹 + `changed_since`）；runner 在写工具成功后比对指纹，变了就把 `passed` 降级为 `stale` 并发帧；新增 `POST /api/sessions/{id}/rerun` 与 `GET /api/spaces/{id}/files`；前端补齐变更 / 文件 / 日志三个 tab。冒烟：写文件 → 验证通过 → 再写文件 → 徽标变「已失效」 |
+| **W5** | 控制面板：指挥台（@空间名 下发任务 / 查状态 / 完成摘要）、消息（inbox）、备忘（todos） | ✅ 已实现 + 单测（9 个）。`panel/store.py`（inbox 只追加 + read.json；todos 原子写）、`panel/summary.py`（结构化摘要，不调模型）。冒烟：下发任务 → 跑完自动落一条系统消息 → 面板读到未读 1 |
 
 W1 不依赖任何 UI，可以现在就做；W2 之后每一步都能单独跑起来看效果。
 
@@ -347,3 +382,138 @@ W2 给核心 loop 加了三个注入点，**不传则完全保持旧行为**（R
 - 草案里验证命令只挂在 agent 类空间。实现中 `Space.from_spec` 给**两类空间都支持** `verify`（generic 也能跑 `pytest` 之类），修复了原 `from_spec` 在 generic 分支提前 return 漏掉 verify 的 bug。
 - 帧类型在草案 6.1 的基础上补了 `status` / `error` / `verification` 三种服务端补充帧（`approval_request` 沿用草案命名）。
 - `Space` 新增 `to_dict()`、`SpaceStore` 新增 `find_session_space()`（按 session id 跨空间定位），供 API 直接按 session id 访问。
+
+## 10. W3 实现备注（客户端骨架）
+
+### 10.1 文件与托管方式
+
+- 前端三件套放在 `src/simpleagent/web/`（`index.html` / `styles.css` / `app.js`），由 `serve/static.py` 用 `importlib.resources` 读取——不依赖进程的工作目录，将来打包成 wheel 或二进制照样能用。
+- 路由两条：`/` 与 `/index.html` → `index.html`，`/assets/<name>` → 同名文件。`asset_bytes()` 内部只取 `PurePosixPath(name).name` 并要求后缀在白名单里，目录穿越在这一层就被掐掉。
+- `Response` 原来只支持 JSON body，W3 给它加了 bytes 分支（`_dispatch` 里判断 `isinstance(resp.body, (bytes, bytearray))`），其余路由不受影响。
+- 样式沿用 `docs/design/client-ui-mockup.html` 里定过的 CSS 变量（浅色），不重新设计配色。
+
+### 10.2 三个踩到的坑
+
+1. **EventSource 收不到带 `event:` 名的帧。** 服务端 SSE 发的是 `id / event / data` 三行，`event` 是帧类型（`text_delta` 等）。`onmessage` 只处理默认事件，必须 `addEventListener("text_delta", ...)` 逐个类型注册，否则一条帧都收不到。`app.js` 顶部维护了一个 `FRAME_TYPES` 列表来做这件事。
+2. **正常结束时没有状态帧。** 原来只有取消 / 出错才发 `status` 帧，跑完一轮客户端会一直停在「运行中」，发送按钮不解禁。改成在 `Runner._finalize()` 这个收口处统一 `publish(status_frame(...))`，成功 / 取消 / 出错三条路径都会发。
+3. **启动失败会静默（已修）。** `_build_agent()` 和「落盘用户消息」这两步原本在 `try` 之外，异常被 `run_coroutine_threadsafe` 返回的 future 吞掉——客户端一条帧都收不到，界面永远停在「运行中」，排查时连日志都没有。典型触发：没配 API key、profile 不存在、cwd 不存在。现在这两步也包进 try，失败时发 `error` + `status(error)` 两帧并落盘 `status=error`；另外给 `_schedule` 加了 `add_done_callback` 兜底日志，以后协程里漏出的异常至少会在 stderr 留痕。
+
+### 10.3 顺带补的后端小接口
+
+- `GET /api/meta`：返回 `profiles`、`default_profile`、`max_steps`。新建空间向导要列 profile，前端不该硬编码。
+- `GET /api/spaces/{id}/sessions?limit=N`：左栏默认 5 条；点「查看全部」时前端带 `limit=50`。上限 200，防止一次性拖垮。
+
+### 10.4 前端的取舍
+
+- 零依赖、零构建：原生 DOM + `fetch` + `EventSource`，没有 React/Vue，也没有 npm。理由见 6.3 的 A 方案——先把布局和事件协议验证透，等稳定了再决定要不要包 Tauri。
+- 渲染顺序是先 `escapeHtml` 再解析极简 Markdown（代码块 / 行内代码），避免把模型输出当 HTML 执行。
+- 消息流不轮询：历史走 `GET /api/sessions/{id}`，增量只走 SSE；`seq` 用于去重（断线重放时浏览器会自动带 `Last-Event-ID`）。
+- 左栏刷新（新 session、状态变化）会重画空间列表，但**不重画右栏消息流**，避免打断正在看的上下文。
+
+### 10.5 首轮打磨（W3 之后补的）
+
+骨架跑通后补的一批体验项，都不新增概念，只是把 3.x 里写了但没做的补上：
+
+- **会话重命名 / 置顶**：新增 `PATCH /api/sessions/{id}`（`title` / `pinned`）。重命名走行内 input（回车保存、Esc 取消），不用 `prompt()`——原生弹窗放在这个界面里很跳。置顶由 `SpaceStore.list_sessions` 保证常驻且不占 5 个名额（W1 就实现了，这次只是把接口开出来）。
+- **刷新后回到原位**：`localStorage` 记住上次打开的 `spaceId/sessionId`，启动时自动重选。
+- **自动滚动只在贴底时生效**：距离底部 >120px 就认定用户在往上翻，不再被流式输出拽回去。
+- **运行中计时**：底部状态栏每秒刷新已用时，结束时显示「完成，用时 N 秒」。
+- **导出 Markdown**：把当前会话的消息流导出成 `.md`（用户/助手分节，工具调用与结果进代码块）。
+- **斜杠命令**：`/verify` / `/model <profile>` / `/help`，都是纯前端就能完成的，没有新增后端接口。
+- **空间卡片验证汇总**：`✓ 通过数/最近会话数`，对应 3.2 里的「验证汇总」。
+
+### 10.6 W4 实现备注（工具卡 / 审批 / 验证状态）
+
+**stale 怎么判**（4.3 那条「让验证不会骗人」的落地方式）：
+
+- 新增 `spaces/verify.py`：`fingerprint(cwd)` 取目录下 tracked 文件的 `(相对路径, mtime_ns, size)` 哈希，遍历复用 `tools/walk.iter_files` 的忽略规则——和 `list_dir` / `grep` 看到的是同一批文件，不会出现「工具认为没改、指纹认为改了」的错位。文件数封顶 5000，够判「有没有变」就行。
+- 验证**通过时**才冻结指纹（写进 `verification.fingerprint`）。失败的结果本来就要重跑，没有「失效」一说。
+- 触发时机：`Runner._on_event` 收到 `ToolResult` 且工具**不是只读**（用 `ToolRegistry.is_readonly` 判定，不用硬编码名单）且没报错时，比对当前指纹与冻结值，不同就把 `passed` 改成 `stale`，落盘并推 `verification` 帧。
+- 用指纹而不是「跑过写工具就 stale」：`bash` 也是写工具，但 `ls` 之类并不改文件，指纹没变就不该让验证失效。
+
+**三处同源**：左栏 session 行的 ✓/✗/⚠、右栏头部 chip、日志 tab 里的完整信息，都读 `meta.verification` 这一份；`stale` 走的是同一条 `verification` 帧，所以三处会同时变。
+
+**两个新接口**：
+
+- `POST /api/sessions/{id}/rerun`：取 jsonl 里最后一条 user 消息重发。改了 prompt 或换了模型后想重试时用；没有用户消息或非纯文本时 400。
+- `GET /api/spaces/{id}/files`：工作目录文件树，只取两层、条目封顶 300。定位文件用，不做成文件管理器——真要深挖让 agent 用 `list_dir` / `glob`。
+
+**前端三个 tab**：都是切过去时才拉数据（`switchTab` 里按需渲染），不会每收到一帧就重算。变更 tab 从消息流里把 `write_file` / `edit_file` 的调用与结果配对（`edit_file` 的返回本身就是 unified diff，直接显示）；日志 tab 展示用量明细、验证命令与输出、疑似报错的工具结果条数。
+
+`Verification` 加了一个 `output` 字段（截断 2000 字）：原来 `output` 不在 dataclass 里，`from_dict` 会把它丢掉，日志 tab 就看不到验证输出了。完整输出仍应走设计里的 `output_ref` 落盘，这次没做。
+
+### 10.7 W5 控制面板
+
+点左栏「控制面板」时，**只有右栏换成面板**，左栏空间列表不动（还是能随时点回某个会话）。面板内部再分两栏：
+
+```
+┌ 状态带：运行中 · 未读消息 · 待办 · 累计 tokens ┐
+├───────────────────┬──────────────────────────┤
+│ 指挥台             │ 消息                      │
+│ @空间名 下发任务    │ 系统 / 定时 / 邮件         │
+│ 任务卡流（状态+摘要）│ ─────────────────────────│
+│                   │ 备忘                      │
+│ [输入框]           │ 文本条目 / 引用会话的条目   │
+└───────────────────┴──────────────────────────┘
+```
+
+**指挥台**：输入框解析 `@空间名 [任务描述]`。有任务描述就在该空间**新建 session** 再发消息（定下的口径：总是新建，任务之间不串味；要续聊就点进那个 session 直接问）；只 `@空间名` 就回一张该空间最近 session 的状态卡，不新建。输入 `@` 出候选，↑↓ 选、回车确认。
+
+任务卡是**轮询**出来的（每 3 秒拉一次 `/api/sessions/{id}/summary`），不是 SSE——面板同时可能盯着好几个空间的 session，给每个都开一条 SSE 太重，而摘要本来就是秒级刷新就够。点卡片跳回该 session 的对话视图。
+
+**完成摘要**：定下的口径是**纯结构化，不额外调模型**——改了几个文件、工具调用次数、报错条数、验证状态、最后一句助手消息截断 120 字，全是现成数据。控制面板是「看一眼」的地方，为了一句人话去堵一次调用不划算；真想要人话做成卡片上的按需按钮（`panel/summary.py` 的 `one_line()` 就是那一行结论）。
+
+**消息（inbox）**：落 `~/.simpleagent/panel/inbox.jsonl`，**只追加**；已读状态单独记在 `read.json`，不去改已经写出去的行。`source` 是开放字符串，v1 只有 `system` 会真的写东西（session 完成/失败/取消、验证失败，在 `Runner` 的收口处落），`schedule` / `mail` 留给 M4 定时任务和邮件适配器——加新来源不用动数据模型。点未读消息自动标记已读，`ref` 指了 session 就跳过去；右上角「+备忘」把一条消息转成备忘。
+
+**备忘（todos）**：全局一份，落 `todos.json`（整体原子写）。条目两种：`text` 纯文本，或 `session` 引用（存 space_id + session_id，点「跳到会话」直接过去）。未完成的在前。
+
+**权限与审批**（M3 的 `Policy`，与「从哪下发」无关，是空间级的同一套）：
+
+| 档 | 工具 | 行为 |
+|---|---|---|
+| `allow` | `list_dir` / `read_file` / `glob` / `grep` | 直接放行，不问 |
+| `ask` | `write_file` / `edit_file` / `bash` | **都要确认**——包括写当前目录 |
+| `deny` | `rm -rf ~`、`mkfs`、fork bomb 等 | 直接拒绝，连问都不问（见 `permissions.inspect_command`） |
+
+所以「写当前目录默认打开」不是默认行为：如果没弹审批卡，多半是这个会话里点过**「本次会话始终允许」**（`always_store` 按 session_id 记，跨轮有效）。
+
+**修掉的死锁**：审批帧发出去就过去了，而 SSE 首次连接不重放（`Last-Event-ID` 只在断线重连时带）。于是面板下发的任务一旦卡在审批上，面板只显示「运行中」，**切到那个会话也看不到审批卡**——那一帧早发完了。现在 `PendingApprovals` 除了 Future 还留下 `ApprovalRequest` 本身，`GET /api/approvals` 返回带 `session_id` / `tool_name` / `arguments` 的详情，两处靠它补卡：面板任务卡轮询到 pending 就显示「等待批准」+ 内联允许/始终允许/拒绝；切进会话时也会先拉一次，把错过的审批卡补出来。
+
+**没做的**：定时任务（`source=schedule`）等 M4；邮件（`source=mail`）要接 agent-mail 时得先定「哪些邮件算消息」的筛选规则，单独一轮；知识库入口仍是 M7；`panel/summary` 里的 `today_tokens` 现在是**累计**口径，等 M4 的用量统计再按天切。权限三档目前硬编码在工具声明里，没有按空间配置——某个空间想「写操作免确认」得改代码。
+
+### 10.8 这一版没做
+
+- 「变更 / 文件 / 日志」三个 tab 已实现；审批卡片端到端可用（冒烟里写文件触发审批 → 批准 → 继续）。
+- 标题目前是首条用户消息截断 40 字（5.3 的方案 a），没做「调一次便宜模型生成 12 字摘要」（方案 b）。会话的**结构化**摘要另算，见 10.7。
+- 会话删除没有接口，左栏只能关闭空间（×），不能删单个会话。
+- 验证的完整输出还没落盘（`output_ref` 字段留着没用起来），现在只存截断后的 `output`。
+
+### 10.9 新建空间：目录形态与执行者拆成两维
+
+改造前 `kind` 一个字段扛了两件事：选了「通用任务」就同时锁死「用 tmp」+「内置 loop」，选了
+「绑定 agent」又必须填目录；而 `Runner._build_agent()` **根本不看 kind 之外的执行者**，
+永远用内置 loop + `config.profiles[space.profile]` 跑——向导里选 claude-code 只是存了个名字，
+实际还是 SimpleAgent 在跑。这次把两维拆开：
+
+- `Space.kind` 收敛为**目录形态**（generic 用 tmp / agent 进 `cwd`）；
+- 新增 `Space.executor`（`simpleagent` | `claude-code` | `opencode`，默认前者），与 kind 正交；
+- `cwd` 从 `[agent]` 段提到顶层——它本来就是空间属性（「在哪跑」），不是 CLI 的启动参数；
+- `AgentBinding` 缩成「怎么把 CLI 拉起来」（`command` / `args` / `resume_flag`），去掉
+  和顶层重复的 `name`、`cwd`；
+- 模型分两栏：`profile`（内置）/ `cli_model`（外部 CLI，`None` = 本机默认，不注入任何 env / args）；
+- 校验集中在 `Space.from_spec()`：未知执行者、绑定目录却不给 cwd、通用任务却指定 cwd、
+  内置执行者却填 `cli_model`，一律 `ValueError`，API 层转 400。
+  `SpaceStore.create_space()` 也改成**先构造再落盘**，非法组合不再留下半个空间目录。
+- `_build_agent()` 加了守卫：`executor != simpleagent` 时直接报错
+  「执行者 claude-code 还没接入（规划在 M8）」，**不静默回退到内置 loop**。
+- 顺带修了一处：`_run_input()` 里「落盘用户消息」挪到构造 Agent **之前**——起不来的时候
+  （没配 key、profile 不存在、外部 CLI 没接入）用户刚发的那句话也不会凭空消失。
+
+以前端为准的两处语义：`/api/meta` 多返回 `executors`（含 `label` / `external` / `models`），
+向导的模型栏与执行者下拉都从这里渲染，前端不再硬编码 agent 名单；输入区的模型切换在外部
+执行者的空间里会禁用（模型由那个 CLI 自己决定），`/model` 命令同理。
+
+**没做的（留给下一步）**：外部 CLI 的启动器本身——spawn `claude -p --output-format stream-json`
+→ 解析成我们的事件帧 → resume，以及最要紧的**审批策略**：claude 无头模式的 `--permission-mode`
+一开，我们自己的审批卡就形同虚设。`[profiles.*]` 里挂外部 CLI 映射（`ANTHROPIC_*` 那套、
+key 仍只写 `api_key_env`）也留到那时一起设计，届时 `cli_model` 才有可选项。

@@ -2,7 +2,7 @@
 
 落盘布局（在 <SIMPLEAGENT_HOME>/spaces/ 下）：
     <space-id>/space.toml          空间定义（唯一真值）
-    <space-id>/tmp/                通用空间的工作目录（kind=generic 时建）
+    <space-id>/tmp/                没有固定 cwd 的空间的工作目录
     <space-id>/sessions/<sid>.jsonl   消息流，只追加
     <space-id>/sessions/<sid>.meta.json  会话元信息（标题/状态/验证），可变
 
@@ -58,28 +58,33 @@ def _space_to_toml(space: Space) -> str:
         f"id = {_toml_str(space.id)}",
         f"name = {_toml_str(space.name)}",
         f"kind = {_toml_str(space.kind)}",
+        f"executor = {_toml_str(space.executor)}",
         f"profile = {_toml_str(space.profile)}",
+    ]
+    if space.cli_model:
+        out.append(f"cli_model = {_toml_str(space.cli_model)}")
+    if space.kind == "agent" and space.cwd:
+        out.append(f"cwd = {_toml_str(space.cwd)}")
+    out += [
         f"opened = {str(space.opened).lower()}",
         f"pinned = {str(space.pinned).lower()}",
         f"created_at = {_toml_str(space.created_at)}",
         f"last_opened_at = {_toml_str(space.last_opened_at)}",
         f"keep_sessions = {space.keep_sessions}",
     ]
-    if space.kind == "agent" and space.agent:
+    # [generic] 和 [agent] 是两张独立的表，可以同时存在（通用任务 + 外部 agent）
+    if space.kind == "generic" and space.generic:
+        out += ["", "[generic]", f"tmp_dir = {_toml_str(space.generic.tmp_dir)}"]
+    if space.executor != "simpleagent" and space.agent:
         a = space.agent
         out += [
             "",
             "[agent]",
-            f"name = {_toml_str(a.name)}",
             f"command = {_toml_str(a.command)}",
             f"args = {json.dumps(a.args, ensure_ascii=False)}",
         ]
-        if a.cwd is not None:
-            out.append(f"cwd = {_toml_str(a.cwd)}")
         if a.resume_flag:
             out.append(f"resume_flag = {_toml_str(a.resume_flag)}")
-    elif space.kind == "generic" and space.generic:
-        out += ["", "[generic]", f"tmp_dir = {_toml_str(space.generic.tmp_dir)}"]
     if space.verify and space.verify.command:
         v = space.verify
         out += [
@@ -93,18 +98,24 @@ def _space_to_toml(space: Space) -> str:
 
 
 def _space_from_toml(data: dict[str, Any], space_id: str) -> Space:
+    # 兼容 W1~W5 写下的旧文件：那时执行者叫 [agent].name，cwd 也藏在 [agent] 里
+    agent_data = data.get("agent") or {}
+    executor = data.get("executor") or agent_data.get("name") or "simpleagent"
     return Space(
         id=space_id,
         name=data.get("name", space_id),
         kind=data.get("kind", "generic"),
+        executor=executor,
         profile=data.get("profile", "default"),
+        cli_model=data.get("cli_model") or None,
+        cwd=data.get("cwd") or agent_data.get("cwd"),
         opened=bool(data.get("opened", True)),
         pinned=bool(data.get("pinned", False)),
         created_at=data.get("created_at", ""),
         last_opened_at=data.get("last_opened_at", ""),
         keep_sessions=int(data.get("keep_sessions", 50)),
         generic=GenericConfig.from_dict(data["generic"]) if data.get("generic") else None,
-        agent=AgentBinding.from_dict(data["agent"]) if data.get("agent") else None,
+        agent=AgentBinding.from_dict(agent_data) if agent_data else None,
         verify=VerifyConfig.from_dict(data["verify"]) if data.get("verify") else None,
     )
 
@@ -176,13 +187,14 @@ class SpaceStore:
         return _space_from_toml(data, space_id)
 
     def create_space(self, spec: SpaceSpec) -> Space:
-        space_id = new_id("sp")
-        sd = self._space_dir(space_id)
+        # 先构造再落盘：from_spec 会校验组合是否合法，非法时不该留下半个空间目录
+        space = Space.from_spec(spec, new_id("sp"))
+        sd = self._space_dir(space.id)
         sd.mkdir(parents=True, exist_ok=True)
-        space = Space.from_spec(spec, space_id)
-        if space.kind == "generic":
+        # 没有 cwd 的空间（kind=generic，或将来允许的空目录）工作目录落在 tmp，先建好
+        if not space.cwd:
             (sd / "tmp").mkdir(exist_ok=True)
-        self._sessions_dir(space_id).mkdir(exist_ok=True)
+        self._sessions_dir(space.id).mkdir(exist_ok=True)
         self._write_space_toml(space)
         return space
 
@@ -250,7 +262,7 @@ class SpaceStore:
             id=session_id,
             space_id=space_id,
             status="idle",
-            agent=agent or (space.agent.name if space.agent else "simpleagent"),
+            agent=agent or space.executor,
             created_at=now,
             updated_at=now,
         )

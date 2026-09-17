@@ -1,9 +1,5 @@
 """bash：执行 shell 命令。
 
-M2 只做执行本身：超时或中断就杀掉整个进程组、合并 stdout 和 stderr、限制读取的输出量。
-危险命令识别、工作目录边界、是否要问用户，都是 M3 权限系统的事（bash 标了
-readonly=False，到时候在注册表里就能拿到这个标记）。
-
 子进程的环境变量会去掉 ctx.hidden_env（配置里各 profile 的 api_key_env）：
 .env 里的 key 本来就不进 os.environ，但用户自己 export 的 key 会被子进程继承。
 """
@@ -16,6 +12,7 @@ import signal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from simpleagent.permissions import Scope
 from simpleagent.tools.base import ToolContext, ToolError, tool
 
 # 最多读取这么多字节的输出，再多就停止读取并终止命令：输出先放在内存里，
@@ -68,7 +65,16 @@ def _kill_group(process: asyncio.subprocess.Process) -> None:
         pass  # 已经全部退出了
 
 
-@tool(name="bash", description=DESCRIPTION, readonly=False)
+def bash_scope(args: BashArgs, ctx: ToolContext) -> Scope:
+    """bash 的作用范围：给了 cwd 参数就连同执行目录一起报，跑到别的地方去也会被拦。
+
+    命令本身交给 inspect_command 单独识别（rm -rf / 之类），路径边界只管住落点。
+    """
+    paths = (ctx.resolve(args.cwd),) if args.cwd else ()
+    return Scope(paths=paths, command=args.command)
+
+
+@tool(name="bash", description=DESCRIPTION, readonly=False, permission="ask", scope=bash_scope)
 async def bash(args: BashArgs, ctx: ToolContext) -> str:
     cwd = ctx.resolve(args.cwd) if args.cwd else ctx.cwd
     if not cwd.is_dir():

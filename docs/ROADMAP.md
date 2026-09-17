@@ -9,7 +9,7 @@
 | ✅ | **M0 脚手架** | uv 项目、配置加载、trace 落盘、FakeLLM、pytest + ruff | 项目骨架、可测试性 |
 | ✅ | **M1 流式对话** | `sa` REPL；OpenAI 兼容流式客户端；`/model` 切换 profile；思考内容显示；usage 统计；Ctrl+C 中断 | Chat Completions 协议、SSE、各家兼容差异 |
 | ✅ | **M2 工具调用 + Agent Loop** | Tool 抽象和注册表；`read_file / write_file / edit_file / list_dir / glob / grep / bash`（带超时）；只读并行、含写串行；错误回传；输出截断落盘；中断时补结果；`max_steps` | Function calling、ReAct 循环、错误自愈 |
-| | **M3 权限 + 会话 + Headless** | allow/ask/deny 规则、工作目录边界、危险命令识别；JSONL 会话和 `sa --resume`；`sa run "..."` 单次无人值守执行 | 人在回路、状态持久化、无人值守的安全边界 |
+| ✅ | **M3 权限 + 会话 + Headless** | allow/ask/deny 规则、工作目录边界、危险命令识别；JSONL 会话和 `sa --resume`；`sa run "..."` 单次无人值守执行 | 人在回路、状态持久化、无人值守的安全边界 |
 | | **M4 个人自动化 v1** ⭐ | `sa daemon`（croniter）；`schedules.toml` 定义任务（prompt / profile / allowed_tools / notify）；`web_fetch`、`notify`（macOS 通知 + 飞书/Telegram webhook）、`schedule_add/list/remove` 工具；运行日志；可选 launchd 常驻 | 事件驱动 agent、无人值守的权限策略 |
 | | **M5 MCP 客户端** | 手写 stdio JSON-RPC（`initialize` → `tools/list` → `tools/call`）；工具名 `mcp__<server>__<tool>`；子进程生命周期管理；先接 `@modelcontextprotocol/server-filesystem` 验证，再接日历/邮件/IM；远程 HTTP 和 OAuth 以后引入官方 `mcp` SDK | MCP 协议、工具生态接入 |
 | | **M6 上下文工程** | token 预算（上次 usage + 字符估算）；三级策略：写入时截断 → 清理旧 tool 结果 → LLM 摘要压缩（不拆开 tool_call 和它的结果）；`/compact`；保持 system prompt 和工具列表稳定以命中前缀缓存 | 上下文窗口管理、缓存友好的 prompt 设计 |
@@ -19,7 +19,12 @@
 | | **W 个人 AI 工作台** | 桌面客户端 + 常驻后台引擎（本地 API、通知路由、客户端审批）。功能清单和客户端技术栈**待设计** | 客户端/服务端分离、事件推送 |
 
 M2 已完成（2026-09-17）：7 个内置工具、输出截断落盘、只读并行/含写串行都齐了；学习笔记见 [notes/M2-tools-and-agent-loop.md](notes/M2-tools-and-agent-loop.md)。
-M3 要做权限（allow/ask/deny）：目前 `bash` / `write_file` / `edit_file` 没有任何拦截，只标了 `readonly=False`。
+M3 已完成（2026-09-17）：权限拆成「判定 + 询问」两层，写操作默认询问、目录越界和危险命令直接拒绝；
+会话落 `sessions/*.jsonl` 并能 `--resume` 恢复；`sa run` 走白名单审批，没人确认时一律拒绝而不是卡住。
+学习笔记见 [notes/M3-permissions-sessions.md](notes/M3-permissions-sessions.md)。
+
+M3 剩下的两件事（不挡 M4 的路，到时候按需补）：权限等级目前写死在工具上，**还没进配置文件**
+（`config.toml` 里不能写「这个项目 bash 全部放行」），M4 的定时任务要用到这套配置；`--allow` 只支持工具名，不支持模式匹配。
 
 M4 完成后就是一个每天能真正用上的自动化 agent；M5–M8 在此基础上逐步增强。工作台的前置条件是 M2 的接口约定（见 [ARCHITECTURE.md](ARCHITECTURE.md#m2-起就要守住的接口约定)）和 M4 的后台常驻进程，具体时间点等设计完再定。
 

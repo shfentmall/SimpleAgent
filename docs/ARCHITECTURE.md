@@ -81,15 +81,74 @@ class ListDirArgs(BaseModel):
     depth: int = Field(2, ge=1, le=5, description="展开层数，1 表示只列直接子项")
 
 
-@tool(name="list_dir", description="...")  # M3 再加 permission="allow" / "ask" / "deny"
+@tool(name="list_dir", description="...")  # readonly=True、permission="allow"
 async def list_dir(args: ListDirArgs, ctx: ToolContext) -> str: ...
+
+
+@tool(
+    name="write_file",
+    description="...",
+    readonly=False,
+    permission="ask",  # M3：改动前要先问
+    scope=lambda args, ctx: Scope(paths=(ctx.resolve(args.path),)),  # M3：报告改动了哪里
+)
+async def write_file(args: WriteFileArgs, ctx: ToolContext) -> str: ...
 ```
 - schema 由 `Args.model_json_schema()` 生成，去掉 pydantic 自动加的 `title`，包装成 `{"type": "function", "function": {...}}`
 - 可以预期的失败抛 `ToolError`，消息原样回给模型；相对路径用 `ctx.resolve()` 基于 `ctx.cwd` 解析
 - `ToolContext` 有 `cwd` 和 `output_dir`；`ctx.save_output(content, name)` 把完整输出落盘。后续加 session、approver（审批器）、进度上报、中断信号
 - `Tool.readonly` 标记这个工具会不会改动外部状态，决定同一批调用是并行还是串行
+- `Tool.permission` 是默认权限等级（`allow` / `ask` / `deny`），`Tool.scope` 报告这次调用会改动
+  哪些绝对路径、要跑什么命令。两者都由注册表在执行前交给权限判定器，`Tool` 自己不做判断
+- **审批器不再挂在 ToolContext 上**：W2 曾经在 `ToolContext` 上放过 `approver`，
+  引入权限判定器之后它成了第二条审批通道，M3 删掉了。审批统一由 `ToolRegistry` 负责：
+  先判定，判定结果是 ask 才调审批器
 - 内置 7 个工具：`list_dir` / `read_file`（带行号、offset+limit，流式读取，按行数和约 3 万字符自己分页）/ `write_file`（整篇写入、自动建目录）/ `edit_file`（唯一匹配或 `replace_all`，保留原换行符，返回 unified diff）/ `glob`（`*`、`?`、`**` 自己转正则）/ `grep`（正则搜内容，跳过二进制和大文件）/ `bash`（`create_subprocess_shell`、自成进程组，超时 / 输出超过 10MB / Ctrl+C 时杀掉整组；stderr 合并进 stdout、stdin 是 DEVNULL；环境变量去掉各 profile 的 `api_key_env`）。目录遍历、忽略清单、按 `\n` 分行、可取消的线程执行共用 `tools/walk.py`
-- 审批器由前端注入：REPL 版询问用户（y / n / always）；headless 版按任务的 `allowed_tools` 白名单判断，需要 ask 的一律拒绝，并把拒绝原因回给模型
+- 审批器由前端注入（M3 已实现，见「权限」章节）：REPL 版读一行输入（y / a / 其他键拒绝）；
+  headless 版按 `--allow` 白名单判断，需要 ask 的一律拒绝，并把拒绝原因回给模型；
+  客户端版推 SSE 帧后挂起等回调
+
+### 权限（M3，`permissions.py`）
+
+拆成两层：**判定**（这次要不要问）和**询问**（这次让不让）。
+
+```
+tool_call → Registry.judge() → Policy.decide() ─┬─ ALLOW → 执行
+                                                ├─ DENY  → 拒绝原因回给模型
+                                                └─ ASK   → Approver.request() → 允许 / 拒绝
+```
+
+- `Policy` 是纯函数，无 IO。判定顺序固定：**工具禁用 → 路径越界 → bash 危险命令 → 默认等级**。
+  越界和危险命令必须排在默认等级之前，否则工具只要声明 `permission="allow"` 就能穿透边界。
+- `Scope.paths` 只放**会被改动**的绝对路径；只读工具不报，因此不受工作目录边界限制
+  （读 `~/.zshrc` 是日常需求，为它弹一次确认不划算）。`../` 要在 scope 里就 `resolve()` 掉。
+- bash 的危险命令清单刻意很窄：只拦「问了也不该答应」的——`rm -rf` 指向家目录 / 系统根目录 /
+  整个工作目录，`mkfs` / `dd` / `fdisk` / `diskutil`，`shutdown` / `reboot`，fork bomb，
+  管道直接喂解释器（远程脚本执行），写裸块设备。可弥补的（`rm -rf node_modules`、装错包、
+  push 错分支）照常走 ask。拦太宽，模型会学着绕开审批，反而更危险。
+- 三种审批器共用同一个异步接口，保住「审批器是异步接口」那条约定：
+
+  | 实现 | 场景 |
+  |---|---|
+  | `ConsoleApprover`（`ui/approve.py`） | REPL：y / a（本次会话都允许）/ 其他键拒绝 |
+  | `WhitelistApprover` | `sa run` 和以后的 `sa daemon`：名单外一律拒绝，原因回给模型 |
+  | `APIApprover`（`serve/approval.py`） | 桌面客户端：推一帧 SSE 后 `await Future` |
+
+  危险判定放在 Policy 里，是三个前端共享的底线：定时任务也绕不过去。
+
+### 会话持久化（M3，`agent/session.py`）
+
+`sessions/<id>.jsonl`，每行一条**操作记录**而不是一条消息：
+
+```
+{"op":"meta", ...}   {"op":"append","message":{...}}   {"op":"truncate","n":5}   {"op":"stats",...}
+```
+
+需要 `truncate` 是因为 Ctrl+C 之后 `Agent._repair` 要**撤回**已经写进历史的半条对话。
+append-only 的文件表达「撤销」就得靠这种墓碑行；全量重写的话，进程崩在写一半时会丢掉整份历史。
+
+消息历史只能通过 `Session.add` / `add_many` / `truncate` / `record_stats` 改，它们负责同步写盘。
+写盘失败静默忽略（持久化是加分项，磁盘满了不该让对话中断）。
 
 ### LLM Client 与配置（M1，已实现）
 
@@ -117,7 +176,7 @@ async def list_dir(args: ListDirArgs, ctx: ToolContext) -> str: ...
 |---|---|---|
 | `config.toml` | 配置 | M1 |
 | `traces/<session>/<n>.json` | 每次 LLM 请求/响应 | M1 |
-| `sessions/*.jsonl` | 会话持久化 | M3 |
+| `sessions/*.jsonl` | 命令行会话持久化（`sa --resume`） | M3 ✅ |
 | `schedules.toml`、`logs/` | 定时任务和运行日志 | M4 |
 | `tool_outputs/` | 过长工具输出的完整内容 | M2 |
 | `memory/`、`skills/` | 长期记忆、技能 | M7 |
@@ -147,7 +206,8 @@ async def list_dir(args: ListDirArgs, ctx: ToolContext) -> str: ...
 为了让终端、桌面客户端、定时任务共用同一个核心：
 
 1. **状态归 `Agent` / `Session`**：消息历史、用量、当前模型不放在任何界面层（M1 暂时在 `Repl` 里，M2 已迁到 `Agent` / `Session`）
-2. **审批器是异步接口**：`async def approve(...)`，终端、客户端、无人值守各自实现
+2. **审批器是异步接口**：`Approver.request(req) -> ApprovalDecision`，终端、客户端、无人值守
+   各自实现。判定要不要问（`Policy`）和执行询问（`Approver`）是两层，见「权限（M3）」
 3. **工具能上报进度**：`ToolContext.emit(event)`，长时间运行的工具（比如外部 agent）靠它流式反馈
 4. **取消是显式调用**：`agent.cancel()`；Ctrl+C、客户端的停止按钮都只是调用方
 5. **事件可序列化**：事件带 `type` 字段、能转 JSON，方便通过本地 API 推给客户端
@@ -158,27 +218,30 @@ async def list_dir(args: ListDirArgs, ctx: ToolContext) -> str: ...
 
 ```
 src/simpleagent/
-  cli.py                  ✅ argparse 入口：sa / sa init（后续加 run / daemon / schedule / sessions）
+  cli.py                  ✅ argparse 入口：sa / sa init / sa run / sa sessions / sa serve / sa --resume
   config.py               ✅ TOML + 环境变量 → pydantic 配置模型
   config.example.toml     ✅ sa init 使用的配置模板
   events.py               ✅ 事件类型（后续加 hooks 分发）
   trace.py                ✅ 请求/响应全量落盘
+  permissions.py          ✅ 权限：Decision / Scope / Policy（含 bash 危险命令识别）、审批器协议
   llm/client.py           ✅ 流式调用、chunk 拼接、思考内容、quirks
   llm/fake.py             ✅ 测试用的脚本化模型
   agent/prompt.py         ✅ system prompt 组装（后续加 AGENTS.md、记忆、skills 列表）
   agent/loop.py           ✅ Agent loop：工具调用循环、max_steps、中断后修复历史
-  agent/session.py        ✅ 会话状态：消息历史、用量（M3 加 JSONL 持久化、恢复会话）
+  agent/session.py        ✅ 会话状态：消息历史、用量、JSONL 持久化与恢复
   agent/context.py           token 预算、结果清理、压缩（M6）
   tools/                  ✅ Tool 抽象、注册表、7 个内置工具
-  tools/base.py           ✅ ToolContext（cwd / output_dir / hidden_env / save_output）、ToolError、Tool（readonly / truncate_output）、@tool
+  tools/base.py           ✅ ToolContext（cwd / output_dir / hidden_env / save_output）、ToolError、
+                          ✅ Tool（readonly / truncate_output / permission / scope）、@tool
   tools/registry.py       ✅ schema 生成、execute（失败转错误文本）、execute_many（只读并行 / 含写串行，分批产出）、输出截断
   tools/walk.py           ✅ 忽略清单、带剪枝的目录遍历、二进制判断、按行读取、可取消的线程执行（glob / grep / read_file / list_dir 共用）
   tools/output.py         ✅ 输出截断：按行数和字符数截断 + 落盘提示
   tools/{list_dir,read_file,write_file,edit_file,glob,grep,bash}.py  ✅ 内置工具
-  permissions.py             规则匹配、工作目录边界（M3）
   scheduler/                 定时 daemon（M4）
   mcp/client.py              stdio JSON-RPC MCP 客户端（M5）
   skills.py                  SKILL.md 发现与按需加载（M7）
-  ui/repl.py              ✅ 交互式 REPL
+  ui/repl.py              ✅ 交互式 REPL（写操作终端确认）
+  ui/headless.py          ✅ `sa run`：无人值守单次执行，白名单审批
+  ui/approve.py           ✅ ConsoleApprover：终端 y / a / 其他键拒绝
 tests/                    ✅ 各模块对应测试
 ```
