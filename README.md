@@ -15,20 +15,41 @@
 - [路线图](docs/ROADMAP.md)：M0–M9 里程碑与当前进度
 - [学习笔记](docs/notes/)：每个里程碑学到的东西和踩过的坑
 
+## 安装
+
+用 [uv](https://docs.astral.sh/uv/) 装成全局命令，之后在任意目录都能直接敲 `sa`（本机没有 Python 3.12 时 uv 会自动下载）：
+
+```bash
+uv tool install --editable .     # 在仓库根目录执行；editable：改完代码立刻生效，不用重装
+sa --version                     # 确认装好了
+```
+
+- 不加 `--editable` 是装一份当前代码的快照，改代码后要 `uv tool install --reinstall .` 才会更新
+- 在别的电脑上直接从 GitHub 装：`uv tool install git+ssh://git@github.com/shfentmall/SimpleAgent.git`
+- 卸载：`uv tool uninstall simpleagent`（`~/.simpleagent/` 里的配置和会话不会删）
+- 命令装在 `~/.local/bin/`；不在 PATH 里的话执行一次 `uv tool update-shell`
+
+同时会装一个长名字 `simple_agent`，和 `sa` 完全等价。macOS 自带一个 `/usr/sbin/sa`（系统记账统计），
+平时 `~/.local/bin` 排在 PATH 前面没问题；但 launchd、cron 这类 PATH 很短的环境会找到系统那个，
+这时写绝对路径 `~/.local/bin/sa`，或者用 `simple_agent`。
+
+不想装也可以：在仓库目录下 `uv sync` 后用 `uv run sa` 代替下面的 `sa`。
+
 ## 快速开始
 
 ```bash
-uv sync                          # 安装依赖（Python 3.12）
-uv run sa init                   # 生成 ~/.simpleagent/config.toml
+sa init                          # 生成 ~/.simpleagent/config.toml
 echo 'DEEPSEEK_API_KEY=sk-...' >> ~/.simpleagent/.env && chmod 600 ~/.simpleagent/.env
                                  # 默认 profile 是 deepseek；也可以直接 export 环境变量
-uv run sa                        # 进入对话
-uv run sa -m local               # 指定 profile，比如本地 Ollama
-uv run sa sessions               # 列出已保存的会话
-uv run sa --resume               # 接着最近一次继续聊
-uv run sa run "整理 downloads"    # headless：跑一个任务就退出，不交互
-uv run sa run "..." --allow write_file,edit_file   # 放行指定的写工具
-uv run sa serve                  # 启动本地 API（HTTP + SSE），供桌面客户端连接
+sa                               # 进入对话
+sa -m local                      # 指定 profile，比如本地 Ollama
+sa sessions                      # 列出已保存的会话
+sa --resume                      # 接着最近一次继续聊
+sa run "整理 downloads"           # headless：跑一个任务就退出，不交互
+sa run "..." --allow write_file,edit_file   # 放行指定的写工具
+sa serve                         # 启动本地 API（HTTP + SSE），供桌面客户端连接
+uv run pytest 2>&1 | sa inbox push -t "夜间测试" --level warn
+                                 # 往控制面板投一条消息（正文可走管道），不需要 serve 在跑
 ```
 
 REPL 命令：`/model [name]` 切换模型、`/tools` 列出可用工具、`/clear` 清空历史、`/usage` 查看用量、`/help`、`/exit`。

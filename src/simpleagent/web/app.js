@@ -654,14 +654,17 @@ const panelState = {
   summary: null,
   dispatch: [],      // 本次打开面板后下发的任务
   inbox: [],
+  inboxView: "active",  // active：当前 | archived：归档
+  counts: { unread: 0, active: 0, archived: 0 },
+  modalItem: null,      // 弹层里正在看的那条消息（带全文）
   todos: [],
-  inboxUnreadOnly: false,
   pollTimer: null,
   mentions: { open: false, items: [], index: 0, from: 0 },
 };
 
 async function openPanel() {
   panelState.open = true;
+  panelState.inboxView = "active";  // 每次打开都先看当前消息，归档是要找东西时才去翻的
   $("ws-header").classList.add("hidden");
   $("tabs").classList.add("hidden");
   $("composer").classList.add("hidden");
@@ -685,16 +688,14 @@ function closePanel() {
 }
 
 async function loadPanel() {
-  const [summary, inbox, todos] = await Promise.all([
+  const [summary, todos] = await Promise.all([
     api.get("/api/panel/summary"),
-    api.get(`/api/inbox?limit=50${panelState.inboxUnreadOnly ? "&unread=1" : ""}`),
     api.get("/api/todos"),
+    loadInbox(),
   ]);
   panelState.summary = summary;
-  panelState.inbox = inbox;
   panelState.todos = todos;
   renderStats();
-  renderInbox();
   renderTodos();
   renderDispatch();
 }
@@ -806,8 +807,13 @@ async function pollDispatch() {
 }
 
 async function loadInbox() {
-  panelState.inbox = await api.get(
-    `/api/inbox?limit=50${panelState.inboxUnreadOnly ? "&unread=1" : ""}`);
+  const view = panelState.inboxView;
+  const [items, counts] = await Promise.all([
+    api.get(`/api/inbox?view=${view}&limit=${view === "archived" ? 200 : 50}`),
+    api.get("/api/inbox/count"),
+  ]);
+  panelState.inbox = items;
+  applyCounts(counts);
   renderInbox();
 }
 
@@ -866,44 +872,150 @@ async function dispatch() {
 }
 
 /* ── 消息 ── */
+const SOURCE_LABEL = { system: "系统", schedule: "定时", mail: "邮件", cli: "脚本", manual: "手动" };
+const LEVEL_LABEL = { info: "信息", success: "成功", warn: "注意", error: "错误" };
+const INBOX_POLL_MS = 30000;
+
+const sourceLabel = (src) => SOURCE_LABEL[src] || src || "未知";
+
+/* 已读的消息离归档还有多久；已归档的显示归档时间。口径在服务端，这里只是换成人话 */
+function archiveHint(m) {
+  if (m.archived) return m.archive_at ? `归档于 ${relTime(m.archive_at)}` : "";
+  if (!m.archive_at) return "";
+  const min = Math.ceil((new Date(m.archive_at).getTime() - Date.now()) / 60000);
+  return min <= 1 ? "即将归档" : `${min} 分钟后归档`;
+}
+
+/* 未读数同时喂给左栏角标和消息卡头部 */
+function applyCounts(c) {
+  panelState.counts = c;
+  const n = c.unread || 0;
+  const badge = $("nav-panel-badge");
+  badge.textContent = n > 99 ? "99+" : String(n);
+  badge.classList.toggle("hidden", n === 0);
+  $("inbox-unread").textContent = String(n);
+  $("inbox-archived-n").textContent = c.archived ? ` ${c.archived}` : "";
+}
+
+async function refreshBadge() {
+  applyCounts(await api.get("/api/inbox/count"));
+}
+
+/* 角标和消息列表共用一个 30 秒的钟：面板开着就连列表一起刷（到期的消息由服务端判定，
+   刷一下就自然挪进归档），没开只刷角标。后台标签页跳过，切回前台时补一次。 */
+function pollInbox() {
+  if (document.hidden) return;
+  const job = panelState.open ? Promise.all([loadInbox(), loadStatsOnly()]) : refreshBadge();
+  job.catch(() => { /* 拿不到就下一轮再试 */ });
+}
+
 function renderInbox() {
   const box = $("inbox-list");
-  $("inbox-unread").textContent = String((panelState.summary || {}).unread || 0);
+  const archivedView = panelState.inboxView === "archived";
+  document.querySelectorAll("#inbox-view .seg-item").forEach((el) =>
+    el.classList.toggle("is-active", el.dataset.view === panelState.inboxView));
   if (!panelState.inbox.length) {
-    box.innerHTML = `<div class="empty-sub" style="padding:8px">暂时没有消息。</div>`;
+    box.innerHTML = `<div class="empty-sub" style="padding:8px">${archivedView
+      ? "归档是空的。消息点开一段时间后会自动移到这里。" : "暂时没有消息。"}</div>`;
     return;
   }
   box.innerHTML = panelState.inbox.map((m) => `
-    <div class="inbox-item ${m.read ? "" : "is-unread"}" data-id="${escapeHtml(m.id)}">
+    <div class="inbox-item ${m.read ? "is-read" : "is-unread"}" data-id="${escapeHtml(m.id)}">
       <span class="inbox-bar ${escapeHtml(m.level)}"></span>
-      <div style="flex:1;min-width:0">
-        <div class="t">${escapeHtml(m.title)}</div>
-        ${m.body ? `<div class="b">${escapeHtml(m.body)}</div>` : ""}
+      <div class="inbox-main">
+        <div class="t"><span class="inbox-src">${escapeHtml(sourceLabel(m.source))}</span>${escapeHtml(m.title)}</div>
+        ${m.preview ? `<div class="b">${escapeHtml(m.preview)}</div>` : ""}
       </div>
-      <span class="w">${escapeHtml(relTime(m.ts))}</span>
-      <span class="todo-tag" data-act="todo" title="转为备忘">+备忘</span>
+      <div class="inbox-side">
+        <span class="w">${escapeHtml(relTime(m.ts))}</span>
+        <span class="inbox-hint">${escapeHtml(archiveHint(m))}</span>
+        <span class="inbox-acts">
+          <span class="todo-tag" data-act="todo" title="转为备忘">+备忘</span>
+          ${archivedView ? "" : `<span class="todo-tag" data-act="archive" title="不等倒计时，直接归档">归档</span>`}
+        </span>
+      </div>
     </div>`).join("");
 
   box.querySelectorAll(".inbox-item").forEach((el) => {
     const item = panelState.inbox.find((m) => m.id === el.dataset.id);
-    el.querySelector('[data-act="todo"]').onclick = async (ev) => {
+    el.querySelector('[data-act="todo"]').onclick = (ev) => {
       ev.stopPropagation();
-      await api.post("/api/todos", { text: item.title, kind: "session", ref: item.ref || {} });
-      await loadPanel();
-      toast("已加入备忘");
+      messageToTodo(item).catch((e) => toast(e.message));
     };
-    el.onclick = async () => {
-      if (!item.read) {
-        await api.post(`/api/inbox/${item.id}/read`, {});
-        item.read = true;
-      }
-      const sid = (item.ref || {}).session_id;
-      const spid = (item.ref || {}).space_id;
-      if (sid && spid) { closePanel(); await selectSession(spid, sid); return; }
-      renderInbox();
-      await loadStatsOnly();
-    };
+    const arch = el.querySelector('[data-act="archive"]');
+    if (arch) {
+      arch.onclick = (ev) => {
+        ev.stopPropagation();
+        archiveMessage(item.id).catch((e) => toast(e.message));
+      };
+    }
+    el.onclick = () => openMessage(item).catch((e) => toast(e.message));
   });
+}
+
+/* 点一条消息：先记已读（归档倒计时从这一刻开始），再按 action 分流——
+   框架内的会话直接跳过去；外部发来的文本在弹层里看全文。 */
+async function openMessage(item) {
+  if (!item.read) {
+    const r = await api.post(`/api/inbox/${item.id}/read`, {});
+    Object.assign(item, r.item);
+    renderInbox();
+    refreshBadge().catch(() => {});
+    loadStatsOnly().catch(() => {});
+  }
+  if (item.action !== "session") return openMessageModal(item.id);
+  const { space_id: spaceId, session_id: sessionId } = item.ref;
+  try {
+    await api.get(`/api/sessions/${sessionId}/summary`);
+  } catch (e) {
+    if (!/not found/.test(e.message)) throw e;
+    return openMessageModal(item.id, "这条消息指向的会话已经不存在了（空间可能被删了），下面是消息原文。");
+  }
+  closePanel();
+  await selectSession(spaceId, sessionId);
+}
+
+async function openMessageModal(id, note = "") {
+  const m = await api.get(`/api/inbox/${id}`);
+  panelState.modalItem = m;
+  $("mm-title").textContent = m.title;
+  const when = m.ts ? new Date(m.ts).toLocaleString("zh-CN", { hour12: false }) : "";
+  $("mm-meta").textContent = [sourceLabel(m.source), when, LEVEL_LABEL[m.level] || m.level,
+    archiveHint(m) || (m.archived ? "已归档" : "")].filter(Boolean).join(" · ");
+  $("mm-note").textContent = note;
+  $("mm-note").classList.toggle("hidden", !note);
+  $("mm-body").innerHTML = m.body ? renderText(m.body) : "";
+  $("mm-body").scrollTop = 0;
+  // 只放行 http(s)：ref.url 来自外部投递，javascript: 之类的链接不能变成可点的按钮
+  const url = (m.ref || {}).url || "";
+  const safe = /^https?:\/\//i.test(url);
+  $("mm-link").classList.toggle("hidden", !safe);
+  if (safe) $("mm-link").href = url;
+  $("mm-archive").classList.toggle("hidden", m.archived);
+  $("msg-modal").classList.remove("hidden");
+}
+
+function closeMessageModal() {
+  $("msg-modal").classList.add("hidden");
+  panelState.modalItem = null;
+}
+
+async function archiveMessage(id) {
+  await api.post(`/api/inbox/${id}/archive`, {});
+  await Promise.all([loadInbox(), loadStatsOnly()]);
+  toast("已归档");
+}
+
+/* 转备忘：会话消息存成可跳转的 session 备忘，外部文本就是一条普通备忘 */
+async function messageToTodo(item) {
+  const isSession = item.action === "session";
+  await api.post("/api/todos", {
+    text: item.title,
+    kind: isSession ? "session" : "text",
+    ref: isSession ? item.ref : {},
+  });
+  await loadPanel();
+  toast("已加入备忘");
 }
 
 /* ── 备忘 ── */
@@ -1431,23 +1543,50 @@ async function boot() {
     }
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); dispatch(); }
   });
-  $("inbox-filter").onclick = async () => {
-    panelState.inboxUnreadOnly = !panelState.inboxUnreadOnly;
-    $("inbox-filter").textContent = panelState.inboxUnreadOnly ? "只看未读" : "全部";
-    await loadInbox();
-  };
+  document.querySelectorAll("#inbox-view .seg-item").forEach((el) => {
+    el.onclick = async () => {
+      if (panelState.inboxView === el.dataset.view) return;
+      panelState.inboxView = el.dataset.view;
+      await loadInbox().catch((e) => toast(e.message));
+    };
+  });
   $("inbox-readall").onclick = async () => {
     await api.post("/api/inbox/all/read", {});
     await loadPanel();
   };
+  $("mm-close").onclick = closeMessageModal;
+  $("msg-modal").onclick = (e) => { if (e.target === $("msg-modal")) closeMessageModal(); };
+  $("mm-copy").onclick = async () => {
+    const m = panelState.modalItem;
+    if (!m) return;
+    try {
+      await navigator.clipboard.writeText(m.body || m.title);
+      toast("已复制");
+    } catch { toast("复制失败：浏览器不允许访问剪贴板"); }
+  };
+  $("mm-todo").onclick = () => {
+    if (panelState.modalItem) messageToTodo(panelState.modalItem).catch((e) => toast(e.message));
+  };
+  $("mm-archive").onclick = async () => {
+    const m = panelState.modalItem;
+    if (!m) return;
+    await archiveMessage(m.id).catch((e) => toast(e.message));
+    closeMessageModal();
+  };
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("msg-modal").classList.contains("hidden")) closeMessageModal();
+  });
+  refreshBadge().catch(() => { /* 角标拿不到不影响启动 */ });
+  setInterval(pollInbox, INBOX_POLL_MS);
   $("todo-add").onclick = addTodoInline;
 
   // 每个工作台标签页挂一条 SSE，开到 6 个就把浏览器给这个 host 的连接占满了，
   // 之后创建空间、发消息全卡在排队里。所以切到后台就断开，回到前台再续传，
   // 错过的帧由服务端按 lastSeq 重放，前端按 seq 去重。
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) closeStream();
-    else if (state.sessionId && !state.es) subscribe(state.sessionId, { resume: true });
+    if (document.hidden) { closeStream(); return; }
+    if (state.sessionId && !state.es) subscribe(state.sessionId, { resume: true });
+    pollInbox();  // 在后台时跳过的那几轮补上
   });
 
   // 运行中每秒刷新一次「已用时」

@@ -103,6 +103,14 @@ def test_cli_init_and_config_error(sa_home: Path, capsys: pytest.CaptureFixture[
     assert (sa_home / "config.toml").exists()
 
 
+def test_cli_version(capsys: pytest.CaptureFixture[str]):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--version"])
+    assert exit_info.value.code == 0
+    name, _, number = capsys.readouterr().out.strip().partition(" ")
+    assert name == "simpleagent" and number[0].isdigit()
+
+
 def test_api_key_env_names_collects_all_profiles():
     config = Config.model_validate(
         {
@@ -115,3 +123,14 @@ def test_api_key_env_names_collects_all_profiles():
         }
     )
     assert config.api_key_env_names() == frozenset({"A_KEY", "B_KEY"})
+
+
+def test_panel_config(sa_home: Path):
+    base = 'default_profile = "a"\n[profiles.a]\nbase_url = "http://a"\nmodel = "m"\n'
+    _write(base)
+    assert load_config().panel.archive_after_minutes == 30  # 不写就是 30 分钟
+    _write(base + "[panel]\narchive_after_minutes = 5\n")
+    assert load_config().panel.archive_after_minutes == 5
+    _write(base + "[panel]\narchive_after_minutes = 0\n")
+    with pytest.raises(ConfigError, match="archive_after_minutes"):
+        load_config()

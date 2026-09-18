@@ -82,6 +82,10 @@ body {
 .nav-item.is-disabled { color: var(--text-3); cursor: not-allowed; }
 .nav-item.is-disabled:hover { background: transparent; }
 .nav-item.is-active-nav { background: var(--accent-soft); color: var(--accent); }
+.nav-badge {
+  margin-left: auto; min-width: 16px; padding: 0 5px; border-radius: 8px;
+  background: var(--red); color: #fff; font-size: 10.5px; line-height: 16px; text-align: center;
+}
 
 .search {
   width: 100%; margin: 12px 0 4px; padding: 6px 9px;
@@ -260,17 +264,36 @@ body {
 .dot.cancelled { background: var(--amber); }
 .dot.idle { background: var(--text-3); }
 
-.inbox-item { display: flex; gap: 8px; padding: 5px 6px; border-radius: 5px; font-size: 12px; }
+.seg { display: inline-flex; gap: 2px; padding: 1px; border-radius: 5px; background: var(--bg); font-weight: 400; font-size: 11px; }
+.seg-item { padding: 0 7px; border-radius: 4px; color: var(--text-2); cursor: pointer; }
+.seg-item.is-active { background: var(--panel); color: var(--accent); box-shadow: 0 0 0 1px var(--border); }
+
+.inbox-item { display: flex; gap: 8px; padding: 5px 6px; border-radius: 5px; font-size: 12px; cursor: pointer; }
 .inbox-item:hover { background: var(--bg); }
 .inbox-item.is-unread { background: var(--accent-soft); }
+.inbox-item.is-read .t { font-weight: 400; color: var(--text-2); }
+.inbox-main { flex: 1; min-width: 0; }
+.inbox-src {
+  font-size: 10px; font-weight: 400; padding: 0 4px; margin-right: 5px; border-radius: 3px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text-2);
+}
+/* min-width 容得下 hover 时的「+备忘 归档」：不然没倒计时的未读行一 hover 就变宽、正文重新折行 */
+.inbox-side { flex: none; min-width: 64px; display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
+.inbox-hint { font-size: 10.5px; color: var(--text-3); white-space: nowrap; }
+.inbox-acts { display: none; gap: 8px; }
+.inbox-item:hover .inbox-acts { display: flex; }
+.inbox-item:hover .inbox-hint { display: none; }
 .inbox-bar { width: 3px; border-radius: 2px; flex: none; }
 .inbox-bar.info { background: var(--text-3); }
 .inbox-bar.success { background: var(--green); }
 .inbox-bar.warn { background: var(--amber); }
 .inbox-bar.error { background: var(--red); }
 .inbox-item .t { font-weight: 500; }
-.inbox-item .b { color: var(--text-2); }
-.inbox-item .w { margin-left: auto; font-size: 10.5px; color: var(--text-3); white-space: nowrap; }
+.inbox-item .b {
+  color: var(--text-2); word-break: break-all; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.inbox-item .w { font-size: 10.5px; color: var(--text-3); white-space: nowrap; }
 
 .todo-item { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; padding: 4px 6px; border-radius: 5px; }
 .todo-item:hover { background: var(--bg); }
@@ -372,6 +395,23 @@ pre.code {
 .modal-err { color: var(--red); font-size: 12px; min-height: 18px; }
 .field-hint { font-size: 11.5px; color: var(--text-3); margin: -4px 0 9px; }
 .modal-foot { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-foot .spacer { flex: 1; }
+a.btn { text-decoration: none; display: inline-block; }
+
+/* 消息详情 */
+.modal-card.wide { width: 640px; }
+.mm-meta { font-size: 11.5px; color: var(--text-3); margin: -6px 0 10px; }
+.mm-note {
+  font-size: 12px; margin-bottom: 10px; padding: 6px 9px; border-radius: 6px;
+  background: var(--amber-soft); color: var(--amber);
+}
+.mm-body {
+  max-height: 60vh; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+  font-size: 12.5px; padding: 10px 2px; margin-bottom: 12px;
+  border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+}
+.mm-body:empty::before { content: "（没有正文）"; color: var(--text-3); }
+.mm-body code { font-family: var(--mono); font-size: 11.5px; background: var(--panel-2); padding: 0 3px; border-radius: 3px; }
 
 .toast {
   position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);

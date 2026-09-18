@@ -6,10 +6,12 @@ import argparse
 import asyncio
 import errno
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from simpleagent.agent.session import SESSION_DIRNAME, Session, SessionStore
 from simpleagent.config import ConfigError, home_dir, init_config, load_config
+from simpleagent.panel.store import LEVELS
 
 # --resume 不给值时的哨兵：argparse 用 const 填进来，好区分「没传」和「传了但没给 id」
 LATEST = "__latest__"
@@ -17,6 +19,14 @@ LATEST = "__latest__"
 
 class CliError(Exception):
     """命令行用法层面的错误：打印一句人话就退出，不像 ConfigError 那样带配置前缀。"""
+
+
+def package_version() -> str:
+    """装好的包的版本号（来自 pyproject.toml）；直接从源码跑、没装过包时返回 unknown。"""
+    try:
+        return version("simpleagent")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 def session_store() -> SessionStore:
@@ -41,6 +51,26 @@ def resolve_resume(store: SessionStore, value: str | None) -> Session | None:
     return session
 
 
+def inbox_push(title: str, body: str | None, level: str, source: str) -> int:
+    """往控制面板投一条消息。直接追加 inbox.jsonl，不需要 sa serve 在跑。
+
+    正文三种给法：`-b 文本`；`-b -` 强制读 stdin；不给 `-b` 而 stdin 是管道时自动读，
+    所以例行任务可以直接 `pytest 2>&1 | sa inbox push -t 夜间测试`。
+    """
+    from simpleagent.panel.store import PanelStore
+
+    title = title.strip()
+    if not title:
+        raise CliError("标题不能为空：sa inbox push -t <标题>")
+    if body == "-" or (body is None and not sys.stdin.isatty()):
+        body = sys.stdin.read()
+    item = PanelStore().add_message(
+        source=source.strip() or "cli", title=title, body=(body or "").rstrip(), level=level
+    )
+    print(item.id)
+    return 0
+
+
 def list_sessions(store: SessionStore, limit: int) -> int:
     rows = store.list(limit=limit)
     if not rows:
@@ -59,6 +89,9 @@ def list_sessions(store: SessionStore, limit: int) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sa", description="SimpleAgent：自用、可学习的本地 agent")
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"simpleagent {package_version()}"
+    )
     parser.add_argument("-m", "--profile", help="模型 profile，默认取配置里的 default_profile")
     parser.add_argument(
         "--resume",
@@ -94,6 +127,20 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("-m", "--profile", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     sessions = commands.add_parser("sessions", help="列出已保存的会话")
     sessions.add_argument("--limit", type=int, default=20, help="最多显示几条，默认 20")
+    inbox = commands.add_parser("inbox", help="控制面板的消息：脚本 / 例行任务往这里投结论")
+    inbox_commands = inbox.add_subparsers(dest="inbox_command", metavar="<action>", required=True)
+    push = inbox_commands.add_parser("push", help="投递一条消息（不需要 sa serve 在跑）")
+    push.add_argument("-t", "--title", required=True, help="标题，面板列表里显示的那一行")
+    push.add_argument(
+        "-b",
+        "--body",
+        default=None,
+        help="正文；不给时若有管道输入就从 stdin 读，- 表示强制读 stdin",
+    )
+    push.add_argument("--level", choices=LEVELS, default="info", help="级别，默认 info")
+    push.add_argument(
+        "--source", default="cli", help="来源，面板上显示成小标签（如 schedule），默认 cli"
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -126,6 +173,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "sessions":
             return list_sessions(session_store(), args.limit)
+        if args.command == "inbox":
+            return inbox_push(args.title, args.body, args.level, args.source)
         if args.command == "run":
             from simpleagent.ui.headless import Headless
 
