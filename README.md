@@ -1,19 +1,26 @@
 # SimpleAgent
 
-最开始的想法是做一个自用的 agent，方便了解一些 agent 的功能；慢慢的到后面就像做一个个人工作台。
+自用的本地 agent，两个目的：一是**在本地解决真实问题**，二是**搞清楚 agent 是怎么实现的**——
+agent loop、工具调用、权限、上下文都从零手写，只依赖 OpenAI 兼容协议，不套任何 agent 框架。
 
-我目前使用 AI 主要的方式 1、基于目录，在目录下启动某个对应的客户端 如 claude 或 opencode，我尽量让自己的项目不依赖任何一个 agent；我会有投资，，健康管理，旅游等一些目录 ；2、随时进行 chat 这个不限于哪个 AI 以网页的形式。
+长期方向是个人 AI 工作台：我平时用 AI 有两条路，一是按目录启动 Claude Code 或 OpenCode
+（投资、健康、旅游各一个目录，尽量不让项目绑死在某一家 agent 上），二是随手在网页上聊。
+所以这个项目要做的，是把那些散在各目录里的 AI 任务管起来：派任务、看状态、收例行任务的结果。
 
-所以目前这个项目的目标：
-1、个人的 AI工作台，能够管理那些目录下运行的 AI 任务，可以分配任务，了解任务状态，可以获取例行任务的结果。
-2、学习各种 agent 的技术实现。
+当前版本 **0.1**，能力见下面的「能做什么」，路线图见 [ROADMAP](docs/ROADMAP.md)。
 
+## 能做什么
 
-## 文档
-
-- [架构设计](docs/ARCHITECTURE.md)：选型、设计原则、模块划分
-- [路线图](docs/ROADMAP.md)：M0–M9 里程碑与当前进度
-- [学习笔记](docs/notes/)：每个里程碑学到的东西和踩过的坑
+- **终端里聊**：`sa` 进 REPL，流式输出，可切模型、看用量、存会话、随时 Ctrl+C 打断。
+- **让模型动手**：内置 7 个工具（`list_dir` `read_file` `write_file` `edit_file` `glob` `grep` `bash`），
+  读类工具并行跑、写类工具串行跑，工具报错原样回给模型让它自己纠正。
+- **有边界的权限**：读操作直接放行，写文件和跑命令要你按键确认；越出工作目录和明显危险的命令直接拒绝。
+- **无人值守**：`sa run "..."` 跑完就退出，配合 cron / launchd 用；没人确认时写操作一律拒绝，除非 `--allow` 明确放行。
+- **浏览器工作台**：`sa serve` 起本地服务，用浏览器管理「空间」（一类任务一个目录），
+  看流式对话、工具卡、审批卡，跑验证命令，控制面板汇总跨空间的任务、消息和待办。
+- **调度外部 agent**：空间的执行者可以选 Claude Code 或 OpenCode，它们以无头模式跑，
+  输出被翻译成同一套事件，界面上和内置 loop 长得一样。
+- **给 sa 发消息**：脚本和定时任务可以用 `sa inbox push` 把结论投进控制面板。
 
 ## 安装
 
@@ -33,46 +40,137 @@ sa --version                     # 确认装好了
 平时 `~/.local/bin` 排在 PATH 前面没问题；但 launchd、cron 这类 PATH 很短的环境会找到系统那个，
 这时写绝对路径 `~/.local/bin/sa`，或者用 `simple_agent`。
 
-不想装也可以：在仓库目录下 `uv sync` 后用 `uv run sa` 代替下面的 `sa`。
+不想装也可以：在仓库目录下 `uv sync` 后用 `uv run sa` 代替下面所有的 `sa`。
 
-## 快速开始
+## 第一次使用
 
 ```bash
-sa init                          # 生成 ~/.simpleagent/config.toml
-echo 'DEEPSEEK_API_KEY=sk-...' >> ~/.simpleagent/.env && chmod 600 ~/.simpleagent/.env
-                                 # 默认 profile 是 deepseek；也可以直接 export 环境变量
-sa                               # 进入对话
-sa -m local                      # 指定 profile，比如本地 Ollama
-sa sessions                      # 列出已保存的会话
-sa --resume                      # 接着最近一次继续聊
-sa run "整理 downloads"           # headless：跑一个任务就退出，不交互
-sa run "..." --allow write_file,edit_file   # 放行指定的写工具
-sa serve                         # 启动本地 API（HTTP + SSE），供桌面客户端连接
-uv run pytest 2>&1 | sa inbox push -t "夜间测试" --level warn
-                                 # 往控制面板投一条消息（正文可走管道），不需要 serve 在跑
+sa init                                              # 生成 ~/.simpleagent/config.toml
+echo 'DEEPSEEK_API_KEY=sk-...' >> ~/.simpleagent/.env # 或者直接 export，二选一
+chmod 600 ~/.simpleagent/.env
+sa                                                   # 进入对话，Ctrl+D 或 /exit 退出
 ```
 
-REPL 命令：`/model [name]` 切换模型、`/tools` 列出可用工具、`/clear` 清空历史、`/usage` 查看用量、`/help`、`/exit`。
-模型可以自己调用工具（`list_dir`、`read_file`、`write_file`、`edit_file`、`glob`、`grep`、`bash`），终端里灰色显示调用和结果预览；
-一轮对话最多请求模型 `max_steps` 次（默认 20）；过长的工具输出只把开头回给模型，完整内容存在 `~/.simpleagent/tool_outputs/`。
-每次请求的完整请求体和响应都记录在 `~/.simpleagent/traces/` 下，会话历史写在 `~/.simpleagent/sessions/`（退出 REPL 不清空）。
+默认用 `deepseek` 这个 profile。配置文件里还预置了 GLM、通义千问、本地 Ollama 等，
+换模型改 `default_profile`，或者启动时 `sa -m glm`。key 只写环境变量名，不会存进配置文件。
+
+## 三种用法
+
+### 1. 终端对话
+
+```bash
+sa                       # 新开一轮
+sa -m local              # 指定 profile，比如本地 Ollama
+sa --resume              # 接着最近一次继续聊
+sa --resume se_x1y2      # 接着指定会话
+sa sessions              # 列出已保存的会话
+```
+
+REPL 里的命令：`/model [name]` 切模型、`/tools` 列工具、`/usage` 看用量、`/clear` 清空历史、`/help`、`/exit`。
+要输入多行，单独一行敲 `"""` 开始，再敲一次 `"""` 结束；Ctrl+C 中断当前回复，Ctrl+D 退出。
+
+模型自己决定调哪个工具，终端里用灰色显示调用和结果预览。一轮对话最多请求模型 `max_steps` 次（默认 20），
+防止它绕圈子。过长的工具输出只把开头回给模型，完整内容存在 `~/.simpleagent/tool_outputs/`（保留 7 天）。
+
+### 2. 浏览器工作台
+
+```bash
+sa serve                 # 默认 127.0.0.1:8384，只监听本机
+sa serve --port 9000     # 端口被占用时换一个
+```
+
+然后浏览器打开 <http://127.0.0.1:8384/>。界面分两栏，左边是空间列表和控制面板，右边是当前会话。
+
+- **空间**：一类任务的容器。「通用」空间自动分配一个 tmp 目录，随手算点东西用；
+  「绑定目录」空间指向真实项目目录，进那个目录干活。每个空间只显示最近 5 个会话，其余收进「查看全部」。
+- **执行者**：新建空间时选 `simpleagent`（内置 loop）、`claude-code` 或 `opencode`。
+  选外部 CLI 时要先在本机装好并登录，权限档有「只读」（默认）和「全放行」两档——
+  它们的无头模式没法把审批实时问回来，所以只能事先定档，全放行的空间界面上会标红。
+- **右栏四个 tab**：对话、变更（这轮改了哪些文件）、文件（工作目录树）、日志（trace 和错误）。
+  头部可以停止、重跑、导出 Markdown、手动跑验证。
+- **验证状态**：空间可以配一条验证命令（比如 `uv run pytest -q`），跑完自动执行，用退出码判定。
+  验证通过之后如果又有文件被改动，状态会降级成「已失效」，不会骗人。
+- **控制面板**：跨空间看正在跑和刚跑完的任务，直接 `@空间名 任务描述` 下发任务；
+  收脚本投来的消息；记待办。
+
+### 3. 无人值守
+
+```bash
+sa run "整理 ~/Downloads，把截图归到 Screenshots 子目录"
+sa run "跑一遍测试并总结失败原因" --allow bash
+sa run "..." --cwd ~/projects/foo --allow write_file,edit_file
+```
+
+跑完就退出，适合放进 cron / launchd。没有人在终端前面，所以需要确认的写操作一律按拒绝处理，
+要放行就用 `--allow` 逐个列出工具名。
+
+脚本和定时任务也可以反过来给 sa 发消息，投进控制面板：
+
+```bash
+sa inbox push -t "备份完成" -b "NAS 增量备份 12.3 GB"
+uv run pytest 2>&1 | sa inbox push -t "夜间测试" --level warn --source schedule
+```
+
+不需要 `sa serve` 在跑。详见 [给 sa 发消息](docs/send-message.md)。
 
 ## 权限
 
-读操作（查看目录、读文件、搜索）直接执行；写文件、改文件、跑命令会在终端问一句：
-`y` 允许、`a` 本次会话都允许、其他键拒绝。以下情况连问都不问，直接拒绝并把原因告诉模型：
+读操作（看目录、读文件、搜索）直接执行；写文件、改文件、跑命令会在终端问一句：
+`y` 允许、`a` 本次会话都允许、其他键拒绝。以下两种情况连问都不问，直接拒绝并把原因告诉模型：
 
 - 目标路径在工作目录之外（`../secret.txt`、`/etc/hosts`）
 - 必然造成不可恢复损失的命令（`rm -rf ~`、`rm -rf /usr`、`mkfs`、`curl … | sh`、fork bomb 等）
 
-理由会回给模型，它通常能自己换成别的办法。`sa run` 是无人值守模式，没人可以按 y——
-写操作一律按拒绝处理，也可以用 `--allow bash,write_file` 显式放行。
+拒绝理由会回给模型，它通常能自己换个办法。工作台里这个确认变成一张审批卡，
+选「允许」「拒绝」或「本次会话始终允许」。
+
+API key 只从环境变量或 `~/.simpleagent/.env` 读，不写进配置文件，也不会出现在 trace 里；
+`bash` 工具启动子进程时会把这些 key 从环境变量里摘掉，免得模型 `env` 一下就看到了。
+
+## 配置和数据
+
+配置在 `~/.simpleagent/config.toml`（`sa init` 生成，里面每项都有注释）：
+
+| 配置项 | 作用 |
+|---|---|
+| `default_profile` | 默认用哪个模型 profile |
+| `show_reasoning` | 是否显示思考内容 |
+| `max_steps` | 一轮对话最多请求模型几次，默认 20 |
+| `system_prompt` | 覆盖默认的 system prompt |
+| `[trace]` | 是否把每次请求响应落盘，调试协议时用 |
+| `[tool_output]` | 工具结果回给模型的字符和行数上限 |
+| `[panel]` | 控制面板的消息多久自动归档 |
+| `[profiles.*]` | 各家模型：`base_url`、`api_key_env`、`model`、`context_window`，以及各家私有参数 |
+
+数据都在 `~/.simpleagent/` 下（可以用环境变量 `SIMPLEAGENT_HOME` 换个位置）：
+
+```
+~/.simpleagent/
+  config.toml          配置
+  .env                 API key（建议 chmod 600）
+  sessions/            终端会话历史（JSONL）
+  spaces/              工作台的空间和它们的会话
+  panel/               控制面板的消息和待办
+  tool_outputs/        被截断的完整工具输出，保留 7 天
+  traces/              每次请求和响应的原始记录
+```
+
+## 文档
+
+- [架构设计](docs/ARCHITECTURE.md)：选型、设计原则、模块划分
+- [路线图](docs/ROADMAP.md)：M0–M9 里程碑与当前进度
+- [发布日志](docs/releases/)：每个版本的变化
+- [变更记录](docs/changelog/)：每次推送的细节
+- [学习笔记](docs/notes/)：每个里程碑学到的东西和踩过的坑
+- [给 sa 发消息](docs/send-message.md)：脚本、定时任务、别的 agent 往控制面板投消息（CLI / HTTP）
 
 ## 开发
 
 ```bash
-uv run pytest        # 测试（不联网）
+uv sync              # 安装依赖
+uv run pytest        # 测试（不联网，用 FakeLLM）
 uv run ruff check    # lint
 uv run ruff format   # 格式化
 ```
 
+协作约定（包括用 AI 改这个仓库时的规矩）见 [AGENTS.md](AGENTS.md)。
