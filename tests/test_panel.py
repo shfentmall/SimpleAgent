@@ -5,12 +5,16 @@
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import threading
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta
 
-from simpleagent.panel.store import PanelStore
+from simpleagent.cli import main
+from simpleagent.panel.store import MAX_BODY_CHARS, PREVIEW_CHARS, PanelStore
 from simpleagent.panel.summary import one_line, summarize
 from simpleagent.serve.app import make_server
 from simpleagent.spaces.models import SpaceSpec
@@ -60,12 +64,157 @@ def test_inbox_append_and_read(sa_home):
 
 
 def test_inbox_is_append_only(sa_home):
-    """已读状态不能靠改 jsonl 实现——这里确认它确实存在单独的 read.json。"""
+    """已读状态不能靠改 jsonl 实现——这里确认它确实存在单独的 state.json。"""
     panel = PanelStore(sa_home)
     panel.add_message(source="system", title="x")
+    before = (sa_home / "panel" / "inbox.jsonl").read_bytes()
     panel.mark_read("*")
-    assert (sa_home / "panel" / "read.json").exists()
-    assert (sa_home / "panel" / "inbox.jsonl").exists()
+    assert (sa_home / "panel" / "state.json").exists()
+    assert (sa_home / "panel" / "inbox.jsonl").read_bytes() == before
+
+
+class Clock:
+    """可以拨的表：测试「30 分钟后归档」不用真的等。"""
+
+    def __init__(self) -> None:
+        self.now = datetime(2026, 9, 18, 10, 0).astimezone()
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def tick(self, **kw) -> None:
+        self.now += timedelta(**kw)
+
+
+def _titles(panel: PanelStore, view: str = "active") -> list[str]:
+    return [m["title"] for m in panel.list_messages(view=view)]
+
+
+def test_inbox_archives_30_minutes_after_read(sa_home):
+    clock = Clock()
+    panel = PanelStore(sa_home, clock=clock)
+    a = panel.add_message(source="system", title="点过的")
+    panel.add_message(source="cli", title="没点的")
+
+    panel.mark_read(a.id)
+    clock.tick(minutes=5)
+    assert panel.mark_read(a.id) is False  # 再点一次不重置倒计时
+    item = panel.list_messages()[1]
+    assert item["read"] is True
+    assert item["archive_at"].startswith("2026-09-18T10:30")
+
+    clock.tick(minutes=24)  # 读后 29 分钟：还在
+    assert _titles(panel) == ["没点的", "点过的"]
+    clock.tick(minutes=1)  # 读后 30 分钟：进归档
+    assert _titles(panel) == ["没点的"]
+    assert _titles(panel, "archived") == ["点过的"]
+    assert panel.list_messages(view="archived")[0]["archived"] is True
+
+    clock.tick(days=7)  # 没点开过的永远不自动归档
+    assert _titles(panel) == ["没点的"]
+    assert panel.counts() == {"unread": 1, "active": 1, "archived": 1}
+
+
+def test_inbox_archive_after_is_configurable(sa_home):
+    clock = Clock()
+    panel = PanelStore(sa_home, archive_after_minutes=1, clock=clock)
+    a = panel.add_message(source="system", title="x")
+    panel.mark_read(a.id)
+    clock.tick(seconds=61)
+    assert _titles(panel, "archived") == ["x"]
+
+
+def test_inbox_mark_all_read_starts_timer(sa_home):
+    clock = Clock()
+    panel = PanelStore(sa_home, clock=clock)
+    panel.add_message(source="system", title="一")
+    panel.add_message(source="system", title="二")
+    assert panel.mark_read("all") is True
+    assert panel.unread_count() == 0
+    clock.tick(minutes=30)
+    # 同一时刻归档的，保持新消息在前
+    assert _titles(panel, "archived") == ["二", "一"]
+    assert _titles(panel) == []
+
+
+def test_inbox_manual_archive(sa_home):
+    clock = Clock()
+    panel = PanelStore(sa_home, clock=clock)
+    old = panel.add_message(source="system", title="早的")
+    new = panel.add_message(source="system", title="晚的")
+    assert panel.unread_count() == 2
+
+    archived = panel.archive(new.id)  # 没点开过也能直接归档，并且算已读
+    assert archived["archived"] is True and archived["read"] is True
+    assert panel.unread_count() == 1
+    assert _titles(panel) == ["早的"]
+
+    clock.tick(minutes=1)
+    panel.archive(old.id)
+    assert _titles(panel, "archived") == ["早的", "晚的"]  # 刚归档的在最上面
+
+    first = panel.list_messages(view="archived")[1]["archive_at"]
+    clock.tick(minutes=1)
+    panel.archive(new.id)  # 已经在归档里的不动，归档时间不变
+    assert panel.list_messages(view="archived")[1]["archive_at"] == first
+    assert panel.archive("ms_nope") is None
+
+
+def test_inbox_preview_detail_and_action(sa_home):
+    panel = PanelStore(sa_home)
+    long = "第一行\n" + "字" * 500
+    text = panel.add_message(source="cli", title="报告", body=long)
+    sess = panel.add_message(
+        source="system", title="完成", ref={"space_id": "sp1", "session_id": "se1"}
+    )
+    panel.add_message(source="system", title="只有 session", ref={"session_id": "se1"})
+
+    items = {m["title"]: m for m in panel.list_messages()}
+    assert "body" not in items["报告"]  # 列表只带预览
+    assert "\n" not in items["报告"]["preview"]
+    assert len(items["报告"]["preview"]) == PREVIEW_CHARS + 1  # 截断 + 省略号
+    assert items["报告"]["action"] == "text"
+    assert items["完成"]["action"] == "session"
+    assert items["只有 session"]["action"] == "text"  # 缺 space_id 跳不过去
+
+    detail = panel.get_message(text.id)
+    assert detail["body"] == long
+    assert panel.get_message(sess.id)["ref"]["session_id"] == "se1"
+    assert panel.get_message("ms_nope") is None
+
+
+def test_inbox_clips_long_body_and_bad_level(sa_home):
+    panel = PanelStore(sa_home)
+    item = panel.add_message(source="cli", title="大", body="x" * (MAX_BODY_CHARS + 10), level="??")
+    body = panel.get_message(item.id)["body"]
+    assert body.startswith("x" * MAX_BODY_CHARS)
+    assert f"原文 {MAX_BODY_CHARS + 10} 字" in body
+    assert item.level == "info"
+
+
+def test_inbox_skips_half_written_line(sa_home):
+    """另一个进程写到一半时读到半行：跳过，不能把整个列表读崩。"""
+    panel = PanelStore(sa_home)
+    panel.add_message(source="system", title="完整的")
+    with (sa_home / "panel" / "inbox.jsonl").open("a", encoding="utf-8") as f:
+        f.write('{"id": "ms_half", "title": "写到一')
+    assert _titles(panel) == ["完整的"]
+    assert panel.counts()["unread"] == 1
+
+
+def test_inbox_migrates_legacy_read_json(sa_home):
+    """W5 的 read.json（只有 id 列表）升级后当作「很早以前读过」，直接进归档。"""
+    panel = PanelStore(sa_home)
+    a = panel.add_message(source="system", title="旧的已读")
+    panel.add_message(source="system", title="旧的未读")
+    legacy = sa_home / "panel" / "read.json"
+    legacy.write_text(json.dumps([a.id]), encoding="utf-8")
+    two_hours_ago = datetime.now().timestamp() - 7200
+    os.utime(legacy, (two_hours_ago, two_hours_ago))
+
+    assert _titles(panel) == ["旧的未读"]
+    assert _titles(panel, "archived") == ["旧的已读"]
+    assert (sa_home / "panel" / "state.json").exists()
 
 
 # --------------------------------------------------------------- 2. todos
@@ -168,8 +317,24 @@ def test_panel_api(config, sa_home):
     assert _get_json(f"{base}/api/inbox")[0]["title"] == "手动一条"
     assert _get_json(f"{base}/api/inbox?unread=1")[0]["read"] is False
 
-    _req("POST", f"{base}/api/inbox/{msg['id']}/read", {})
+    read = _req("POST", f"{base}/api/inbox/{msg['id']}/read", {})
+    assert read["changed"] is True
+    assert read["item"]["read"] is True and read["item"]["archive_at"]  # 倒计时马上可见
+    assert "body" not in read["item"]
     assert not _get_json(f"{base}/api/inbox?unread=1")
+
+    # 详情带全文，列表只有 preview
+    assert "body" not in _get_json(f"{base}/api/inbox")[0]
+    detail = _get_json(f"{base}/api/inbox/{msg['id']}")
+    assert detail["body"] == "b" and detail["action"] == "text"
+
+    # 手动归档 → 从当前移到归档；count 跟着变
+    assert _get_json(f"{base}/api/inbox/count") == {"unread": 0, "active": 1, "archived": 0}
+    archived = _req("POST", f"{base}/api/inbox/{msg['id']}/archive", {})
+    assert archived["archived"] is True
+    assert _get_json(f"{base}/api/inbox") == []
+    assert _get_json(f"{base}/api/inbox?view=archived")[0]["id"] == msg["id"]
+    assert _get_json(f"{base}/api/inbox/count") == {"unread": 0, "active": 0, "archived": 1}
 
     todo = _req(
         "POST",
@@ -186,13 +351,58 @@ def test_panel_api(config, sa_home):
 
 def test_panel_api_bad_input(config, sa_home):
     base = _serve(config)
-    for url, data in [
-        (f"{base}/api/inbox", {"body": "没标题"}),
-        (f"{base}/api/todos", {"text": "  "}),
+    for method, url, data, code in [
+        ("POST", f"{base}/api/inbox", {"body": "没标题"}, 400),
+        ("POST", f"{base}/api/todos", {"text": "  "}, 400),
+        ("GET", f"{base}/api/inbox?view=trash", None, 400),
+        ("GET", f"{base}/api/inbox/ms_nope", None, 404),
+        ("POST", f"{base}/api/inbox/ms_nope/read", {}, 404),
+        ("POST", f"{base}/api/inbox/ms_nope/archive", {}, 404),
     ]:
         try:
-            _req("POST", url, data)
+            _req(method, url, data)
         except urllib.error.HTTPError as e:
-            assert e.code == 400
+            assert e.code == code, url
         else:
-            raise AssertionError("应当 400")
+            raise AssertionError(f"{url} 应当 {code}")
+
+
+# --------------------------------------------------------------- 5. sa inbox push
+def test_cli_inbox_push_with_body(sa_home, capsys):
+    code = main(["inbox", "push", "-t", "日报", "-b", "今天没事", "--level", "success"])
+    assert code == 0
+    item_id = capsys.readouterr().out.strip()
+    msg = PanelStore(sa_home).get_message(item_id)
+    assert (msg["title"], msg["body"], msg["level"], msg["source"]) == (
+        "日报",
+        "今天没事",
+        "success",
+        "cli",
+    )
+
+
+def test_cli_inbox_push_reads_stdin(sa_home, monkeypatch, capsys):
+    """管道进来的输出当正文：例行任务直接 `xxx | sa inbox push -t 标题`。"""
+    monkeypatch.setattr("sys.stdin", io.StringIO("3 passed\n1 failed\n"))
+    assert main(["inbox", "push", "-t", "夜间测试", "--source", "schedule"]) == 0
+    msg = PanelStore(sa_home).list_messages()[0]
+    assert msg["source"] == "schedule"
+    assert PanelStore(sa_home).get_message(msg["id"])["body"] == "3 passed\n1 failed"
+
+
+def test_cli_inbox_push_tty_has_no_body(sa_home, monkeypatch, capsys):
+    """终端里直接敲、没有管道：不能卡在等 stdin 上。"""
+
+    class Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setattr("sys.stdin", Tty("不该被读到"))
+    assert main(["inbox", "push", "-t", "只有标题"]) == 0
+    msg = PanelStore(sa_home).list_messages()[0]
+    assert msg["preview"] == ""
+
+
+def test_cli_inbox_push_rejects_blank_title(sa_home, capsys):
+    assert main(["inbox", "push", "-t", "  ", "-b", "x"]) == 1
+    assert "标题不能为空" in capsys.readouterr().err

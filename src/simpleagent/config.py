@@ -133,6 +133,15 @@ class ToolOutputConfig(BaseModel):
 TOOL_OUTPUT_DIRNAME = "tool_outputs"
 
 
+class PanelConfig(BaseModel):
+    """控制面板。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 消息点开后多久移进归档；没点开过的不会自动归档
+    archive_after_minutes: int = Field(30, ge=1)
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -144,6 +153,7 @@ class Config(BaseModel):
     max_steps: int = Field(20, ge=1)
     tool_output: ToolOutputConfig = Field(default_factory=ToolOutputConfig)
     trace: TraceConfig = Field(default_factory=TraceConfig)
+    panel: PanelConfig = Field(default_factory=PanelConfig)
 
     @model_validator(mode="after")
     def _check_default_profile(self) -> Config:

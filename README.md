@@ -26,6 +26,8 @@ uv run sa --resume               # 接着最近一次继续聊
 uv run sa run "整理 downloads"    # headless：跑一个任务就退出，不交互
 uv run sa run "..." --allow write_file,edit_file   # 放行指定的写工具
 uv run sa serve                  # 启动本地 API（HTTP + SSE），供桌面客户端连接
+uv run pytest 2>&1 | uv run sa inbox push -t "夜间测试" --level warn
+                                 # 往控制面板投一条消息（正文可走管道），不需要 serve 在跑
 ```
 
 REPL 命令：`/model [name]` 切换模型、`/tools` 列出可用工具、`/clear` 清空历史、`/usage` 查看用量、`/help`、`/exit`。
