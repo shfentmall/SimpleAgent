@@ -78,7 +78,9 @@ function escapeHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-/* 极简 Markdown：先转义再处理，避免注入。只支持代码块、行内代码、段落。 */
+/* 极简 Markdown：先转义再处理，避免注入。只支持代码块、行内代码、段落。
+   控制面板的消息弹层在用：那里是失败原因、stderr 这类文本，以 # 开头的行不该变成标题。
+   对话里模型的回复走 markdown.js 的 renderMarkdown。 */
 function renderText(raw) {
   let s = escapeHtml(raw);
   s = s.replace(/```[\w]*\n([\s\S]*?)```/g, (_, code) => `<pre class="code">${code.replace(/\n$/, "")}</pre>`);
@@ -363,14 +365,27 @@ function ensureAssistantBubble() {
   $("empty-state")?.remove();
   const el = document.createElement("div");
   el.className = "msg assistant";
-  el.innerHTML = `<div class="avatar">AI</div><div class="body"><div class="who">助手</div><div class="text"></div></div>`;
+  el.innerHTML = `<div class="avatar">AI</div><div class="body"><div class="who">助手</div><div class="text md"></div></div>`;
   box.appendChild(el);
   state.accEl = el.querySelector(".text");
   state.streamEl = el;
   return state.accEl;
 }
 
+/* 流式光标放进最后一个块的末尾（段落、列表项、代码块里），不要另起一行。
+   链接、换行、分隔线这类元素里面放不了，停在它们外面 */
+const CURSOR_STOP = new Set(["A", "BR", "HR", "INPUT"]);
+
+function placeCursor(el) {
+  let host = el;
+  while (host.lastChild && host.lastChild.nodeType === Node.ELEMENT_NODE
+    && !CURSOR_STOP.has(host.lastChild.tagName)) host = host.lastChild;
+  host.insertAdjacentHTML("beforeend", '<span class="cursor">&nbsp;</span>');
+}
+
+/* 收尾时按完整文本再渲染一遍去掉光标：外部 CLI 执行者不一定先发 message_done 再发工具调用 */
 function finishAssistantBubble() {
+  if (state.accEl) state.accEl.innerHTML = renderMarkdown(state.acc);
   state.acc = "";
   state.accEl = null;
   state.streamEl = null;
@@ -459,7 +474,7 @@ function renderHistory(messages) {
         const el = document.createElement("div");
         el.className = "msg assistant";
         el.innerHTML = `<div class="avatar">AI</div><div class="body"><div class="who">助手</div>
-          <div class="text">${renderText(m.content)}</div></div>`;
+          <div class="text md">${renderMarkdown(m.content)}</div></div>`;
         box.appendChild(el);
       }
       for (const tc of m.tool_calls || []) {
@@ -512,7 +527,8 @@ async function onFrame(type, frame) {
   if (type === "text_delta") {
     state.acc += p.text || "";
     const el = ensureAssistantBubble();
-    el.innerHTML = renderText(state.acc) + '<span class="cursor">&nbsp;</span>';
+    el.innerHTML = renderMarkdown(state.acc);
+    placeCursor(el);
     scrollDown();
   } else if (type === "reasoning_delta") {
     let d = state.streamEl && state.streamEl.querySelector("details.reasoning");
@@ -539,7 +555,6 @@ async function onFrame(type, frame) {
     }
     scrollDown();
   } else if (type === "message_done") {
-    if (state.accEl) state.accEl.innerHTML = renderText(state.acc);
     finishAssistantBubble();
     if (p.usage) updateUsage(p.usage);
     await refreshSessions();
