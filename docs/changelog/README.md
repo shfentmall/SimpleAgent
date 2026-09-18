@@ -50,6 +50,7 @@
 
 ## 索引
 
+- [2026-09-18 README 按「怎么用 sa」重写，补 v0.1.0 发布日志](2026-09-18-readme-rewrite-v0.1.0-release.md)
 - [2026-09-18 任务终态分流：只有失败进消息，完成/取消只在指挥台显示；指挥台刷新后从后台恢复](2026-09-18-task-final-status-routing.md)
 - [2026-09-18 sa 支持装成全局命令（uv tool install），补 --version 和撞名兜底](2026-09-18-global-cli-install.md)
 - [2026-09-18 控制面板消息升级为中控：详情弹层、自动归档、`sa inbox push` 外部投递](2026-09-18-panel-inbox-detail-archive-push.md)
