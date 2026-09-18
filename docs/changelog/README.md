@@ -50,6 +50,7 @@
 
 ## 索引
 
+- [2026-09-19 空间会话里模型回复改为 Markdown 渲染（标题/列表/表格/引用/链接，零依赖手写，图片不加载）](2026-09-19-space-session-markdown-render.md)
 - [2026-09-18 README 按「怎么用 sa」重写，补 v0.1.0 发布日志](2026-09-18-readme-rewrite-v0.1.0-release.md)
 - [2026-09-18 任务终态分流：只有失败进消息，完成/取消只在指挥台显示；指挥台刷新后从后台恢复](2026-09-18-task-final-status-routing.md)
 - [2026-09-18 sa 支持装成全局命令（uv tool install），补 --version 和撞名兜底](2026-09-18-global-cli-install.md)
