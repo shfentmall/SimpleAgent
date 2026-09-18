@@ -4,7 +4,9 @@ from collections.abc import Iterable
 
 import httpx2
 import openai
+import pytest
 
+from simpleagent.agent.session import SessionStore
 from simpleagent.config import Config, ConfigError, Profile
 from simpleagent.llm.fake import FakeLLM, Script
 from simpleagent.ui.repl import Repl
@@ -243,3 +245,17 @@ async def test_repl_hides_api_key_env_from_tools(config: Config):
     config.profiles["b"].api_key_env = "SA_TEST_KEY_B"
     h = Harness(config, {})
     assert h.repl.agent.hidden_env == frozenset({"SA_TEST_KEY_A", "SA_TEST_KEY_B"})
+
+
+def test_startup_failure_leaves_no_empty_session(config: Config, sa_home):
+    # 缺 API key 时创建模型客户端就会抛错：这时不能已经往 sessions/ 里写了一条空会话
+    def broken(name: str, profile: Profile) -> FakeLLM:
+        raise ConfigError("找不到 SA_TEST_KEY")
+
+    store = SessionStore(sa_home / "sessions")
+    with pytest.raises(ConfigError):
+        Repl(config, llm_factory=broken, out=io.StringIO(), store=store)
+    assert store.list() == []
+
+    Repl(config, llm_factory=lambda n, p: FakeLLM([], name=n, profile=p), store=store)
+    assert len(store.list()) == 1

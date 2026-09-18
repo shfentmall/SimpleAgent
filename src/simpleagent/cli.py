@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import errno
 import sys
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from simpleagent.agent.session import SESSION_DIRNAME, Session, SessionStore
@@ -18,6 +19,14 @@ LATEST = "__latest__"
 
 class CliError(Exception):
     """命令行用法层面的错误：打印一句人话就退出，不像 ConfigError 那样带配置前缀。"""
+
+
+def package_version() -> str:
+    """装好的包的版本号（来自 pyproject.toml）；直接从源码跑、没装过包时返回 unknown。"""
+    try:
+        return version("simpleagent")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 def session_store() -> SessionStore:
@@ -80,6 +89,9 @@ def list_sessions(store: SessionStore, limit: int) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sa", description="SimpleAgent：自用、可学习的本地 agent")
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"simpleagent {package_version()}"
+    )
     parser.add_argument("-m", "--profile", help="模型 profile，默认取配置里的 default_profile")
     parser.add_argument(
         "--resume",
