@@ -32,7 +32,6 @@ from simpleagent.agents import adapter_for
 from simpleagent.config import TOOL_OUTPUT_DIRNAME, Config, home_dir
 from simpleagent.events import Event, MessageDone, ToolResult
 from simpleagent.panel.store import PanelStore
-from simpleagent.panel.summary import one_line, summarize
 from simpleagent.permissions import Policy
 from simpleagent.serve.approval import APIApprover, ApprovalDecision, PendingApprovals
 from simpleagent.serve.bus import EventBus
@@ -49,6 +48,15 @@ from simpleagent.tools import ToolRegistry, builtin_tools
 
 # (profile_name, Profile) -> LLM 实例；测试时注入 FakeLLM
 LLMFactory = Callable[[str, Any], Any]
+
+# 终态 → (消息级别, 标题用词)。只有 INBOX_LEVELS 里的级别才进控制面板的消息，
+# 其余只在指挥台显示当前状态（meta + status 帧已经够它用了）
+FINAL_NOTICE = {
+    "done": ("success", "完成"),
+    "cancelled": ("warn", "已取消"),
+    "error": ("error", "失败"),
+}
+INBOX_LEVELS = frozenset({"error"})
 
 
 def _log_future_error(fut: Any) -> None:
@@ -191,12 +199,10 @@ class Runner:
             # 起不来必须让客户端知道：这一段在原来是在 try 之外，异常会被 asyncio future
             # 吞掉，表现是「发了消息没有任何反应，且永远停在运行中」。典型触发：没配 API key、
             # profile 不存在、cwd 不存在。CancelledError 继承自 BaseException，不会被这里吃掉。
+            # 也走 _finalize：起不来正是最该进消息提醒的失败，不能绕开收口点。
             message = f"启动失败：{type(e).__name__}: {e}"
-            self.store.update_meta(space_id, session_id, status="error")
             self.bus.publish(error_frame(session_id, message))
-            self.bus.publish(
-                status_frame(session_id, "error", {"space_id": space_id, "reason": message})
-            )
+            self._finalize(space_id, session_id, session, "error", reason=message)
             self._agents.pop(session_id, None)
             return
         # 广播一帧 running，面板才知道"开始了"
@@ -206,6 +212,7 @@ class Runner:
         if task is not None:
             self._tasks[session_id] = task
         try:
+            reason: str | None = None
             if space.executor == "simpleagent":
                 agent = self._agents[session_id]
                 async for event in agent.run(session, user_input):
@@ -213,7 +220,7 @@ class Runner:
                 status = "done"
             else:
                 # 外部 CLI 走完全不同的执行路径，但生成的是同一套事件
-                status = await self._run_cli(space, session, user_input)
+                status, reason = await self._run_cli(space, session, user_input)
         except asyncio.CancelledError:
             self._finalize(space_id, session_id, session, "cancelled")
             raise
@@ -222,7 +229,7 @@ class Runner:
             self.bus.publish(error_frame(session_id, message))
             self._finalize(space_id, session_id, session, "error", reason=message)
         else:
-            self._finalize(space_id, session_id, session, status)
+            self._finalize(space_id, session_id, session, status, reason=reason)
         finally:
             self._tasks.pop(session_id, None)
             self._agents.pop(session_id, None)
@@ -268,7 +275,7 @@ class Runner:
         *,
         reason: str | None = None,
     ) -> None:
-        """一轮结束的唯一收口点：落盘终态 + 广播一帧 status + 往控制面板发通知。
+        """一轮结束的唯一收口点：落盘终态 + 广播一帧 status + 失败时往控制面板的消息里落一条。
 
         正常结束时没有 error 帧，客户端和控制面板都要靠这帧把「运行中」切成终态，
         所以三个终态（done / error / cancelled）统一在这里广播。
@@ -279,31 +286,34 @@ class Runner:
         if reason is not None:
             extra["reason"] = reason
         self.bus.publish(status_frame(session_id, status, extra))
-        if status in ("done", "error", "cancelled"):
-            self._notify(space_id, session_id, session, status)
+        if status in FINAL_NOTICE:
+            self._notify(space_id, session_id, status, reason)
 
-    def _notify(self, space_id: str, session_id: str, session: Session, status: str) -> None:
-        """跑完往控制面板的消息里落一条：否则用户只能一直盯着页面才知道结果。"""
+    def _notify(self, space_id: str, session_id: str, status: str, reason: str | None) -> None:
+        """级别够高的终态才往控制面板的消息里落一条：消息只放要你去处理的事。
+
+        完成 / 取消已经随 meta 落盘、随 status 帧广播，指挥台的任务卡自己就能显示当前状态；
+        再各落一条消息只会把左栏角标刷高，真正的失败反而被淹掉。
+        """
+        level, head = FINAL_NOTICE[status]
+        if level not in INBOX_LEVELS:
+            return
         space = self.store.get_space(space_id)
         meta = self.store.get_session_meta(space_id, session_id)
         title = (meta.title if meta else "") or "会话"
         name = space.name if space else space_id
-        if status == "done":
-            level, head, body = "success", "完成", one_line(summarize(session.messages, meta))
-        elif status == "error":
-            level, head, body = "error", "失败", "运行出错，去那个会话的日志 tab 看原因"
-        else:
-            level, head, body = "warn", "已取消", "被手动停止"
         self.panel.add_message(
             source="system",
             title=f"{name} · {head}：{title}",
-            body=body,
+            body=reason or "运行出错，去那个会话的日志 tab 看原因",
             level=level,
             ref={"space_id": space_id, "session_id": session_id},
         )
 
-    async def _run_cli(self, space: Space, session: Session, user_input: str) -> str:
-        """把一次输入交给外部 CLI（claude / opencode），返回这次运行的收口状态。
+    async def _run_cli(
+        self, space: Space, session: Session, user_input: str
+    ) -> tuple[str, str | None]:
+        """把一次输入交给外部 CLI（claude / opencode），返回这次运行的收口状态和失败原因。
 
         和内置 loop 的路径**汇合在同一套事件上**：翻译出来的 TextDelta / ToolCallStart /
         ToolResult / MessageDone 照常走 `_on_event`（先落盘再广播），所以总线、存储、
@@ -339,11 +349,13 @@ class Runner:
                 limit=4 * 1024 * 1024,
             )
         except FileNotFoundError:
-            self.bus.publish(error_frame(session.id, f"找不到可执行文件：{argv[0]}"))
-            return "error"
+            message = f"找不到可执行文件：{argv[0]}"
+            self.bus.publish(error_frame(session.id, message))
+            return "error", message
         except OSError as e:
-            self.bus.publish(error_frame(session.id, f"启动 {argv[0]} 失败：{e}"))
-            return "error"
+            message = f"启动 {argv[0]} 失败：{e}"
+            self.bus.publish(error_frame(session.id, message))
+            return "error", message
 
         self._procs[session.id] = proc
         ok: bool | None = None
@@ -379,7 +391,7 @@ class Runner:
         session.usage = adapter.usage
         if session.id in self._cancelled:
             self._cancelled.discard(session.id)
-            return "cancelled"
+            return "cancelled", None
         if ok is None:
             # 对面没给结束事件（进程被信号打死、崩了）：只能拿退出码兜底
             ok = code == 0
@@ -388,9 +400,10 @@ class Runner:
                 if stderr_tail:
                     error += f"：{stderr_tail}"
         if not ok:
-            self.bus.publish(error_frame(session.id, error or f"{space.executor} 运行失败"))
-            return "error"
-        return "done"
+            message = error or f"{space.executor} 运行失败"
+            self.bus.publish(error_frame(session.id, message))
+            return "error", message
+        return "done", None
 
     @staticmethod
     async def _drain(stream: Any, keep: int = 4000) -> str:
