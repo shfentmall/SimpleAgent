@@ -125,12 +125,17 @@ def test_cli_failure_becomes_an_error_frame(config, sa_home, tmp_path, monkeypat
     errors = [f for f in frames if f.type == "error"]
     assert errors and "Not logged in" in errors[0].payload["message"]
     assert frames[-1].payload["status"] == "error"
+    # 失败原因跟着收口：status 帧带 reason，控制面板的消息正文直接写原因
+    assert "Not logged in" in frames[-1].payload["reason"]
     # 用户那句话仍然留着，配好之后还能重跑
     assert store.load_session(space.id, session.id).messages[0] == {
         "role": "user",
         "content": "你好",
     }
     runner.shutdown()
+    [msg] = runner.panel.list_messages()
+    assert msg["level"] == "error"
+    assert "Not logged in" in runner.panel.get_message(msg["id"])["body"]
 
 
 def test_cli_missing_binary_reports_clearly(config, sa_home, tmp_path, monkeypatch):

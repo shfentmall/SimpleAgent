@@ -290,7 +290,9 @@ def test_runner_emits_status_done(config, sa_home):
     assert "usage" in frames[-1].payload
     # 落盘终态
     assert store.get_session_meta(space.id, session.id).status == "done"
-    runner.shutdown()
+    runner.shutdown()  # 等 loop 停下，_finalize 里发帧之后的那步（落消息）一定已经走完
+    # 完成只在指挥台看，不进消息：否则每跑完一个任务角标就 +1，失败反而被淹掉
+    assert runner.panel.list_messages() == []
 
 
 # ------------------------------------------------- 8. 取消仍要广播 status: cancelled
@@ -324,6 +326,37 @@ def test_runner_emits_status_cancelled(config, sa_home):
     assert "cancelled" in statuses
     assert store.get_session_meta(space.id, session.id).status == "cancelled"
     runner.shutdown()
+    # 取消是用户自己点的，不用再进消息提醒一遍
+    assert runner.panel.list_messages() == []
+
+
+def test_runner_startup_error_goes_to_inbox(config, sa_home):
+    """起不来（profile 不存在、没配 key）是最该提醒的失败：要走 _finalize 进消息，正文带原因。
+
+    改动前这条分支自己落盘、自己发帧，绕开了收口点，消息里一条都没有。
+    """
+    store = SpaceStore(sa_home)
+    space = store.create_space(SpaceSpec(name="t", kind="generic", profile="nope"))
+    session = store.create_session(space.id)
+    runner = Runner(config, store=store, llm_factory=_fake_factory([]))
+    runner.start()
+    q, _ = runner.bus.subscribe(session.id)
+
+    runner.run_input(space.id, session.id, "hi")
+    while True:
+        f = q.get(timeout=5)
+        if f.type == "status" and f.payload["status"] == "error":
+            break
+    runner.shutdown()
+
+    assert "nope" in f.payload["reason"]
+    assert f.payload["space_id"] == space.id
+    assert store.get_session_meta(space.id, session.id).status == "error"
+    [msg] = runner.panel.list_messages()
+    assert msg["level"] == "error"
+    assert msg["title"] == "t · 失败：hi"
+    assert msg["ref"] == {"space_id": space.id, "session_id": session.id}
+    assert "nope" in runner.panel.get_message(msg["id"])["body"]
 
 
 # ------------------------------------------------- 9. 面板把完成的会话留在 recent 里

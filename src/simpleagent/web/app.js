@@ -652,7 +652,7 @@ async function selectSession(spaceId, sessionId) {
 const panelState = {
   open: false,
   summary: null,
-  dispatch: [],      // 本次打开面板后下发的任务
+  dispatch: [],      // 指挥台任务卡：本页下发的 + 从后台恢复的近期任务
   inbox: [],
   inboxView: "active",  // active：当前 | archived：归档
   counts: { unread: 0, active: 0, archived: 0 },
@@ -697,6 +697,7 @@ async function loadPanel() {
   panelState.todos = todos;
   renderStats();
   renderTodos();
+  await restoreDispatch(summary);
   renderDispatch();
 }
 
@@ -727,10 +728,49 @@ function parseTarget(text) {
   return { token: m[0], name, space, rest: text.replace(m[0], "").trim() };
 }
 
+/* 指挥台的卡片不只来自本页下发：刷新页面后、或在对话视图里跑的任务，靠 summary 的
+   running + recent（24 小时内的终态）补回来。完成 / 取消不进消息，指挥台就是看它们当前
+   状态的地方，不能刷新一下就没了。补回来的卡片各拉一次摘要，运行中的之后交给 pollDispatch。 */
+async function restoreDispatch(summary) {
+  const known = new Set(panelState.dispatch.map((d) => d.sessionId));
+  const fresh = [...(summary.running || []), ...(summary.recent || [])]
+    .filter((r) => !known.has(r.session_id))
+    .map((r) => ({
+      spaceId: r.space_id,
+      spaceName: r.space_name,
+      sessionId: r.session_id,
+      at: Date.parse(r.updated_at) || 0,
+      startedAt: null,  // 后台只记了 updated_at，不知道这一轮从哪一刻开始
+      done: r.status !== "running",
+      finishedAt: r.status === "running" ? null : r.updated_at,
+      summary: { title: r.title, status: r.status },
+    }));
+  if (!fresh.length) return false;
+  await Promise.all(fresh.map(async (d) => {
+    try {
+      d.summary = await api.get(`/api/sessions/${d.sessionId}/summary`);
+    } catch { /* 拉不到摘要就只显示标题和状态 */ }
+  }));
+  // 等摘要的这段时间里，另一轮刷新或刚下发的任务可能已经把同一个会话放进来了
+  const now = new Set(panelState.dispatch.map((d) => d.sessionId));
+  panelState.dispatch.push(...fresh.filter((d) => !now.has(d.sessionId)));
+  panelState.dispatch.sort((a, b) => b.at - a.at);
+  return true;
+}
+
+/* 卡片第二行：终态写明「完成 / 已取消 / 出错」再跟摘要，状态不能只靠左边那条色带 */
+function dispatchLine(d, cls) {
+  if (d.approval) return `等待批准 ${d.approval.tool_name}`;
+  if (cls === "running") return "运行中…";
+  const head = STATUS_TEXT[cls] || cls;
+  const line = (d.summary || {}).line;
+  return line ? `${head} · ${line}` : head;
+}
+
 async function renderDispatch() {
   const box = $("dispatch-list");
   if (!panelState.dispatch.length) {
-    box.innerHTML = `<div class="empty-sub" style="padding:8px">还没有下发任务。试试「@${escapeHtml(
+    box.innerHTML = `<div class="empty-sub" style="padding:8px">24 小时内没有任务。试试「@${escapeHtml(
       (state.spaces[0] || {}).name || "空间名")} 把 tests/ 下重复 fixture 提出来」</div>`;
     return;
   }
@@ -738,13 +778,13 @@ async function renderDispatch() {
     const s = d.summary || {};
     const ap = d.approval;
     const cls = ap ? "error" : (s.status || "idle");
-    const when = d.finishedAt ? relTime(d.finishedAt) : fmtDur(Math.floor((Date.now() - d.startedAt) / 1000));
+    const when = d.finishedAt ? relTime(d.finishedAt)
+      : d.startedAt ? fmtDur(Math.floor((Date.now() - d.startedAt) / 1000)) : "";
     return `<div class="dispatch ${cls}" data-i="${i}">
       <div class="row1"><span class="dot ${cls}"></span>
         <span class="who">${escapeHtml(d.spaceName)}</span>
         <span class="when">${escapeHtml(when)}</span></div>
-      <div class="row2">${escapeHtml(s.title || "新会话")} · ${escapeHtml(
-        ap ? `等待批准 ${ap.tool_name}` : (cls === "running" ? "运行中…" : (s.line || STATUS_TEXT[cls] || cls)))}</div>
+      <div class="row2">${escapeHtml(s.title || "新会话")} · ${escapeHtml(dispatchLine(d, cls))}</div>
       ${ap ? `<div class="row3">${escapeHtml(ap.arguments || "")}</div>
         <div class="dispatch-actions">
           <button class="btn btn-mini" data-act="ap-allow">允许</button>
@@ -820,6 +860,7 @@ async function loadInbox() {
 async function loadStatsOnly() {
   panelState.summary = await api.get("/api/panel/summary");
   renderStats();
+  if (await restoreDispatch(panelState.summary)) renderDispatch();
 }
 
 /* 下发一条：@空间名 有任务描述就新建 session 跑；只 @ 就回一张状态卡 */
@@ -847,12 +888,13 @@ async function dispatch() {
       spaceId: t.space.id,
       spaceName: t.space.name,
       sessionId: m ? m.id : null,
-      startedAt: Date.now(),
+      at: Date.now(),
+      startedAt: null,
       done: !m || m.status !== "running",
       finishedAt: m ? m.updated_at : null,
       summary: m
-        ? { title: m.title, status: m.status, line: STATUS_TEXT[m.status] || m.status }
-        : { title: "这个空间还没有会话", status: "idle", line: "—" },
+        ? { title: m.title, status: m.status }
+        : { title: "这个空间还没有会话", status: "idle" },
     });
     renderDispatch();
     return;
@@ -860,10 +902,13 @@ async function dispatch() {
 
   const meta = await api.post(`/api/spaces/${t.space.id}/sessions`, {});
   await api.post(`/api/sessions/${meta.id}/input`, { text: t.rest });
+  // 上面两次请求之间，轮询可能已经把这个会话当成「运行中」恢复成卡片了
+  panelState.dispatch = panelState.dispatch.filter((d) => d.sessionId !== meta.id);
   panelState.dispatch.unshift({
     spaceId: t.space.id,
     spaceName: t.space.name,
     sessionId: meta.id,
+    at: Date.now(),
     startedAt: Date.now(),
     done: false,
     summary: { title: t.rest.slice(0, 40), status: "running" },
