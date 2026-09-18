@@ -48,6 +48,30 @@ def test_bus_order_and_replay():
     bus.unsubscribe("se1", q)
 
 
+def test_sse_resume_via_query(config, sa_home):
+    """EventSource 设不了 Last-Event-ID 头，前端主动续传时走 ?last_event_id=N。
+
+    后台标签页会断开 SSE 把连接让出来（浏览器对同一 host 只给 6 条），切回前台再续传；
+    这条不通的话，切走期间的帧就丢了。
+    """
+    from simpleagent.serve.app import Server
+
+    server = Server(config, store=SpaceStore(sa_home))
+    for i in range(3):
+        server.runner.bus.publish(Frame("se1", "tick", {"i": i}))
+
+    def first_ids(headers: dict[str, str], n: int) -> list[str]:
+        # 只取重放出来的 n 帧：再往下取就是阻塞等新帧 / keepalive 了
+        resp = server.handle("GET", "/api/sessions/se1/events", headers, b"")
+        chunks = [next(resp.stream) for _ in range(n)]
+        resp.stream.close()
+        return [c.split("\n", 1)[0] for c in chunks]
+
+    assert first_ids({"x-query": "last_event_id=1"}, 2) == ["id: 2", "id: 3"]
+    # 浏览器自动重连带的头更新，两者都在时以头为准
+    assert first_ids({"x-query": "last_event_id=1", "last-event-id": "2"}, 1) == ["id: 3"]
+
+
 # --------------------------------------------------------------- 2. 审批挂起 → 恢复
 async def test_approval_roundtrip():
     bus = EventBus()

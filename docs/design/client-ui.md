@@ -315,7 +315,7 @@ class SpaceStore:
 | POST | `/api/sessions/{id}/verify` | 手动跑验证 |
 | PATCH | `/api/sessions/{id}` | 重命名 / 置顶（`title` / `pinned`） |
 | PATCH | `/api/sessions/{id}/verification` | 手动标记已验证 |
-| GET | `/api/sessions/{id}/events` | SSE 事件流，支持 `Last-Event-ID` |
+| GET | `/api/sessions/{id}/events` | SSE 事件流，支持 `Last-Event-ID` 头或 `?last_event_id=N`（头优先） |
 | GET | `/api/approvals?status=pending` | 待审批列表 |
 | POST | `/api/approvals/{id}` | `{action: allow|deny|always}` |
 | GET | `/api/panel/summary` | 控制面板：运行中任务、未读数、待办数、累计用量 |
@@ -411,6 +411,7 @@ W2 给核心 loop 加了三个注入点，**不传则完全保持旧行为**（R
 - 零依赖、零构建：原生 DOM + `fetch` + `EventSource`，没有 React/Vue，也没有 npm。理由见 6.3 的 A 方案——先把布局和事件协议验证透，等稳定了再决定要不要包 Tauri。
 - 渲染顺序是先 `escapeHtml` 再解析极简 Markdown（代码块 / 行内代码），避免把模型输出当 HTML 执行。
 - 消息流不轮询：历史走 `GET /api/sessions/{id}`，增量只走 SSE；`seq` 用于去重（断线重放时浏览器会自动带 `Last-Event-ID`）。
+- 后台标签页不占 SSE：浏览器对同一 host 只给 6 条 HTTP/1.1 连接，每个标签页挂一条 SSE，开到第 6 个后新请求全卡在排队里（创建空间点了没反应）。所以 `visibilitychange` 切到后台就断开，回到前台用 `?last_event_id=<lastSeq>` 续传。普通请求另设 20s 超时，排队卡住时至少报个错。
 - 左栏刷新（新 session、状态变化）会重画空间列表，但**不重画右栏消息流**，避免打断正在看的上下文。
 
 ### 10.5 首轮打磨（W3 之后补的）

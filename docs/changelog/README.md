@@ -50,6 +50,7 @@
 
 ## 索引
 
+- [2026-09-17 修复新建空间「创建」按钮点了没反应（浏览器 SSE 连接被占满）](2026-09-17-wizard-create-button-sse-connection-limit-fix.md)
 - [2026-09-17 修复新建空间向导的「执行者」「权限」下拉](2026-09-17-wizard-executor-permission-dropdown-fix.md)
 - [2026-09-17 外部 CLI 执行者（Claude Code / OpenCode）接入空间 + 合并近期活动流分支](2026-09-17-cli-executors-and-panel-merge.md)
 - [2026-09-17 M3（权限 / 会话 / headless）+ 工作台 W3~W5 + 新建空间拆成两维](2026-09-17-m3-workbench-w3-w5-and-space-wizard.md)
