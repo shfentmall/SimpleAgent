@@ -192,9 +192,6 @@ class Repl:
         name = profile or config.default_profile
         if name not in config.profiles:
             raise ConfigError(f"没有名为 '{name}' 的 profile")
-        # 新开的会话立刻挂上存储：之后的每条消息都会写进 sessions/<id>.jsonl
-        if store is not None and session is None:
-            store.start(self.session, profile=name, cwd=str(cwd))
         self.agent = Agent(
             llm=self._make_llm(name),
             tools=ToolRegistry(
@@ -210,6 +207,10 @@ class Repl:
             output_dir=output_dir,
             hidden_env=config.api_key_env_names(),
         )
+        # 新开的会话挂上存储：之后的每条消息都会写进 sessions/<id>.jsonl。
+        # 放在创建模型客户端之后——缺 API key 时上面就抛错了，不能留下一条空会话
+        if store is not None and session is None:
+            store.start(self.session, profile=name, cwd=str(cwd))
 
     def _make_llm(self, name: str) -> LLM:
         if name not in self.config.profiles:

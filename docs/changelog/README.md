@@ -50,6 +50,7 @@
 
 ## 索引
 
+- [2026-09-18 sa 支持装成全局命令（uv tool install），补 --version 和撞名兜底](2026-09-18-global-cli-install.md)
 - [2026-09-18 控制面板消息升级为中控：详情弹层、自动归档、`sa inbox push` 外部投递](2026-09-18-panel-inbox-detail-archive-push.md)
 - [2026-09-17 修复新建空间「创建」按钮点了没反应（浏览器 SSE 连接被占满）](2026-09-17-wizard-create-button-sse-connection-limit-fix.md)
 - [2026-09-17 修复新建空间向导的「执行者」「权限」下拉](2026-09-17-wizard-executor-permission-dropdown-fix.md)
