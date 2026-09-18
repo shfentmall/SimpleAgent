@@ -14,7 +14,7 @@
     <div class="side-scroll">
       <button id="btn-new-space" class="btn-new">+ 新建空间</button>
       <div class="nav">
-        <div class="nav-item" data-nav="panel" id="nav-panel"><span class="ico">◎</span>控制面板</div>
+        <div class="nav-item" data-nav="panel" id="nav-panel"><span class="ico">◎</span>控制面板<span class="nav-badge hidden" id="nav-panel-badge" title="未读消息"></span></div>
         <div class="nav-item is-disabled" title="M7 实现"><span class="ico">❏</span>知识库<span class="tail">M7</span></div>
       </div>
       <input id="search" class="search" type="search" placeholder="搜索会话标题…" autocomplete="off">
@@ -80,8 +80,11 @@
         <div class="panel-right">
           <section class="panel-card panel-inbox">
             <div class="panel-head">消息
-              <span class="panel-sub"><span id="inbox-filter" class="link">全部</span> ·
-                未读 <span id="inbox-unread">0</span> ·
+              <span class="seg" id="inbox-view">
+                <span class="seg-item is-active" data-view="active">当前</span>
+                <span class="seg-item" data-view="archived">归档<span id="inbox-archived-n"></span></span>
+              </span>
+              <span class="panel-sub">未读 <span id="inbox-unread">0</span> ·
                 <span id="inbox-readall" class="link">全部已读</span></span></div>
             <div class="panel-body" id="inbox-list"></div>
           </section>
@@ -132,6 +135,24 @@
     <div class="modal-foot">
       <button id="f-cancel" class="btn">取消</button>
       <button id="f-create" class="btn btn-primary">创建</button>
+    </div>
+  </div>
+</div>
+
+<!-- ───────────────────────── 消息详情：外部文本看全文 ───────────────────────── -->
+<div id="msg-modal" class="modal hidden">
+  <div class="modal-card wide">
+    <div class="modal-head" id="mm-title"></div>
+    <div class="mm-meta" id="mm-meta"></div>
+    <div class="mm-note hidden" id="mm-note"></div>
+    <div class="mm-body" id="mm-body"></div>
+    <div class="modal-foot">
+      <button id="mm-copy" class="btn">复制</button>
+      <button id="mm-todo" class="btn">+备忘</button>
+      <button id="mm-archive" class="btn">归档</button>
+      <a id="mm-link" class="btn hidden" target="_blank" rel="noopener noreferrer">打开链接</a>
+      <span class="spacer"></span>
+      <button id="mm-close" class="btn btn-primary">关闭</button>
     </div>
   </div>
 </div>

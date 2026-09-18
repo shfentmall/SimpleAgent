@@ -1,6 +1,7 @@
 # 客户端界面设计（W 里程碑：个人 AI 工作台）
 
 > 状态：W1~W5 已实现（W5 = 控制面板：指挥台 / 消息 / 备忘）。知识库入口留给 M7。
+> 控制面板消息已补：外部文本弹层看全文、点开 30 分钟后自动归档、`sa inbox push` 外部投递（见 10.11）。
 > 新建空间已拆成「目录形态 × 执行者」两个正交维度（见 4 与 10.9）；外部 CLI 的启动器仍留 M8。
 > W1~W5 只改 `src/`，不动核心 loop 的默认行为。
 > 前置：M3（会话 JSONL 持久化 + 权限），M4（daemon / 定时任务）只影响“控制面板”的填充内容，不阻塞骨架。
@@ -320,9 +321,12 @@ class SpaceStore:
 | POST | `/api/approvals/{id}` | `{action: allow|deny|always}` |
 | GET | `/api/panel/summary` | 控制面板：运行中任务、未读数、待办数、累计用量 |
 | GET | `/api/sessions/{id}/summary` | 结构化摘要（改了几个文件 / 工具调用 / 验证状态 / 最后一句） |
-| GET | `/api/inbox` | 消息列表（`?unread=1` 只看未读） |
-| POST | `/api/inbox` | 外部消息源投递（定时任务 / 邮件适配器） |
-| POST | `/api/inbox/{id}/read` | 标记已读，`id` 为 `all` 时全部已读 |
+| GET | `/api/inbox` | 消息列表：`?view=active\|archived`（默认 active）、`?unread=1` 只看未读；条目只带 `preview`，不带全文 |
+| GET | `/api/inbox/count` | `{unread, active, archived}`，左栏角标轮询用 |
+| GET | `/api/inbox/{id}` | 消息详情（完整正文 + 状态） |
+| POST | `/api/inbox` | 外部消息源投递（定时任务 / 邮件适配器）；不开服务时用 `sa inbox push` |
+| POST | `/api/inbox/{id}/read` | 标记已读（开始归档倒计时）并返回更新后的条目，`id` 为 `all` 时全部已读 |
+| POST | `/api/inbox/{id}/archive` | 手动归档，不等倒计时 |
 | GET/POST | `/api/todos` | 备忘列表 / 新增 |
 | PATCH/DELETE | `/api/todos/{id}` | 改（text / done）/ 删 |
 | GET | `/api/knowledge/...` | 知识库（M7） |
@@ -468,6 +472,7 @@ W2 给核心 loop 加了三个注入点，**不传则完全保持旧行为**（R
 **完成摘要**：定下的口径是**纯结构化，不额外调模型**——改了几个文件、工具调用次数、报错条数、验证状态、最后一句助手消息截断 120 字，全是现成数据。控制面板是「看一眼」的地方，为了一句人话去堵一次调用不划算；真想要人话做成卡片上的按需按钮（`panel/summary.py` 的 `one_line()` 就是那一行结论）。
 
 **消息（inbox）**：落 `~/.simpleagent/panel/inbox.jsonl`，**只追加**；已读状态单独记在 `read.json`，不去改已经写出去的行。`source` 是开放字符串，v1 只有 `system` 会真的写东西（session 完成/失败/取消、验证失败，在 `Runner` 的收口处落），`schedule` / `mail` 留给 M4 定时任务和邮件适配器——加新来源不用动数据模型。点未读消息自动标记已读，`ref` 指了 session 就跳过去；右上角「+备忘」把一条消息转成备忘。
+（点开外部文本看全文、点开后自动归档、`sa inbox push` 这几件后来补上了，`read.json` 也换成了 `state.json`，见 10.11。）
 
 **备忘（todos）**：全局一份，落 `todos.json`（整体原子写）。条目两种：`text` 纯文本，或 `session` 引用（存 space_id + session_id，点「跳到会话」直接过去）。未完成的在前。
 
@@ -570,3 +575,65 @@ agents/opencode.py opencode run --format json 的事件翻译
 `stream_event` 增量块和工具块的事件形状是照文档写的，登录后要补一份成功样本重录；
 `cli_model` 现在只是透传给 `--model` / `-m` 的字符串，「用我们 config.toml 里的 profile
 跑 claude / opencode」（注入 `ANTHROPIC_BASE_URL` 那套）还没做。
+
+### 10.11 控制面板消息：详情、归档与外部投递
+
+W5 的消息只是「系统事件流水」：外部发来的纯文本点了没反应、正文在列表里原样铺开，
+看过的和没看过的堆在一起，外部来源必须等 `sa serve` 在跑才能投。这一轮把它做成中控：
+**例行任务 / 脚本投结论进来 → 左栏角标提醒 → 点开（会话跳转 / 文本看全文）→ 点开 30 分钟后自动移进归档**。
+
+**归档是算出来的，不是搬过去的。** 每条消息只多记两个时间，放在 `panel/state.json`：
+
+```json
+{"ms_1726..._a1b2c3": {"read_at": "2026-09-18T10:00:00.000+08:00", "archived_at": null}}
+```
+
+```
+archive_at = archived_at or read_at + archive_after     # 没点开过 → 永不自动归档
+archived   = now >= archive_at
+```
+
+- 不把消息挪到另一个文件：那要改写 `inbox.jsonl`，破坏「只追加」，还会和正在追加的外部进程打架；
+- 没有后台定时器：服务没开的那段时间不会漏，任何时候读出来都对；
+- `[panel] archive_after_minutes`（默认 30）改了对老消息立即生效；
+- 不在前端 `setTimeout` 到点隐藏：状态必须在 Python 侧，刷新页面、换个客户端都一致。
+
+推论：「全部已读」= 全部点过，到点一起进归档；手动归档顺带补 `read_at`（归档的一定算看过），
+所以未读数只数 `read_at` 为空的。W5 的 `read.json` 只有 id、没有时间，第一次读 `state.json`
+不存在时迁移过来，`read_at` 取 `read.json` 的 mtime——多半早过了时限，升级后老消息直接进归档。
+
+**点开之后做什么由 `ref` 推出**（`action` 字段，服务端算，不进数据模型）：`ref` 里有
+`space_id` + `session_id` → `session`，其它都是 `text`。
+
+| action | 点击 | 兜底 |
+|---|---|---|
+| `session` | 记已读 → 跳到那个会话 | 会话已不存在（空间被删）→ 退回弹层看原文，顶部提示 |
+| `text` | 记已读 → 弹层看全文（`renderText`：先转义再渲染代码块） | — |
+
+弹层底部：复制 / +备忘 / 归档 / 打开链接（仅 `ref.url` 是 http(s) 时出现，`javascript:` 这类
+外部投进来的链接不给按钮）/ 关闭；Esc、点遮罩都能关。「+备忘」按 action 建 `session` 或 `text`
+备忘（W5 一律建成 `session`，外部文本转过去会出现一个点了没反应的「跳到会话」）。
+
+**列表与全文分开取**：`GET /api/inbox` 的条目只带 `preview`（去换行、截 200 字），全文走
+`GET /api/inbox/{id}`。外部报告可能很长，归档一次拉 200 条不该把全文都带上。正文入库时封顶
+64 000 字，超出截断并注明原长度——例行任务的结论不该因为太长整条丢掉。
+
+**外部投递**：`sa inbox push` 直接追加 `inbox.jsonl`，不需要 serve 在跑：
+
+```bash
+uv run pytest 2>&1 | sa inbox push -t "夜间测试" --level warn --source schedule
+sa inbox push -t "备份完成" -b "NAS 增量备份 12.3 GB"
+```
+
+没给 `-b` 且 stdin 是管道时自动读 stdin（`-b -` 强制读）；终端里直接敲不会卡在等输入上。
+两个进程同时追加时，每条用一次 `os.write`（`O_APPEND`）写出整行，不走带缓冲的文件对象
+（缓冲会把长行拆成几次写，两边内容可能交错）；读的一侧遇到半行直接跳过，下次读就完整了。
+`state.json` 只有服务端写，读-改-写用一把锁串起来（HTTP 层是多线程的）。
+
+**刷新**：一个 30 秒的钟——面板开着时连列表带统计一起刷（到期的消息刷一下就自然挪进归档），
+没开只拉 `/api/inbox/count` 刷左栏角标；后台标签页跳过，切回前台补一次。角标不复用
+`/api/panel/summary`，因为那个要遍历所有空间的 session，不适合 30 秒一次。
+面板每次打开都回到「当前」，归档是要找东西时才去翻的；归档视图按归档时间倒序，刚被归档的在最上面。
+
+**没做的**：从归档恢复 / 「保留」不自动归档 / 归档搜索（先看用得上不）；`inbox.jsonl` 按月轮转
+（现在每次都整文件读，几千条以内无感）；新消息的系统通知留给 M4 的 `notify`。

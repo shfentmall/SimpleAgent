@@ -80,7 +80,7 @@ class Server:
     ) -> None:
         self.config = config
         self.store = store or SpaceStore()
-        self.panel = PanelStore()
+        self.panel = PanelStore(archive_after_minutes=config.panel.archive_after_minutes)
         self.runner = runner or Runner(config, store=self.store, llm_factory=llm_factory)
 
     def start(self) -> None:
@@ -159,9 +159,18 @@ class Server:
             return self._inbox_list(headers)
         if method == "POST" and path_only == "/api/inbox":
             return self._inbox_add(body)
+        # count 要排在 /api/inbox/{id} 前面，不然会被当成一条 id 叫 count 的消息
+        if method == "GET" and path_only == "/api/inbox/count":
+            return Response(200, self.panel.counts())
+        m = re.match(r"^/api/inbox/([^/]+)$", path_only)
+        if m and method == "GET":
+            return self._inbox_detail(m.group(1))
         m = re.match(r"^/api/inbox/([^/]+)/read$", path_only)
         if m and method == "POST":
             return self._inbox_read(m.group(1))
+        m = re.match(r"^/api/inbox/([^/]+)/archive$", path_only)
+        if m and method == "POST":
+            return self._inbox_archive(m.group(1))
         if path_only == "/api/todos":
             if method == "GET":
                 return self._todo_list()
@@ -475,15 +484,32 @@ class Server:
         return Response(200, summary)
 
     def _inbox_list(self, headers: dict[str, str]) -> Response:
+        """`?view=active|archived`（默认 active）；条目只带 preview，全文走详情。"""
         query = parse_qs(headers.get("x-query", ""))
-        limit = int(query.get("limit", ["50"])[0] or 50)
+        view = query.get("view", ["active"])[0]
+        if view not in ("active", "archived"):
+            return Response(400, {"error": "view 只能是 active / archived"})
+        raw = query.get("limit", [""])[0]
+        limit = int(raw) if raw.isdigit() else 50
         unread_only = query.get("unread", [""])[0] in ("1", "true", "yes")
         return Response(
-            200, self.panel.list_messages(limit=max(1, min(limit, 200)), unread_only=unread_only)
+            200,
+            self.panel.list_messages(
+                view=view, limit=max(1, min(limit, 200)), unread_only=unread_only
+            ),
         )
 
+    def _inbox_detail(self, item_id: str) -> Response:
+        item = self.panel.get_message(item_id)
+        if item is None:
+            return Response(404, {"error": "message not found"})
+        return Response(200, item)
+
     def _inbox_add(self, body: bytes) -> Response:
-        """外部消息源（定时任务 / 邮件适配器）投递用。v1 系统事件是服务端自己写的。"""
+        """外部消息源（定时任务 / 邮件适配器）投递用；不开服务时可以用 `sa inbox push`。
+
+        正文截断、level 白名单都在 store 里做，两条投递路径口径一致。
+        """
         data = self._safe_json(body) or {}
         title = str(data.get("title", "")).strip()
         if not title:
@@ -498,8 +524,21 @@ class Server:
         return Response(201, item.to_dict())
 
     def _inbox_read(self, item_id: str) -> Response:
+        """标记已读。单条时顺带返回更新后的条目：前端马上就能显示「N 分钟后归档」。"""
         changed = self.panel.mark_read(item_id)
-        return Response(200, {"read": item_id, "changed": changed})
+        if item_id in ("*", "all"):
+            return Response(200, {"read": item_id, "changed": changed})
+        item = self.panel.get_message(item_id)
+        if item is None:
+            return Response(404, {"error": "message not found"})
+        item.pop("body", None)  # 和列表条目同形，前端直接替换
+        return Response(200, {"read": item_id, "changed": changed, "item": item})
+
+    def _inbox_archive(self, item_id: str) -> Response:
+        item = self.panel.archive(item_id)
+        if item is None:
+            return Response(404, {"error": "message not found"})
+        return Response(200, item)
 
     def _todo_list(self) -> Response:
         return Response(200, self.panel.list_todos())
