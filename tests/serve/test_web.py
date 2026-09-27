@@ -350,9 +350,10 @@ def test_index_and_assets(config):
     assert ctype.startswith("text/html")
     assert "SimpleAgent 工作台" in body.decode("utf-8")
 
-    # markdown.js 要先于 app.js 加载：app.js 直接调它挂在 window 上的 renderMarkdown
+    # markdown.js / turns.js 要先于 app.js 加载：app.js 直接调它们挂在 window 上的函数
     page = body.decode("utf-8")
     assert page.index("/assets/markdown.js") < page.index("/assets/app.js")
+    assert page.index("/assets/turns.js") < page.index("/assets/app.js")
 
     status, ctype, body = _get(f"{base}/index.html")
     assert status == 200 and ctype.startswith("text/html")
@@ -364,6 +365,10 @@ def test_index_and_assets(config):
     _, ctype, js = _get(f"{base}/assets/markdown.js")
     assert ctype.startswith("text/javascript")
     assert "renderMarkdown" in js.decode("utf-8")
+
+    _, ctype, js = _get(f"{base}/assets/turns.js")
+    assert ctype.startswith("text/javascript")
+    assert "groupTurns" in js.decode("utf-8")
 
     _, ctype, _ = _get(f"{base}/assets/styles.css")
     assert ctype.startswith("text/css")

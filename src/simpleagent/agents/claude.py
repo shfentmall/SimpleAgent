@@ -19,6 +19,10 @@
 
 **成败只能看 `result.is_error`**：本机没登录时录到的样本里 `subtype` 还是 `"success"`，
 `is_error` 才是 `true`（见 tests/fixtures/cli/claude-not-logged-in.jsonl）。
+
+成功路径的样本见 tests/fixtures/cli/claude-read-only.jsonl（2.1.283 录制）：同一条 API 消息里的
+每个内容块（thinking / text / tool_use）**各自单独来一条 `assistant` 事件**，所以一段文字发出来时
+还不知道后面会不会跟着工具调用；并行调用时，下一个 tool_use 可能排在上一个的结果后面。
 """
 
 from __future__ import annotations
@@ -63,6 +67,8 @@ class ClaudeAdapter:
         self.cost_usd = 0.0
         # 逐字流式已经吐出去的文本：assistant 整段事件再来一次时要跳过，避免重复
         self._streamed = ""
+        # 思考内容同理：逐字流过了，整段的 thinking 块就不再发
+        self._thought = False
 
     # ----------------------------------------------------------------- 命令
     def command(
@@ -140,8 +146,8 @@ class ClaudeAdapter:
     def _stream_event(self, d: dict[str, Any]) -> CliTurn:
         """`--include-partial-messages` 的增量块。
 
-        注意：这个事件的形状**还没用真实样本验证过**（本机 claude 未登录，录不到成功路径）。
-        解析失败没关系——整段的 `assistant` 事件照样会把文本吐出来，只是从逐字降级成整段。
+        形状已用 2.1.283 的真实样本验证过。万一以后变了、解析失败也没关系——
+        整段的 `assistant` 事件照样会把文本吐出来，只是从逐字降级成整段。
         """
         ev = d.get("event") or {}
         if ev.get("type") != "content_block_delta":
@@ -152,6 +158,7 @@ class ClaudeAdapter:
             self._streamed += delta["text"]
             return CliTurn(events=[TextDelta(delta["text"])])
         if dtype == "thinking_delta" and delta.get("thinking"):
+            self._thought = True
             return CliTurn(events=[ReasoningDelta(delta["thinking"])])
         return CliTurn()
 
@@ -170,8 +177,10 @@ class ClaudeAdapter:
             if btype == "text":
                 text += block.get("text", "")
             elif btype == "thinking":
-                if block.get("thinking"):
+                # 2.1.283 实测思考内容是空串（只给加密签名），这里多半什么都不发
+                if block.get("thinking") and not self._thought:
                     events.append(ReasoningDelta(block["thinking"]))
+                self._thought = False
             elif btype == "tool_use":
                 events.append(
                     ToolCallStart(

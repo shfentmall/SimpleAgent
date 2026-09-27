@@ -39,7 +39,7 @@ from simpleagent.agent.session import Session
 from simpleagent.agents import adapter_for
 from simpleagent.command import ChildResult, SessionBrief, command_prompt, command_tools
 from simpleagent.config import TOOL_OUTPUT_DIRNAME, Config, home_dir
-from simpleagent.events import Event, MessageDone, ToolResult
+from simpleagent.events import Event, MessageDone, ToolCallStart, ToolResult
 from simpleagent.knowledge import Knowledge
 from simpleagent.mcp.manager import McpManager
 from simpleagent.panel.quote import has_quote
@@ -647,6 +647,10 @@ class Runner:
                     )
                     resume = adapter.session_id
                 for event in turn.events:
+                    if isinstance(event, ToolCallStart):
+                        # 对面的 MessageDone 只带文本，工具调用得单独存：不然刷新后历史里
+                        # 只剩工具结果，看不出调了什么工具、传了什么参数
+                        self.store.append_message(space.id, session.id, event.as_message())
                     self._on_event(space.id, session.id, event)
                 if turn.error:
                     error = turn.error
