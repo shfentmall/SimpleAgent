@@ -80,6 +80,8 @@ curl -s -X POST http://127.0.0.1:8384/api/inbox \
 |---|---|---|
 | `201` | 投递成功 | 存下来的整条消息：`{"id", "source", "title", "body", "ts", "level", "ref"}` |
 | `400` | 标题为空；**请求体不是合法 JSON 也是这个** | `{"error": "title 不能为空"}` |
+| `415` | 没带 `Content-Type: application/json` | `{"error": "content-type must be application/json"}` |
+| `403` | Host 不是 localhost / 字面 IP，或带了跨站的 `Origin` 头 | `{"error": "host not allowed"}` / `{"error": "origin not allowed"}` |
 | 连接被拒 | `sa serve` 没开 | — 退回用 `sa inbox push` |
 
 ## 字段说明
