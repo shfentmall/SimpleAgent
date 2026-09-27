@@ -347,6 +347,14 @@ class SpaceStore:
 
 审批走异步 `approve()` 接口：后台需要确认时推 `approval_request` 事件并挂起，客户端回 POST 后继续；客户端不在线则按无人值守策略拒绝（M3 已定的行为）。
 
+**请求来源检查**（`serve/app.py` 的 `check_request`，在 HTTP 层、路由之前；参考 Paseo 的做法）。只监听 127.0.0.1 还不够，浏览器里的恶意网页照样能打过来：
+
+- **Host 白名单**，所有请求都查：去掉端口后只能是 `localhost`、`*.localhost` 或字面 IP（IPv6 要带方括号），否则 `403 {"error": "host not allowed"}`，缺 Host 头也拒。防 DNS rebinding：网页把自己的域名解析到 127.0.0.1 后，浏览器会把它当同源，读写整个 API（列出空间 → 往全放行空间的会话发输入 → 执行 bash），但 Host 仍是它的域名。副作用：用局域网主机名（如 `mac.local`）访问会被拒，要用 IP。
+- **写请求（POST/PATCH/DELETE）带 body 必须是 `Content-Type: application/json`**（charset 等参数不管），否则 415。`text/plain` 的 POST 是「简单请求」，跨站 `fetch(..., {mode: "no-cors"})` 不走 CORS 预检就能打到 `POST /api/spaces`、`POST /api/inbox` 这类不需要知道 id 的接口；要求 JSON 就逼浏览器先预检，而本服务不回 CORS 头，预检必然失败。不带 body 的写请求（取消、重跑、标已读）不查。
+- **写请求带了 `Origin` 就必须和 Host 同源**（host:port 一致，scheme 为 http/https），否则 403。`Origin: null` 也拒。curl、脚本不带 Origin，不受影响；以后包成 Tauri 之类的桌面壳，页面 Origin 会变成 `tauri://localhost`，到时要加进白名单。
+
+单测直接调 `Server.handle` 不经过这层，不用伪造这些头；这些检查的测试在 `tests/serve/test_request_guard.py`，走真实 HTTP。
+
 ### 6.3 技术选型（待确认）
 
 | 层 | 方案 | 说明 |
