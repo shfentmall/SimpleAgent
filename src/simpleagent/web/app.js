@@ -15,6 +15,11 @@ const FRAME_TYPES = [
 
 const LS_KEY = "sa.workbench.current";   // 记住上次打开的会话，刷新后自动回到原位
 
+/* 这次按键是不是输入法在用：选词、把拼音串原样上屏时按的 Enter 是确认候选，不是发送。
+   Chrome / Firefox 里这次 keydown 的 isComposing 是 true；Safari 先发 compositionend
+   再发 keydown，isComposing 已经变回 false，只能靠 keyCode 229（输入法占用）认出来。 */
+const imeBusy = (e) => e.isComposing || e.keyCode === 229;
+
 const state = {
   spaces: [],
   profiles: [],
@@ -28,16 +33,14 @@ const state = {
   running: false,
   startedAt: null,     // 本轮开始时间，用于显示已用时
   noReplyTimer: null,  // 兜底：发出去之后一直没有任何帧就提醒
-  acc: "",           // 当前助手消息的累积文本
-  accEl: null,       // 累积文本渲染到的元素
-  streamEl: null,    // 流式时的光标占位容器
-  toolCards: new Map(),   // call_id -> { body, toggle }
+  turn: null,        // 正在接帧的这一轮助手回复（见 newTurn），跑完就清空
   showAll: new Set(),     // 展开了「查看全部」的空间 id
   filter: "",
   tab: "chat",            // 当前右栏 tab
   editingSpace: null,     // 向导处于「空间设置」模式时是那个空间，新建时为 null
   commandSpaceId: null,   // 指挥台调度者住的系统空间（/api/meta 给），左栏不显示
   commandSpace: null,     // 它的详情：点进调度会话时，头部、日志要用
+  skills: {},             // 空间 id -> 能用 /技能名 调的技能（/ 菜单和 /help 用）
 };
 
 /* ────────────────────────────── 请求封装 ────────────────────────────── */
@@ -122,6 +125,15 @@ const STATUS_TEXT = { running: "运行中", verifying: "验证中", done: "完�
 
 /* 卡片徽标：执行者决定「谁跑」，形态决定「在哪儿跑」。
    内置执行者 + 通用形态就显示「通用」，其余按执行者缩写。 */
+/* 权限模式。sp.mode 是后端算好的实际生效那档：没单独设过的内置空间已经按配置默认算了 */
+const MODE_LABEL = { "read-only": "只读", workspace: "工作区", full: "全放行" };
+
+function fullAccessTitle(sp) {
+  return (sp.executor || "simpleagent") === "simpleagent"
+    ? "这个空间全放行：改文件、跑命令都不经确认（危险命令照样拦）"
+    : "这个空间的外部 agent 不经确认就会改文件、跑命令";
+}
+
 function badgeFor(sp) {
   const exec = sp.executor || "simpleagent";
   if (exec === "simpleagent") return sp.kind === "generic" ? ["通用", ""] : ["SA", "b-sa"];
@@ -162,8 +174,8 @@ function renderSpaces() {
     const [label, cls] = badgeFor(sp);
     const dir = sp.cwd || null;
     const danger =
-      (sp.executor || "simpleagent") !== "simpleagent" && sp.permission === "full"
-        ? `<span class="warn-chip" title="这个空间的外部 agent 不经确认就会改文件、跑命令">全放行</span>`
+      sp.mode === "full"
+        ? `<span class="warn-chip" title="${escapeHtml(fullAccessTitle(sp))}">全放行</span>`
         : "";
     const vs = sp.sessions || [];
     const vsum = vs.length
@@ -289,6 +301,7 @@ function startRename(row, meta) {
     renderSpaces();
   };
   input.addEventListener("keydown", (e) => {
+    if (imeBusy(e)) return;
     if (e.key === "Enter") { e.preventDefault(); finish(true); }
     if (e.key === "Escape") { e.preventDefault(); finish(false); }
   });
@@ -312,13 +325,22 @@ function renderHeader() {
     const [label, cls] = badgeFor(sp);
     badge.className = `badge ${cls}`;
     badge.textContent = label;
-    badge.title =
-      (sp.executor || "simpleagent") !== "simpleagent" && sp.permission === "full"
-        ? "这个空间的外部 agent 不经确认就会改文件、跑命令"
-        : "";
+    badge.title = sp.mode === "full" ? fullAccessTitle(sp) : "";
     badge.classList.remove("hidden");
   } else {
     badge.classList.add("hidden");
+  }
+
+  // 当前空间的权限模式：全放行标红；在「空间设置」里改，正在跑的会话下一次工具调用起生效。
+  // 指挥台不显示：调度者没有文件工具，计划卡每次都要人确认，模式对它不起作用
+  const mc = $("ws-mode");
+  if (sp && sp.mode && sp.id !== state.commandSpaceId) {
+    mc.textContent = `权限：${MODE_LABEL[sp.mode] || sp.mode}`;
+    mc.className = sp.mode === "full" ? "chip c-failed" : "chip";
+    mc.title = sp.mode === "full" ? fullAccessTitle(sp) : "在「空间设置」里切换";
+    mc.classList.remove("hidden");
+  } else {
+    mc.classList.add("hidden");
   }
 
   const dir = (sp && sp.cwd) || "";
@@ -373,13 +395,14 @@ function renderHeader() {
 }
 
 /* ────────────────────────────── 消息流 ────────────────────────────── */
+/* 一轮助手回复画成一个气泡：上面一条「过程」折叠条（说过的话、思考、每次工具调用），
+   下面是最终回答。哪段算过程、哪段算回答见 turns.js；运行中和看历史用同一套画法。
+   过程默认收着：运行中折叠条上显示做到第几步、在做什么，点它才展开。 */
+const T = window.SATurns;
+
 function clearStream() {
-  const box = streamEl();
-  box.innerHTML = "";
-  state.toolCards.clear();
-  state.acc = "";
-  state.accEl = null;
-  state.streamEl = null;
+  streamEl().innerHTML = "";
+  state.turn = null;
 }
 
 function addUserBubble(text) {
@@ -390,20 +413,181 @@ function addUserBubble(text) {
   el.innerHTML = `<div class="avatar">你</div><div class="body"><div class="who">用户</div><div class="text"></div></div>`;
   el.querySelector(".text").textContent = text;
   box.appendChild(el);
+  state.turn = null;  // 之后的帧开新的一轮
   scrollDown();
 }
 
-function ensureAssistantBubble() {
-  if (state.accEl) return state.accEl;
+/* 空间目录：工具参数里的绝对路径在这个目录下的，显示成相对路径 */
+function spaceCwd() {
+  const sp = findSpace(state.spaceId);
+  return (sp && sp.cwd) || "";
+}
+
+/* 开一轮：头像 + 过程（折叠条 + 明细）+ 审批卡 + 回答 + 错误 */
+function newTurn({ live = true } = {}) {
   const box = streamEl();
   $("empty-state")?.remove();
   const el = document.createElement("div");
   el.className = "msg assistant";
-  el.innerHTML = `<div class="avatar">AI</div><div class="body"><div class="who">助手</div><div class="text md"></div></div>`;
+  el.innerHTML = `<div class="avatar">AI</div><div class="body"><div class="who">助手</div>
+    <div class="proc hidden">
+      <button class="proc-head" type="button"><span class="chev">▶</span><span class="proc-label"></span><span class="proc-toggle">展开</span></button>
+      <div class="proc-body"></div>
+    </div>
+    <div class="turn-cards"></div>
+    <div class="text md answer"></div>
+    <div class="turn-tail"></div></div>`;
   box.appendChild(el);
-  state.accEl = el.querySelector(".text");
-  state.streamEl = el;
-  return state.accEl;
+  const turn = {
+    live,
+    proc: el.querySelector(".proc"),
+    label: el.querySelector(".proc-label"),
+    toggle: el.querySelector(".proc-toggle"),
+    body: el.querySelector(".proc-body"),
+    cards: el.querySelector(".turn-cards"),
+    answerEl: el.querySelector(".answer"),
+    tail: el.querySelector(".turn-tail"),
+    steps: [],            // 和 turns.js 的 steps 同一个形状，折叠条上的汇总用它算
+    tools: new Map(),     // call_id -> { step, out, mark, meta }
+    answer: "",           // 最后一次工具调用之后的文字：再来工具调用就挪进过程
+    think: null,          // 正在流的思考内容 { step, el }
+    waiting: 0,           // 还没处理的审批卡
+    startedAt: state.startedAt || Date.now(),
+    seconds: null,        // 收尾时定下来的用时；看历史时不知道
+  };
+  el.querySelector(".proc-head").onclick = () =>
+    setProcOpen(turn, !turn.proc.classList.contains("is-open"));
+  return turn;
+}
+
+function ensureTurn() {
+  if (!state.turn) state.turn = newTurn();
+  return state.turn;
+}
+
+function setProcOpen(turn, open) {
+  turn.proc.classList.toggle("is-open", open);
+  turn.toggle.textContent = open ? "收起" : "展开";
+}
+
+/* 折叠条上那句话。运行中：处理中 · 第几步 · 在做什么 · 已用时；结束后：做了哪些事 · 用时 */
+function renderProcHead(turn) {
+  const tools = turn.steps.filter((s) => s.kind === "tool");
+  turn.proc.classList.toggle("hidden", !turn.steps.length && !turn.waiting);
+  const parts = [];
+  if (turn.live) {
+    parts.push(turn.waiting
+      ? `<span class="wait">⏸ 等你批准</span>`
+      : `<span class="live">◐ 处理中</span>`);
+    if (tools.length) parts.push(`第 ${tools.length} 步`);
+    const last = turn.steps[turn.steps.length - 1];
+    if (last && last.kind === "tool" && !last.done) {
+      const brief = T.toolBrief(last.name, last.args, spaceCwd());
+      parts.push(escapeHtml(`${T.toolLabel(last.name)} ${brief}`.trim()));
+    } else if (turn.think || (last && last.kind === "tool" && !turn.answer)) {
+      parts.push("思考中");  // 在想下一步：工具都跑完了、还没开始说话
+    }
+    parts.push(`<span class="dim">${fmtDur(Math.floor((Date.now() - turn.startedAt) / 1000))}</span>`);
+  } else {
+    const what = T.summarize(turn.steps, spaceCwd())
+      || (turn.steps.some((s) => s.kind === "think") && !tools.length ? "思考过程" : "");
+    parts.push(what ? `过程 · ${escapeHtml(what)}` : "过程");
+    const bad = tools.filter((s) => s.isError).length;
+    if (bad) parts.push(`<span class="err">${bad} 步出错</span>`);
+    if (turn.seconds !== null) parts.push(`<span class="dim">${fmtDur(turn.seconds)}</span>`);
+  }
+  turn.label.innerHTML = parts.join(" · ");
+}
+
+/* 过程里加一步。工具是一行（名字 + 关键参数 + 结果行数），点这一行才展开参数和输出 */
+function addStep(turn, step) {
+  turn.steps.push(step);
+  let el;
+  if (step.kind === "tool") {
+    el = document.createElement("div");
+    el.className = "step";
+    el.innerHTML = `<div class="step-row"><span class="mark"></span><span class="tname"></span>
+      <span class="brief"></span><span class="meta"></span></div><div class="step-out hidden"></div>`;
+    const row = el.querySelector(".step-row");
+    el.querySelector(".tname").textContent = T.toolLabel(step.name);
+    el.querySelector(".brief").textContent = T.toolBrief(step.name, step.args, spaceCwd());
+    const ref = { step, out: el.querySelector(".step-out"), mark: el.querySelector(".mark"), meta: el.querySelector(".meta") };
+    row.onclick = () => {
+      ref.out.classList.toggle("hidden");
+      if (!ref.out.classList.contains("hidden")) fillStepOut(ref);
+    };
+    if (step.id) turn.tools.set(step.id, ref);
+    paintStep(ref);
+  } else if (step.kind === "think") {
+    el = document.createElement("div");
+    el.className = "think";
+    el.textContent = step.text;
+  } else {
+    el = document.createElement("div");
+    el.className = "narr md";
+    el.innerHTML = renderMarkdown(step.text);
+  }
+  turn.body.appendChild(el);
+  renderProcHead(turn);
+  return el;
+}
+
+function paintStep(ref) {
+  const s = ref.step;
+  const [mark, cls] = !s.done ? ["◐", "run"] : s.cancelled ? ["–", "off"] : s.isError ? ["✗", "fail"] : ["✓", "ok"];
+  ref.mark.textContent = mark;
+  ref.mark.className = `mark ${cls}`;
+  const lines = s.result ? s.result.replace(/\n+$/, "").split("\n").length : 0;
+  ref.meta.textContent = !s.done ? "…" : s.cancelled ? "未完成" : s.isError ? "出错" : lines ? `${lines} 行` : "完成";
+  if (!ref.out.classList.contains("hidden")) fillStepOut(ref);
+}
+
+/* 展开后的内容现用现画：工具输出可能很长，收着的时候不占 DOM */
+function fillStepOut(ref) {
+  const s = ref.step;
+  let args = s.args || "";
+  try { args = JSON.stringify(JSON.parse(args || "{}"), null, 2); } catch { /* 原样显示 */ }
+  ref.out.innerHTML = "";
+  if (args && args !== "{}") {
+    const a = document.createElement("div");
+    a.className = "step-args";
+    a.textContent = args.length > 4000 ? `${args.slice(0, 4000)}\n…` : args;
+    ref.out.appendChild(a);
+  }
+  const r = document.createElement("div");
+  r.textContent = s.done ? (s.result || "（没有输出）") : "运行中…";
+  ref.out.appendChild(r);
+}
+
+/* 来了工具调用：前面那段文字原来是「边做边说」，从回答区挪进过程 */
+function demoteAnswer(turn) {
+  if (turn.answer.trim()) addStep(turn, { kind: "text", text: turn.answer });
+  turn.answer = "";
+  turn.answerEl.innerHTML = "";
+}
+
+/* 一轮收尾：去掉光标、定下用时、没跑完的工具标成未完成。
+   有回答时过程保持收着；没有回答（出错、中断）就把过程摊开，这时过程就是全部内容 */
+function finishTurn(turn, { timed = true } = {}) {
+  if (!turn) return;
+  turn.live = false;
+  turn.think = null;
+  if (timed) turn.seconds = Math.floor((Date.now() - turn.startedAt) / 1000);
+  turn.answerEl.innerHTML = turn.answer ? renderMarkdown(turn.answer) : "";
+  for (const ref of turn.tools.values()) {
+    if (!ref.step.done) { Object.assign(ref.step, { done: true, cancelled: true }); paintStep(ref); }
+  }
+  // 一轮结束时还没处理的审批（中途停止、出错）已经作废：按钮去掉，收进过程
+  for (const card of [...turn.cards.children]) {
+    card.querySelector("div").textContent = `未处理 · ${card.dataset.tool || ""}（这一轮已经结束）`;
+    card.querySelector("button")?.parentElement.remove();
+    card.classList.add("is-done");
+    turn.body.appendChild(card);
+  }
+  turn.waiting = 0;
+  if (!turn.answer.trim() && turn.steps.length) setProcOpen(turn, true);
+  renderProcHead(turn);
+  if (state.turn === turn) state.turn = null;
 }
 
 /* 流式光标放进最后一个块的末尾（段落、列表项、代码块里），不要另起一行。
@@ -417,43 +601,14 @@ function placeCursor(el) {
   host.insertAdjacentHTML("beforeend", '<span class="cursor">&nbsp;</span>');
 }
 
-/* 收尾时按完整文本再渲染一遍去掉光标：外部 CLI 执行者不一定先发 message_done 再发工具调用 */
-function finishAssistantBubble() {
-  if (state.accEl) state.accEl.innerHTML = renderMarkdown(state.acc);
-  state.acc = "";
-  state.accEl = null;
-  state.streamEl = null;
-}
-
-function addToolCard(name, argsText, callId) {
-  const box = streamEl();
-  $("empty-state")?.remove();
-  const card = document.createElement("div");
-  card.className = "card";
-  card.innerHTML = `
-    <div class="card-head"><span class="name">${escapeHtml(name)}</span>
-      <span class="args">${escapeHtml(shortPath(argsText, 60))}</span>
-      <span class="tail">展开</span></div>
-    <div class="card-body hidden"></div>`;
-  const body = card.querySelector(".card-body");
-  const tail = card.querySelector(".tail");
-  card.querySelector(".card-head").onclick = () => {
-    body.classList.toggle("hidden");
-    tail.textContent = body.classList.contains("hidden") ? "展开" : "收起";
-  };
-  box.appendChild(card);
-  if (callId) state.toolCards.set(callId, { card, body });
-  scrollDown();
-  return { card, body };
-}
-
+/* 出错、达到步数上限这类：跟在这一轮的回答后面；不在某一轮里（加载失败、发送失败）就接在最后 */
 function addErrorCard(text) {
   const box = streamEl();
   $("empty-state")?.remove();
   const el = document.createElement("div");
   el.className = "card is-error";
   el.textContent = text;
-  box.appendChild(el);
+  (state.turn ? state.turn.tail : box).appendChild(el);
   scrollDown();
 }
 
@@ -467,11 +622,13 @@ function planHtml(argsText) {
   return `<div class="plan">${plan.summary ? `<div class="plan-sum">${escapeHtml(plan.summary)}</div>` : ""}<ol>${steps}</ol></div>`;
 }
 
+/* 审批卡要人操作，不收进过程：放在折叠条和回答之间。处理完挪进过程，留个记录 */
 function addApprovalCard(approvalId, toolName, argsText, reason) {
-  const box = streamEl();
+  const turn = ensureTurn();
   const el = document.createElement("div");
   el.className = "card is-approval";
   el.dataset.approval = approvalId;
+  el.dataset.tool = toolName;
   // 计划每次都要人看：不给「始终允许」
   const isPlan = toolName === "propose_plan";
   el.innerHTML = `
@@ -487,12 +644,22 @@ function addApprovalCard(approvalId, toolName, argsText, reason) {
     b.onclick = async () => {
       try {
         await api.post(`/api/approvals/${approvalId}`, { action: b.dataset.act });
-        el.querySelectorAll("button").forEach((x) => (x.disabled = true));
-        el.querySelector("div").textContent = `已处理：${b.textContent}`;
+        // 收成一条记录挪进过程：普通审批只留一行（参数上面那一行已经有了），计划卡留着计划
+        const head = el.querySelector("div");
+        head.textContent = `已处理：${b.textContent} · ${toolName}`;
+        for (const child of [...el.children]) {
+          if (child !== head && (!isPlan || child.querySelector("button"))) child.remove();
+        }
+        el.classList.add("is-done");
+        turn.body.appendChild(el);
+        turn.waiting = Math.max(0, turn.waiting - 1);
+        renderProcHead(turn);
       } catch (e) { toast(`提交失败：${e.message}`); }
     };
   });
-  box.appendChild(el);
+  turn.cards.appendChild(el);
+  turn.waiting += 1;
+  renderProcHead(turn);
   scrollDown();
 }
 
@@ -503,41 +670,27 @@ function scrollDown(force) {
   if (force || nearBottom) box.scrollTop = box.scrollHeight;
 }
 
-/* 历史消息 → 气泡。assistant 带 tool_calls 时画成工具卡，tool 消息回填到对应卡片。 */
-function renderHistory(messages) {
+/* 历史消息 → 一轮一轮画出来。会话还在跑时，最后一轮留着接后面的帧 */
+function renderHistory(messages, { running = false } = {}) {
   clearStream();
   const box = streamEl();
   if (!messages.length) {
-    box.innerHTML = `<div class="empty"><div class="empty-title">新会话</div>
+    box.innerHTML = `<div class="empty" id="empty-state"><div class="empty-title">新会话</div>
       <div class="empty-sub">在下面输入第一句话。</div></div>`;
     return;
   }
-  for (const m of messages) {
-    if (m.role === "user") {
-      addUserBubble(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
-    } else if (m.role === "assistant") {
-      if (m.content) {
-        const el = document.createElement("div");
-        el.className = "msg assistant";
-        el.innerHTML = `<div class="avatar">AI</div><div class="body"><div class="who">助手</div>
-          <div class="text md">${renderMarkdown(m.content)}</div></div>`;
-        box.appendChild(el);
-      }
-      for (const tc of m.tool_calls || []) {
-        const args = tc.function ? tc.function.arguments : "";
-        addToolCard(tc.function ? tc.function.name : "tool", args, tc.id);
-      }
-    } else if (m.role === "tool") {
-      const hit = state.toolCards.get(m.tool_call_id);
-      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-      if (hit) {
-        hit.body.textContent = text;
-        hit.body.classList.remove("hidden");
-      } else {
-        addToolCard(m.name || "tool", "", m.tool_call_id).body.textContent = text;
-      }
-    }
-  }
+  const turns = T.groupTurns(messages);
+  turns.forEach((t, i) => {
+    if (t.user !== null) addUserBubble(t.user);
+    if (!t.steps.length && !t.answer) return;
+    const live = running && i === turns.length - 1;
+    const turn = newTurn({ live });
+    for (const s of t.steps) addStep(turn, s);
+    turn.answer = t.answer;
+    turn.answerEl.innerHTML = t.answer ? renderMarkdown(t.answer) : "";
+    if (live) state.turn = turn;
+    else finishTurn(turn, { timed: false });
+  });
   scrollDown();
 }
 
@@ -574,37 +727,45 @@ async function onFrame(type, frame) {
   const p = frame.payload || {};
 
   if (type === "text_delta") {
-    state.acc += p.text || "";
-    const el = ensureAssistantBubble();
-    el.innerHTML = renderMarkdown(state.acc);
-    placeCursor(el);
+    // 先当回答显示；后面要是来了工具调用，再挪进过程（demoteAnswer）
+    const turn = ensureTurn();
+    turn.think = null;
+    turn.answer += p.text || "";
+    turn.answerEl.innerHTML = renderMarkdown(turn.answer);
+    placeCursor(turn.answerEl);
     scrollDown();
   } else if (type === "reasoning_delta") {
-    let d = state.streamEl && state.streamEl.querySelector("details.reasoning");
-    if (!d) {
-      ensureAssistantBubble();
-      d = document.createElement("details");
-      d.className = "reasoning";
-      d.innerHTML = `<summary>思考过程</summary><div></div>`;
-      state.streamEl.querySelector(".body").appendChild(d);
+    const turn = ensureTurn();
+    if (!turn.think) {
+      const step = { kind: "think", text: "" };
+      turn.think = { step, el: addStep(turn, step) };
+      renderProcHead(turn);
     }
-    d.querySelector("div").textContent += p.text || "";
+    turn.think.step.text += p.text || "";
+    turn.think.el.textContent = turn.think.step.text;
   } else if (type === "tool_call_start") {
-    finishAssistantBubble();
+    const turn = ensureTurn();
+    turn.think = null;
+    demoteAnswer(turn);
     const args = typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments);
-    addToolCard(p.name, args, p.call_id);
-  } else if (type === "tool_result") {
-    const hit = state.toolCards.get(p.call_id);
-    if (hit) {
-      hit.body.textContent = p.content || "";
-      hit.body.classList.remove("hidden");
-      hit.card.classList.toggle("is-error", !!p.is_error);
-    } else {
-      addToolCard(p.name || "tool", "", p.call_id).body.textContent = p.content || "";
-    }
+    addStep(turn, { kind: "tool", id: p.call_id, name: p.name, args, result: "", isError: false, done: false });
     scrollDown();
+  } else if (type === "tool_result") {
+    const turn = ensureTurn();
+    let ref = turn.tools.get(p.call_id);
+    if (!ref) {
+      addStep(turn, { kind: "tool", id: p.call_id, name: p.name || "工具", args: "", done: false });
+      ref = turn.tools.get(p.call_id);
+    }
+    if (ref) {
+      Object.assign(ref.step, { result: p.content || "", isError: !!p.is_error, done: true });
+      paintStep(ref);
+    }
+    renderProcHead(turn);
   } else if (type === "message_done") {
-    finishAssistantBubble();
+    // 这段文字说完了（去掉光标）；它是不是最终回答，要等后面有没有工具调用
+    const turn = state.turn;
+    if (turn && turn.answer) turn.answerEl.innerHTML = renderMarkdown(turn.answer);
     if (p.usage) updateUsage(p.usage);
     await refreshSessions();
   } else if (type === "status") {
@@ -619,12 +780,15 @@ async function onFrame(type, frame) {
         ? `${STATUS_TEXT[p.status]}，用时 ${fmtDur(sec)}`
         : (STATUS_TEXT[p.status] || p.status);
     }
+    // 跑完（验证是另一回事，头部有自己的状态）：这一轮收尾，过程收成一行
+    if (p.status !== "running") finishTurn(state.turn);
     renderHeader();
     if (p.status !== "running") await refreshSessions();
   } else if (type === "error") {
     state.running = false;
     state.startedAt = null;
     addErrorCard(p.message || "出错了");
+    finishTurn(state.turn);
     renderHeader();
   } else if (type === "max_steps") {
     addErrorCard(`达到最大步数（${p.max_steps}）已停止。`);
@@ -708,7 +872,7 @@ async function selectSession(spaceId, sessionId) {
   try {
     const data = await api.get(`/api/sessions/${sessionId}`);
     state.messages = data.messages || [];
-    renderHistory(state.messages);
+    renderHistory(state.messages, { running: state.running });
     scrollDown(true);
     if (typeof data.seq === "number") seq = data.seq;
   } catch (e) {
@@ -724,6 +888,8 @@ async function selectSession(spaceId, sessionId) {
 }
 
 /* ─────────────────────── 控制面板（W5） ─────────────────────── */
+const DISPATCH_PLACEHOLDER =
+  "要做什么？调度者会派给合适的空间，跨空间先给你看计划（@空间名 开头 = 直接下发）";
 const panelState = {
   open: false,
   summary: null,
@@ -735,6 +901,8 @@ const panelState = {
   todos: [],
   pollTimer: null,
   mentions: { open: false, items: [], index: 0, from: 0 },
+  replyTo: null,        // 追问模式：卡片上点了「追问」，下一句直接发给这个会话，不经过调度者
+  quote: null,          // 引用的消息 {id, title, source}：下一次下发带上它，全文由服务端拼
 };
 
 async function openPanel() {
@@ -807,21 +975,50 @@ function parseTarget(text) {
    running + recent（24 小时内的终态）补回来。完成 / 取消不进消息，指挥台就是看它们当前
    状态的地方，不能刷新一下就没了。补回来的卡片各拉一次摘要，运行中的之后交给 pollDispatch。 */
 async function restoreDispatch(summary) {
+  const rows = [...(summary.running || []), ...(summary.recent || [])];
+  // 已有的卡片：后台的 updated_at 变了，说明它又跑过一轮（被调度者追问、在对话里接着聊）。
+  // 卡片要跟上：换到最近那个调度者下面、状态和最后一句刷新。只看「在不在跑」不够：
+  // 追问可能在两次轮询之间就跑完了，卡片会一直停在上一轮
+  const refresh = [];
+  let touched = false;
+  for (const r of rows) {
+    const d = panelState.dispatch.find((x) => x.sessionId === r.session_id);
+    if (!d) continue;
+    const seen = d.updatedAt;
+    d.updatedAt = r.updated_at;
+    if (!d.done || seen === undefined || seen === r.updated_at) continue;
+    touched = true;
+    Object.assign(d, { parentId: cardParent(r), at: Date.parse(r.updated_at) || Date.now() });
+    if (r.status === "running") {
+      Object.assign(d, { done: false, startedAt: null, finishedAt: null });
+      d.summary = { ...(d.summary || {}), status: "running", last_text: "" };
+    } else {
+      d.finishedAt = r.updated_at;
+      refresh.push(d);
+    }
+  }
+  await Promise.all(refresh.map(async (d) => {
+    try { d.summary = await api.get(`/api/sessions/${d.sessionId}/summary`); } catch { /* 下一轮再试 */ }
+  }));
   const known = new Set(panelState.dispatch.map((d) => d.sessionId));
-  const fresh = [...(summary.running || []), ...(summary.recent || [])]
+  const fresh = rows
     .filter((r) => !known.has(r.session_id))
     .map((r) => ({
       spaceId: r.space_id,
       spaceName: r.space_name,
       sessionId: r.session_id,
-      parentId: r.parent_session_id || null,  // 调度者派出的子任务：卡片挂到它下面
+      updatedAt: r.updated_at,
+      parentId: cardParent(r),  // 调度者派出（或追问过）的子任务：卡片挂到它下面
       at: Date.parse(r.updated_at) || 0,
       startedAt: null,  // 后台只记了 updated_at，不知道这一轮从哪一刻开始
       done: r.status !== "running",
       finishedAt: r.status === "running" ? null : r.updated_at,
       summary: { title: r.title, status: r.status },
     }));
-  if (!fresh.length) return false;
+  if (!fresh.length) {
+    if (touched) panelState.dispatch.sort((a, b) => b.at - a.at);
+    return touched;
+  }
   await Promise.all(fresh.map(async (d) => {
     try {
       d.summary = await api.get(`/api/sessions/${d.sessionId}/summary`);
@@ -832,6 +1029,11 @@ async function restoreDispatch(summary) {
   panelState.dispatch.push(...fresh.filter((d) => !now.has(d.sessionId)));
   panelState.dispatch.sort((a, b) => b.at - a.at);
   return true;
+}
+
+/* 卡片挂在哪张调度卡下面：最近一次让它跑的调度者，没有就看它是谁派出来的 */
+function cardParent(r) {
+  return r.dispatched_by || r.parent_session_id || null;
 }
 
 /* 卡片第二行：终态写明「完成 / 已取消 / 出错」再跟摘要，状态不能只靠左边那条色带 */
@@ -877,7 +1079,10 @@ async function renderDispatch() {
     const when = d.finishedAt ? relTime(d.finishedAt)
       : d.startedAt ? fmtDur(Math.floor((Date.now() - d.startedAt) / 1000)) : "";
     const commander = d.spaceId === state.commandSpaceId;
-    return `<div class="dispatch ${cls}${child ? " child" : ""}" data-i="${i}">
+    // 追问：跑完了、没在等审批、没被锁（空间切过执行者）的会话才能接着说
+    const canReply = d.sessionId && !ap && cls !== "running" && !s.locked;
+    const replying = panelState.replyTo && panelState.replyTo.sessionId === d.sessionId;
+    return `<div class="dispatch ${cls}${child ? " child" : ""}${replying ? " replying" : ""}" data-i="${i}">
       <div class="row1"><span class="dot ${cls}"></span>
         ${child ? `<span class="arrow">↳</span>` : ""}
         <span class="who">${escapeHtml(d.spaceName)}</span>
@@ -891,6 +1096,10 @@ async function renderDispatch() {
           <button class="btn btn-mini" data-act="ap-deny">拒绝</button>
         </div>` : ""}
       ${!ap && s.last_text ? `<div class="row3">${escapeHtml(s.last_text)}</div>` : ""}
+      ${canReply ? `<div class="dispatch-actions">
+          <button class="btn btn-mini" data-act="reply"
+            title="${commander ? "接着和这次的调度者说：它记得自己派过什么" : "直接对这个会话说，不经过调度者"}">追问</button>
+        </div>` : ""}
     </div>`;
   }).join("");
   box.querySelectorAll(".dispatch").forEach((el) => {
@@ -905,11 +1114,133 @@ async function renderDispatch() {
         toast("已处理");
       };
     });
+    const reply = el.querySelector("[data-act='reply']");
+    if (reply) {
+      reply.onclick = (ev) => {
+        ev.stopPropagation();
+        setReplyTo(d);
+      };
+    }
     el.onclick = async () => {
       closePanel();
       await selectSession(d.spaceId, d.sessionId);
     };
   });
+}
+
+/* ── 追问模式：卡片上点「追问」，指挥台输入框的下一句直接发给那个会话 ── */
+function setReplyTo(d) {
+  const commander = d.spaceId === state.commandSpaceId;
+  panelState.replyTo = {
+    sessionId: d.sessionId,
+    spaceId: d.spaceId,
+    label: `${commander ? "调度者" : d.spaceName} · ${(d.summary || {}).title || "会话"}`,
+  };
+  renderReplyTo();
+  renderDispatch();
+  $("dispatch-input").focus();
+}
+
+function clearReplyTo() {
+  if (!panelState.replyTo) return;
+  panelState.replyTo = null;
+  renderReplyTo();
+  renderDispatch();
+}
+
+function renderReplyTo() {
+  const box = $("dispatch-reply");
+  const r = panelState.replyTo;
+  box.classList.toggle("hidden", !r);
+  renderDispatchPlaceholder();
+  if (!r) { box.innerHTML = ""; return; }
+  box.innerHTML = `<span class="reply-label">追问 → ${escapeHtml(r.label)}</span>
+    <button class="reply-x" title="退出追问（Esc）">✕</button>`;
+  box.querySelector(".reply-x").onclick = clearReplyTo;
+}
+
+function renderDispatchPlaceholder() {
+  const r = panelState.replyTo;
+  const q = panelState.quote;
+  $("dispatch-input").placeholder =
+    r && q ? "接着对它说，引用的消息一起发过去；Esc 退出追问"
+    : r ? "接着对它说（它记得之前的上下文）；Esc 退出追问"
+    : q ? "补一句要求，也可以不写直接回车；@空间名 开头 = 直接发给那个空间；Esc 去掉引用"
+    : DISPATCH_PLACEHOLDER;
+}
+
+/* ── 引用消息：消息上点「→指挥台」，下一次下发带上这条消息 ──
+   发给谁都行：默认交给调度者，@空间名 直派、追问模式也一样带上。正文由服务端拼（列表只有预览），
+   发出去之后服务端把消息标成已读 */
+function setQuote(item) {
+  panelState.quote = { id: item.id, title: item.title, source: item.source };
+  renderQuote();
+  $("dispatch-input").focus();
+}
+
+function clearQuote() {
+  if (!panelState.quote) return;
+  panelState.quote = null;
+  renderQuote();
+}
+
+function renderQuote() {
+  const box = $("dispatch-quote");
+  const q = panelState.quote;
+  box.classList.toggle("hidden", !q);
+  renderDispatchPlaceholder();
+  if (!q) { box.innerHTML = ""; return; }
+  box.innerHTML = `<span class="reply-label" title="${escapeHtml(q.title)}">引用 · ${escapeHtml(sourceLabel(q.source))} ·「${escapeHtml(q.title)}」</span>
+    <button class="reply-x" title="去掉引用（Esc）">✕</button>`;
+  box.querySelector(".reply-x").onclick = clearQuote;
+}
+
+/* /input 的请求体：挂着引用就带上消息 id */
+function inputPayload(text) {
+  return panelState.quote ? { text, quote: panelState.quote.id } : { text };
+}
+
+/* 引用发出去了：去掉标签，消息列表跟着刷新（它已经被标成已读）。
+   请求在路上时又点了另一条消息的「→指挥台」，新挂上的那条不能被顺手清掉 */
+function quoteSent(body) {
+  if (!body.quote) return;
+  if (panelState.quote && panelState.quote.id === body.quote) clearQuote();
+  loadInbox().catch(() => { /* 下一轮轮询再刷 */ });
+}
+
+/* 本页先画出来的卡片标题；服务端的标题是拼好的全文取前 40 字，下一轮轮询会换成那个 */
+function cardTitle(text) {
+  const q = panelState.quote;
+  const full = q ? `${text || "处理这条消息"} 【引用消息】${q.title}` : text;
+  return full.replace(/\s+/g, " ").slice(0, 40);
+}
+
+/* 追问：直接往那个会话发一句。它正在跑、被锁住时后端回 409，原因显示在输入框下面 */
+async function sendReply(text) {
+  const r = panelState.replyTo;
+  const input = $("dispatch-input");
+  input.value = "";
+  $("dispatch-hint").textContent = "";
+  const body = inputPayload(text);
+  try {
+    await api.post(`/api/sessions/${r.sessionId}/input`, body);
+  } catch (e) {
+    input.value = text;  // 没发出去：把原话还给输入框
+    $("dispatch-hint").textContent = `追问失败：${e.message}`;
+    return;
+  }
+  quoteSent(body);
+  let d = panelState.dispatch.find((x) => x.sessionId === r.sessionId);
+  if (!d) {
+    d = { spaceId: r.spaceId, spaceName: r.label, sessionId: r.sessionId, parentId: null };
+    panelState.dispatch.push(d);
+  }
+  Object.assign(d, { at: Date.now(), startedAt: Date.now(), done: false, finishedAt: null });
+  d.summary = { ...(d.summary || {}), status: "running", last_text: "" };
+  panelState.dispatch.sort((a, b) => b.at - a.at);
+  panelState.replyTo = null;
+  renderReplyTo();
+  renderDispatch();
 }
 
 async function pollDispatch() {
@@ -928,6 +1259,8 @@ async function pollDispatch() {
       const s = await api.get(`/api/sessions/${d.sessionId}/summary`);
       const wasStatus = (d.summary || {}).status;
       d.summary = s;
+      // 追问过的会话会换一个调度者：卡片跟着挂过去
+      if (d.spaceId !== state.commandSpaceId) d.parentId = cardParent(s);
       if (s.status !== "running" && s.status !== "idle") {
         d.done = true;
         d.finishedAt = new Date().toISOString();
@@ -972,7 +1305,11 @@ async function loadStatsOnly() {
 async function dispatch() {
   const input = $("dispatch-input");
   const text = input.value.trim();
-  if (!text) return;
+  if (!text && !panelState.quote) return;  // 挂着引用时可以不写字：服务端补一句「处理这条消息」
+  if (panelState.replyTo) {
+    await sendReply(text);
+    return;
+  }
   if (!text.startsWith("@")) {
     await dispatchToCommander(text);
     return;
@@ -989,8 +1326,8 @@ async function dispatch() {
   input.value = "";
   $("dispatch-hint").textContent = "";
 
-  if (!t.rest) {
-    // 只 @：查这个空间最近一个 session 的状态，不新建
+  if (!t.rest && !panelState.quote) {
+    // 只 @、也没挂引用：查这个空间最近一个 session 的状态，不新建
     const metas = await api.get(`/api/spaces/${t.space.id}/sessions?limit=1`);
     const m = metas[0];
     panelState.dispatch.unshift({
@@ -1010,8 +1347,11 @@ async function dispatch() {
     return;
   }
 
+  const body = inputPayload(t.rest);
+  const title = cardTitle(t.rest);
   const meta = await api.post(`/api/spaces/${t.space.id}/sessions`, {});
-  await api.post(`/api/sessions/${meta.id}/input`, { text: t.rest });
+  await api.post(`/api/sessions/${meta.id}/input`, body);
+  quoteSent(body);
   // 上面两次请求之间，轮询可能已经把这个会话当成「运行中」恢复成卡片了
   panelState.dispatch = panelState.dispatch.filter((d) => d.sessionId !== meta.id);
   panelState.dispatch.unshift({
@@ -1022,7 +1362,7 @@ async function dispatch() {
     at: Date.now(),
     startedAt: Date.now(),
     done: false,
-    summary: { title: t.rest.slice(0, 40), status: "running" },
+    summary: { title, status: "running" },
   });
   renderDispatch();
 }
@@ -1036,15 +1376,18 @@ async function dispatchToCommander(text) {
   }
   input.value = "";
   $("dispatch-hint").textContent = "";
+  const body = inputPayload(text);
+  const title = cardTitle(text);
   let meta;
   try {
     meta = await api.post(`/api/spaces/${state.commandSpaceId}/sessions`, {});
-    await api.post(`/api/sessions/${meta.id}/input`, { text });
+    await api.post(`/api/sessions/${meta.id}/input`, body);
   } catch (e) {
     input.value = text;  // 没发出去：把原话还给输入框，免得重打
     $("dispatch-hint").textContent = `下发失败：${e.message}`;
     return;
   }
+  quoteSent(body);
   panelState.dispatch = panelState.dispatch.filter((d) => d.sessionId !== meta.id);
   panelState.dispatch.unshift({
     spaceId: state.commandSpaceId,
@@ -1054,7 +1397,7 @@ async function dispatchToCommander(text) {
     at: Date.now(),
     startedAt: Date.now(),
     done: false,
-    summary: { title: text.slice(0, 40), status: "running" },
+    summary: { title, status: "running" },
   });
   renderDispatch();
 }
@@ -1119,6 +1462,7 @@ function renderInbox() {
         <span class="inbox-hint">${escapeHtml(archiveHint(m))}</span>
         <span class="inbox-acts">
           <span class="todo-tag" data-act="todo" title="转为备忘">+备忘</span>
+          <span class="todo-tag" data-act="command" title="挂到指挥台的输入框上，补一句要求再下发">→指挥台</span>
           ${archivedView ? "" : `<span class="todo-tag" data-act="archive" title="不等倒计时，直接归档">归档</span>`}
         </span>
       </div>
@@ -1129,6 +1473,10 @@ function renderInbox() {
     el.querySelector('[data-act="todo"]').onclick = (ev) => {
       ev.stopPropagation();
       messageToTodo(item).catch((e) => toast(e.message));
+    };
+    el.querySelector('[data-act="command"]').onclick = (ev) => {
+      ev.stopPropagation();
+      setQuote(item);
     };
     const arch = el.querySelector('[data-act="archive"]');
     if (arch) {
@@ -1259,6 +1607,7 @@ async function addTodoInline() {
     await loadPanel();
   };
   input.addEventListener("keydown", (e) => {
+    if (imeBusy(e)) return;
     if (e.key === "Enter") { e.preventDefault(); finish(true); }
     if (e.key === "Escape") { e.preventDefault(); finish(false); }
   });
@@ -1434,6 +1783,8 @@ async function rerun() {
   if (!state.sessionId) return;
   try {
     const r = await api.post(`/api/sessions/${state.sessionId}/rerun`, {});
+    // 服务端把这句话又落了一条用户消息：界面上也补一条，之后的帧才是新的一轮
+    addUserBubble(r.text);
     state.running = true;
     state.startedAt = Date.now();
     $("status-hint").textContent = "重跑中…";
@@ -1472,40 +1823,158 @@ function exportMarkdown() {
   toast("已导出 Markdown");
 }
 
-/* 斜杠命令：只做本地就能完成的几个，不新增后端接口 */
+/* 斜杠命令：/help、/verify、/model 在前端处理；/技能名 原样发给后端，由 runner 展开成技能全文 */
+const WEB_COMMANDS = [
+  { name: "help", args: "", desc: "显示可用的命令和技能" },
+  { name: "verify", args: "", desc: "跑空间里配置的验证命令" },
+  { name: "model", args: "<profile>", desc: "切换这个空间的模型" },
+];
+
+/* 这个空间能用 /技能名 调的技能。有缓存直接用；fresh=true 时重新拉（技能目录可能改过） */
+async function skillsFor(spaceId, fresh = false) {
+  if (!spaceId) return [];
+  if (!fresh && state.skills[spaceId]) return state.skills[spaceId];
+  try {
+    state.skills[spaceId] = (await api.get(`/api/spaces/${spaceId}/commands`)).skills || [];
+  } catch {
+    // 拉不到就沿用上次的（没有就当空）：菜单里少几项，不影响别的
+    state.skills[spaceId] = state.skills[spaceId] || [];
+  }
+  return state.skills[spaceId];
+}
+
+/* 返回 true：在前端处理掉了；false：不是前端命令，交给后端当普通消息发（目前就是 /技能名） */
 async function runCommand(text) {
   const [cmd, ...rest] = text.slice(1).split(/\s+/);
   const arg = rest.join(" ").trim();
   if (cmd === "help" || cmd === "") {
-    addNoteCard(["可用命令：",
-      "/verify —— 跑空间里配置的验证命令",
-      `/model <profile> —— 切换模型（当前可选：${state.profiles.join(" / ")}）`,
-      "/help —— 显示这条帮助"].join("\n"));
-    return;
+    const skills = await skillsFor(state.spaceId);
+    const lines = ["可用命令：",
+      ...WEB_COMMANDS.map((c) => `/${c.name}${c.args ? ` ${c.args}` : ""} —— ${c.desc}`),
+      `（/model 当前可选：${state.profiles.join(" / ")}）`];
+    if (skills.length) {
+      lines.push("", "技能（/<技能名> [补充说明]）：",
+        ...skills.map((s) => `/${s.name} —— ${s.description.length > 80 ? `${s.description.slice(0, 80)}…` : s.description}`));
+    }
+    lines.push("", "输入 / 弹出补全菜单：↑↓ 选择，Tab 补全，Enter 选中，Esc 关闭。");
+    addNoteCard(lines.join("\n"));
+    return true;
   }
   if (cmd === "verify") {
-    if (!state.sessionId) return;
+    if (!state.sessionId) return true;
     toast("已提交验证命令");
     try { await api.post(`/api/sessions/${state.sessionId}/verify`, {}); }
     catch (e) { toast(`验证失败：${e.message}`); }
-    return;
+    return true;
   }
   if (cmd === "model") {
-    if (!arg) { toast("用法：/model <profile>"); return; }
-    if (!state.profiles.includes(arg)) { toast(`没有这个 profile：${arg}`); return; }
+    if (!arg) { toast("用法：/model <profile>"); return true; }
+    if (!state.profiles.includes(arg)) { toast(`没有这个 profile：${arg}`); return true; }
     const cur = findSpace(state.spaceId);
     if (cur && (cur.executor || "simpleagent") !== "simpleagent") {
       toast("这个空间绑的是外部 agent，模型由它自己的配置决定");
-      return;
+      return true;
     }
     try {
       await api.patch(`/api/spaces/${state.spaceId}`, { profile: arg });
       await loadSpaces();
       toast(`已切换到 ${arg}`);
     } catch (e) { toast(e.message); }
-    return;
+    return true;
   }
+  if ((await skillsFor(state.spaceId)).some((s) => s.name === cmd)) return false;
   toast(`未知命令 /${cmd}，输入 /help 看可用的`);
+  return true;
+}
+
+/* ── / 补全菜单 ── 候选怎么算在 slash.js，这里只管画和按键 */
+const slash = { open: false, items: [], index: 0 };
+
+/* input 事件：刚输入 / 时顺手重新拉一次技能，回来后按那时的输入重画 */
+function updateSlash() {
+  const ta = $("input");
+  if (ta.value.slice(0, ta.selectionStart) === "/" && state.spaceId) {
+    const spaceId = state.spaceId;
+    skillsFor(spaceId, true).then(() => {
+      if (state.spaceId === spaceId && document.activeElement === ta) refreshSlash();
+    });
+  }
+  refreshSlash();
+}
+
+function refreshSlash() {
+  const ta = $("input");
+  const sp = findSpace(state.spaceId);
+  const menu = ta.disabled ? null : slashMenu(ta.value.slice(0, ta.selectionStart), {
+    commands: WEB_COMMANDS,
+    skills: state.skills[state.spaceId] || [],
+    profiles: state.profiles,
+    current: sp ? sp.profile : "",
+  });
+  slash.open = !!menu;
+  slash.items = menu ? menu.items : [];
+  slash.index = 0;
+  drawSlash();
+}
+
+function closeSlash() {
+  slash.open = false;
+  drawSlash();
+}
+
+function drawSlash() {
+  $("composer").querySelector(".slash-menu")?.remove();
+  if (!slash.open) return;
+  const box = document.createElement("div");
+  box.className = "mentions slash-menu";
+  box.innerHTML = slash.items.map((it, i) => `
+    <div class="mention slash-item ${i === slash.index ? "is-active" : ""}" data-i="${i}"
+      title="${escapeHtml(it.desc)}">
+      <span class="slash-label">${escapeHtml(it.label)}</span>
+      ${it.hint ? `<span class="slash-hint">${escapeHtml(it.hint)}</span>` : ""}
+      ${it.tag ? `<span class="badge">${escapeHtml(it.tag)}</span>` : ""}
+      <span class="slash-desc">${escapeHtml(it.desc)}</span>
+    </div>`).join("");
+  $("composer").appendChild(box);
+  box.querySelectorAll(".slash-item").forEach((el) => {
+    // mousedown + preventDefault：不让输入框先失焦（失焦会关菜单，click 就落空了）
+    el.onmousedown = (ev) => { ev.preventDefault(); applySlash(Number(el.dataset.i), true); };
+  });
+  box.querySelector(".is-active")?.scrollIntoView({ block: "nearest" });
+}
+
+/* 选中一项：光标前的文字换成它。Enter / 点击选的、又不用再补参数的（/help、某个 profile）直接发送 */
+function applySlash(i, submit) {
+  const it = slash.items[i];
+  if (!it) return;
+  const ta = $("input");
+  ta.value = it.value + ta.value.slice(ta.selectionEnd);
+  ta.selectionStart = ta.selectionEnd = it.value.length;
+  ta.focus();
+  autoGrow();
+  if (submit && it.submit) { closeSlash(); send(); return; }
+  refreshSlash();  // 选了 /model 之后接着列 profile
+}
+
+/* 输入框的按键：菜单开着时 ↑↓ / Tab / Enter / Esc 归菜单，其余照常 */
+function onInputKeydown(e) {
+  if (imeBusy(e)) return;
+  if (slash.open) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const n = slash.items.length;
+      slash.index = (slash.index + (e.key === "ArrowDown" ? 1 : n - 1)) % n;
+      drawSlash();
+      return;
+    }
+    if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+      e.preventDefault();
+      applySlash(slash.index, e.key === "Enter");
+      return;
+    }
+    if (e.key === "Escape") { e.preventDefault(); closeSlash(); return; }
+  }
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 }
 
 function addNoteCard(text) {
@@ -1536,7 +2005,9 @@ async function send() {
   if (!text || !state.sessionId) return;
   $("input").value = "";
   autoGrow();
-  if (text.startsWith("/")) { await runCommand(text); return; }
+  closeSlash();
+  // /技能名 前端不处理，和普通消息一样发出去
+  if (text.startsWith("/") && await runCommand(text)) return;
   addUserBubble(text);
   state.running = true;
   state.startedAt = Date.now();
@@ -1584,9 +2055,9 @@ function openModal(sp) {
     fillExecutorDependents();
     if ($("f-executor").value === "simpleagent") {
       if (state.profiles.includes(editing.profile)) $("f-profile").value = editing.profile;
-    } else {
-      $("f-permission").value = editing.permission || "safe";
     }
+    // 两种执行者都有权限下拉；显示实际生效的那档（没单独设过的就是配置默认）
+    if (editing.mode) $("f-permission").value = editing.mode;
   } else {
     $("f-name").value = "";
     $("f-cwd").value = "";
@@ -1633,9 +2104,21 @@ function syncModalFields() {
   const external = $("f-executor").value !== "simpleagent";
   $("f-cwd-wrap").classList.toggle("hidden", kind !== "agent");
   $("f-model-hint").classList.toggle("hidden", !external);
-  $("f-perm-wrap").classList.toggle("hidden", !external);
   $("f-model-label").textContent = external ? "模型" : "模型 profile";
-  $("f-perm-hint").classList.toggle("hidden", !external || $("f-permission").value !== "full");
+  // 下拉框下面一行说明：全放行给警示，内置执行者的其他档讲清放行什么
+  const hint = $("f-perm-hint");
+  const perm = $("f-permission").value;
+  const info = state.executors.find((e) => e.name === $("f-executor").value);
+  const option = ((info && info.permissions) || []).find((p) => p.name === perm);
+  if (perm === "full") {
+    hint.textContent = external
+      ? "全放行：这个空间的外部 agent 不经确认就会改文件、跑命令（我们的审批卡管不到它）"
+      : "全放行：改文件、跑命令都不经确认，只有危险命令（rm -rf ~ 之类）照样拦";
+  } else {
+    hint.textContent = (option && option.description) || "";
+  }
+  hint.classList.toggle("warn", perm === "full");
+  hint.classList.toggle("hidden", !hint.textContent);
   const ed = state.editingSpace;
   $("f-switch-hint").classList.toggle(
     "hidden", !ed || (ed.executor || "simpleagent") === $("f-executor").value);
@@ -1651,8 +2134,8 @@ function executorFields() {
     // 本机默认 = 不传 cli_model；以后有 preset 时这里换成选中的 preset 名
     const cliModel = $("f-profile").value;
     if (cliModel) body.cli_model = cliModel;
-    body.permission = $("f-permission").value;
   }
+  body.permission = $("f-permission").value;
   return body;
 }
 
@@ -1780,10 +2263,9 @@ async function boot() {
     toast("已提交验证命令");
     await api.post(`/api/sessions/${state.sessionId}/verify`, {}).catch((e) => toast(e.message));
   };
-  $("input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
-  });
-  $("input").addEventListener("input", autoGrow);
+  $("input").addEventListener("keydown", onInputKeydown);
+  $("input").addEventListener("input", () => { autoGrow(); updateSlash(); });
+  $("input").addEventListener("blur", closeSlash);
   $("search").addEventListener("input", (e) => {
     state.filter = e.target.value;
     renderSpaces();
@@ -1803,6 +2285,7 @@ async function boot() {
   $("btn-dispatch").onclick = dispatch;
   $("dispatch-input").addEventListener("input", updateMentions);
   $("dispatch-input").addEventListener("keydown", (e) => {
+    if (imeBusy(e)) return;
     const mn = panelState.mentions;
     if (mn.open) {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -1819,6 +2302,8 @@ async function boot() {
       }
       if (e.key === "Escape") { e.preventDefault(); mn.open = false; updateMentions(); return; }
     }
+    if (e.key === "Escape" && panelState.replyTo) { e.preventDefault(); clearReplyTo(); return; }
+    if (e.key === "Escape" && panelState.quote) { e.preventDefault(); clearQuote(); return; }
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); dispatch(); }
   });
   document.querySelectorAll("#inbox-view .seg-item").forEach((el) => {
@@ -1845,6 +2330,12 @@ async function boot() {
   $("mm-todo").onclick = () => {
     if (panelState.modalItem) messageToTodo(panelState.modalItem).catch((e) => toast(e.message));
   };
+  $("mm-command").onclick = () => {
+    const m = panelState.modalItem;
+    if (!m) return;
+    closeMessageModal();
+    setQuote(m);
+  };
   $("mm-archive").onclick = async () => {
     const m = panelState.modalItem;
     if (!m) return;
@@ -1867,12 +2358,13 @@ async function boot() {
     pollInbox();  // 在后台时跳过的那几轮补上
   });
 
-  // 运行中每秒刷新一次「已用时」
+  // 运行中每秒刷新一次「已用时」（输入框下面和折叠条上各一处）
   setInterval(() => {
     if (state.running && state.startedAt) {
       $("status-hint").textContent =
         `${STATUS_TEXT.running}… ${fmtDur(Math.floor((Date.now() - state.startedAt) / 1000))}`;
     }
+    if (state.turn && state.turn.live) renderProcHead(state.turn);
   }, 1000);
 
   // 回到上次打开的会话（刷新页面不该丢上下文）

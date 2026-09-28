@@ -32,6 +32,7 @@
       </div>
       <div class="ws-meta">
         <span id="ws-dir" class="ws-dir"></span>
+        <span id="ws-mode" class="chip hidden"></span>
         <span id="ws-verify" class="chip hidden"></span>
         <span id="ws-usage" class="chip hidden"></span>
       </div>
@@ -70,6 +71,8 @@
             <span class="panel-sub">说任务自动派发 · @空间名 直派</span></div>
           <div class="panel-body" id="dispatch-list"></div>
           <div class="panel-foot">
+            <div id="dispatch-quote" class="reply-chip hidden"></div>
+            <div id="dispatch-reply" class="reply-chip hidden"></div>
             <textarea id="dispatch-input" rows="2" placeholder="要做什么？调度者会派给合适的空间，跨空间先给你看计划（@空间名 开头 = 直接下发）"></textarea>
             <div class="composer-bar">
               <div id="dispatch-hint" class="hint"></div>
@@ -133,10 +136,9 @@
     <div class="field-hint hidden" id="f-model-hint">
       本机默认：不注入任何配置，等同于在那个目录下直接运行 claude / opencode
     </div>
-    <label class="field hidden" id="f-perm-wrap"><span>权限</span><select id="f-permission"></select></label>
-    <div class="field-hint hidden" id="f-perm-hint">
-      全放行：这个空间的外部 agent 不经确认就会改文件、跑命令（我们的审批卡管不到它）
-    </div>
+    <label class="field" id="f-perm-wrap"><span>权限</span><select id="f-permission"></select></label>
+    <!-- 选中那档的一句说明，全放行时换成警示；文案由 syncModalFields 按执行者填 -->
+    <div class="field-hint hidden" id="f-perm-hint"></div>
     <label class="field hidden" id="f-cwd-wrap"><span>工作目录</span>
       <input id="f-cwd" placeholder="/Users/…/project"></label>
     <label class="field" id="f-verify-wrap"><span>验证命令（可选）</span><input id="f-verify" placeholder="uv run pytest -q"></label>
@@ -158,6 +160,7 @@
     <div class="modal-foot">
       <button id="mm-copy" class="btn">复制</button>
       <button id="mm-todo" class="btn">+备忘</button>
+      <button id="mm-command" class="btn" title="挂到指挥台的输入框上，补一句要求再下发">交给指挥台</button>
       <button id="mm-archive" class="btn">归档</button>
       <a id="mm-link" class="btn hidden" target="_blank" rel="noopener noreferrer">打开链接</a>
       <span class="spacer"></span>
@@ -168,6 +171,8 @@
 
 <div id="toast" class="toast hidden"></div>
 <script src="/assets/markdown.js"></script>
+<script src="/assets/slash.js"></script>
+<script src="/assets/turns.js"></script>
 <script src="/assets/app.js"></script>
 </body>
 </html>

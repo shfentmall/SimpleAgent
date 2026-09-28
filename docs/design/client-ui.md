@@ -109,7 +109,7 @@ Space（空间）──1:N── Session（会话/一次运行实例）
 
 - **头部**：面包屑（空间 / session）+ agent 徽标 + 工作目录 + 验证状态 + token 用量 + 操作（新建 session、停止、重跑、跑验证、导出 markdown）。
 - **Tab**：对话（默认）/ 变更（文件 diff 列表，来自 `edit_file` / `write_file` 事件）/ 文件（当前 cwd 树）/ 日志（trace、请求用量、错误）。
-- **消息流**：用户消息、助手文本（流式）、思考内容（可折叠）、工具调用卡（默认折叠，显示工具名+关键参数+结果行数，展开看完整输出）、审批卡（允许 / 拒绝 / 本次会话始终允许）、错误卡。
+- **消息流**：用户消息；一轮助手回复是一个气泡：上面一条「过程」折叠条（边做边说的话、思考内容、每次工具调用一行：工具名 + 关键参数 + 结果行数，点开看参数和完整输出），下面是最终回答（流式）；审批卡（允许 / 拒绝 / 本次会话始终允许）和错误卡不收进折叠。见 10.16。
 - **输入区**：多行输入、模型 profile 切换、`@` 引用文件、`/` 命令（`/compact`、`/model`、`/verify` 等）、发送 / 停止。
 
 ## 4. 空间的两个正交维度
@@ -326,6 +326,7 @@ class SpaceStore:
 | POST | `/api/sessions/{id}/input` | 发一条用户输入，触发 run（202） |
 | POST | `/api/sessions/{id}/rerun` | 用最后一条用户消息再跑一次 |
 | GET | `/api/spaces/{id}/files` | 工作目录文件树（两层，右栏「文件」tab） |
+| GET | `/api/spaces/{id}/commands` | 输入框 `/` 菜单要列的技能（只有内置 loop 的普通空间有；见 design/slash-completion.md） |
 | POST | `/api/sessions/{id}/verify` | 手动跑验证 |
 | PATCH | `/api/sessions/{id}` | 重命名 / 置顶（`title` / `pinned`） |
 | PATCH | `/api/sessions/{id}/verification` | 手动标记已验证 |
@@ -345,6 +346,14 @@ class SpaceStore:
 | GET | `/api/knowledge/...` | 知识库（M7） |
 
 审批走异步 `approve()` 接口：后台需要确认时推 `approval_request` 事件并挂起，客户端回 POST 后继续；客户端不在线则按无人值守策略拒绝（M3 已定的行为）。
+
+**请求来源检查**（`serve/app.py` 的 `check_request`，在 HTTP 层、路由之前；参考 Paseo 的做法）。只监听 127.0.0.1 还不够，浏览器里的恶意网页照样能打过来：
+
+- **Host 白名单**，所有请求都查：去掉端口后只能是 `localhost`、`*.localhost` 或字面 IP（IPv6 要带方括号），否则 `403 {"error": "host not allowed"}`，缺 Host 头也拒。防 DNS rebinding：网页把自己的域名解析到 127.0.0.1 后，浏览器会把它当同源，读写整个 API（列出空间 → 往全放行空间的会话发输入 → 执行 bash），但 Host 仍是它的域名。副作用：用局域网主机名（如 `mac.local`）访问会被拒，要用 IP。
+- **写请求（POST/PATCH/DELETE）带 body 必须是 `Content-Type: application/json`**（charset 等参数不管），否则 415。`text/plain` 的 POST 是「简单请求」，跨站 `fetch(..., {mode: "no-cors"})` 不走 CORS 预检就能打到 `POST /api/spaces`、`POST /api/inbox` 这类不需要知道 id 的接口；要求 JSON 就逼浏览器先预检，而本服务不回 CORS 头，预检必然失败。不带 body 的写请求（取消、重跑、标已读）不查。
+- **写请求带了 `Origin` 就必须和 Host 同源**（host:port 一致，scheme 为 http/https），否则 403。`Origin: null` 也拒。curl、脚本不带 Origin，不受影响；以后包成 Tauri 之类的桌面壳，页面 Origin 会变成 `tauri://localhost`，到时要加进白名单。
+
+单测直接调 `Server.handle` 不经过这层，不用伪造这些头；这些检查的测试在 `tests/serve/test_request_guard.py`，走真实 HTTP。
 
 ### 6.3 技术选型（待确认）
 
@@ -728,8 +737,9 @@ W5 起每个 session 跑完都往消息里落一条（完成 / 失败 / 取消�
 
 **流式。** 每个 `text_delta` 仍然整段重新渲染（和原来一样，几 KB 的回复开销可以忽略）。没闭合的
 围栏按代码块延伸到末尾，末尾多出的空行去掉，免得代码块写到一半时先按普通文本闪一下。光标由
-`placeCursor` 插到最后一个块的末尾（段落、列表项、代码块里），不另起一行；`finishAssistantBubble`
-统一做收尾渲染去掉光标——外部 CLI 执行者不一定先发 `message_done` 再发工具调用。
+`placeCursor` 插到最后一个块的末尾（段落、列表项、代码块里），不另起一行；`message_done` 和一轮收尾
+（`finishTurn`，见 10.16）都会按完整文本再渲染一遍去掉光标——外部 CLI 执行者不一定先发 `message_done`
+再发工具调用。
 
 **测试。** `tests/serve/test_markdown.py` 用 node 直接跑 `markdown.js`（`module.exports` 导出），
 在 Python 里断言 HTML；没装 node 就整体跳过，不为测试引入 npm。覆盖块级结构、误渲染
@@ -749,3 +759,72 @@ W5 起每个 session 跑完都往消息里落一条（完成 / 失败 / 取消�
 现在 `GET /api/sessions/{id}` 带上 `seq`，前端只订阅它之后的帧。
 
 方案、取舍、改动清单和验证记录见 [command-dispatch.md](command-dispatch.md)。
+
+### 10.15 引用消息到指挥台
+
+控制面板的消息行悬停出现「→指挥台」，消息详情里有「交给指挥台」：这条消息作为引用挂到指挥台输入框上方，
+补一句要求或直接回车就发出去（默认要求「处理这条消息」）。正文由服务端拼（`/input` 多收一个 `quote`），
+发出去后消息标成已读。引用过消息的调度会话，派发前一律先出计划卡，只派一个空间也要（代码层面强制）：
+正文可能来自邮件、脚本投递，照着它派活之前要让你看一眼。`@空间名` 直派和追问也能带引用。
+
+方案、取舍、改动清单和验证记录见 [message-to-command.md](message-to-command.md)。
+
+### 10.16 一轮回复分成「过程」和「最终回答」
+
+**问题。** 在 Claude Code 空间里实测（录了一份真实事件流回放，见下）：每段「我先看看……」都单独画成一个
+「助手」气泡，和最后的结论长得一样；工具结果一到就把整段输出铺开（3.4 写的是默认折叠，实现跑偏了）；
+刷新后工具卡只剩没名字、没参数的「tool」——外部执行者这条路只落了文本和工具结果，工具调用本身没落盘。
+
+**现在的样子。** 一轮助手回复 = 一个气泡：
+- 上面一条「过程」折叠条，**运行中也收着**，只显示「◐ 处理中 · 第 3 步 · Read src/ledger.py · 12 秒」；
+  等审批时是「⏸ 等你批准」；工具跑完、还没开始说话时是「思考中」。
+- 跑完收成一句话：「过程 · 找文件 1 次、读了 3 个文件 · 16 秒」，有工具出错时加「1 步出错」。
+- 点折叠条展开：边做边说的话、思考内容（灰色小字）、每次工具调用一行（✓ / ✗ / ◐ + 工具名 + 关键参数 +
+  结果行数）；再点某一行才展开参数和完整输出（现用现画，收着时不占 DOM）。
+- 下面是最终回答，正常字号，是这一轮的主角。
+- 审批卡要人操作，放在折叠条和回答之间；处理完收成一行「已处理：允许 · bash」挪进过程
+  （计划卡保留计划内容）。一轮结束时还没处理的审批（中途停止）标成「未处理」收进去。
+- 错误卡、达到步数上限跟在回答后面。**没有回答**的一轮（出错、中断、停在工具调用上）把过程摊开，
+  这时过程就是全部内容。
+- 没有全局「总是展开」开关（讨论过，不要）。
+
+**怎么分出哪段是回答：只看先后顺序。** 一段文字后面还跟着工具调用，它就是过程；一轮里最后一次工具调用
+之后的文字才是回答。流式时文字先按回答显示，来了工具调用再挪进过程（`demoteAnswer`）。
+不能在文字出来时就判断：Claude Code 把同一条 API 消息的每个内容块拆成单独的 `assistant` 事件，
+录到的样本里文字在第 51 行、紧跟的 tool_use 在第 58 行，文字到的时候还不知道后面有没有工具调用。
+这条规则不看是哪个执行者，内置 loop（文字和 tool_calls 在同一条消息里）、Claude Code、OpenCode 共用。
+放弃的做法：让后端判断「最终回答」再发新帧类型——Claude Code 也要等到 `result` 才知道，前端自己推得出来，
+没必要改帧协议。
+
+**外部执行者补存工具调用。** `Runner._run_cli()` 遇到 `ToolCallStart` 先落一条
+`ToolCallStart.as_message()`（`{"role": "assistant", "content": null, "tool_calls": [...]}`）再广播，
+历史就和内置 loop 一样是「调用 → 结果」配对的。只放在 CLI 路径：内置 loop 的 `MessageDone` 本身带
+tool_calls，放进公共的 `_on_event` 会存两遍。以前存下的老会话补不回工具名，显示成「工具」、汇总写
+「调用工具 N 次」，不报错。顺带：控制面板的会话摘要（`panel/summary.py` 数 tool_calls）现在也能数到
+Claude Code 会话的工具调用次数。
+
+**文件。**
+- `web/turns.js`（新）：纯函数，照 `markdown.js` / `slash.js` 的写法，node 里能 require。
+  `groupTurns(messages)` 把历史切成一轮一轮（`{ user, steps, answer }`）；`toolBrief(name, args, cwd)`
+  挑最能说明「干了什么」的参数，内置和 Claude Code 两套工具名都认，空间目录下的路径显示成相对路径
+  （macOS 的 `/tmp` ↔ `/private/tmp` 两种写法都认）；`summarize(steps)` 生成折叠条上那句话
+  （读写文件按路径去重，最多列三类，多了加「等」）。
+- `web/app.js`：`ensureAssistantBubble` / `addToolCard` 换成 `newTurn` / `addStep` / `paintStep` /
+  `demoteAnswer` / `finishTurn`；`renderHistory` 先 `groupTurns` 再用同一套函数画，会话还在跑时最后一轮
+  留作 `state.turn` 接后面的帧；「重跑」补画一条用户消息，之后的帧才是新的一轮；顺手修了新会话发出第一句
+  之后「新会话 / 在下面输入第一句话」不消失的问题（占位元素少了 `id="empty-state"`）。
+- `agents/claude.py`：流式来过 `thinking_delta` 的思考块，整段 `assistant` 事件里不再重发（和文本的
+  `_streamed` 同理）。2.1.283 实测思考内容是空串、只给加密签名，所以目前看不出来。
+
+**验证。**
+- `tests/fixtures/cli/claude-read-only.jsonl`：第一份 Claude Code **成功路径**的真实样本（2.1.283，只读档：
+  说一句打算 → Glob → 3 个并行 Read → 结论），脱敏方法见同目录 README。`test_cli_adapters.py` 对着它断言
+  事件顺序，`test_cli_runner.py` 断言每个工具结果前面都落了对应的工具调用。
+- `tests/serve/test_turns.py`：用 node 跑 `turns.js`，覆盖内置格式、Claude Code 格式、缺工具调用的老会话、
+  没有回答的一轮、多轮切分、摘要和汇总。
+- 手动：假 `claude` 命令按原节奏回放录好的事件流，看运行中 / 完成 / 展开 / 刷新；内置执行者用 FakeLLM
+  起工作台，走一遍思考 → 边做边说 → 并行工具 → bash 审批（允许、停止两种）→ 回答 → 同一会话追问。
+
+**没做的**：终端 REPL 的显示没动；导出 Markdown 仍然导出全部过程；Claude Code 的 `system` 事件
+（`task_summary`、`thinking_tokens`）没用上，以后可以拿来给折叠条上的「在做什么」提供更准的说法。
+

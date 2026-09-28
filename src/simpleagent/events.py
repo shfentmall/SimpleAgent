@@ -112,6 +112,23 @@ class ToolCallStart:
     permission: str = "allow"  # 工具的默认等级：allow / ask / deny
     readonly: bool = True  # False 时这批调用会串行执行
 
+    def as_message(self) -> dict[str, Any]:
+        """单独落盘用的助手消息（外部 CLI 执行者用，见 Runner._run_cli）。
+
+        内置 loop 不需要：它的 MessageDone 本身就带着 tool_calls。
+        """
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": self.call_id,
+                    "type": "function",
+                    "function": {"name": self.name, "arguments": self.arguments},
+                }
+            ],
+        }
+
 
 @dataclass
 class ToolResult:

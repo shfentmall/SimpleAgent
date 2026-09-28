@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import queue
 import re
@@ -18,11 +19,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from simpleagent.agents.base import PERMISSION_LABELS, PERMISSIONS, SAFE
-from simpleagent.config import Config
+from simpleagent.config import Config, home_dir
+from simpleagent.knowledge.skills import discover_skills, skill_roots
+from simpleagent.panel.quote import quote_text
 from simpleagent.panel.store import PanelStore
 from simpleagent.panel.summary import one_line, summarize
+from simpleagent.permissions import MODE_SUMMARY, Mode
 from simpleagent.serve.bus import frame_to_sse
-from simpleagent.serve.runner import Runner
+from simpleagent.serve.runner import Runner, SessionBusy
 from simpleagent.serve.static import asset_bytes
 from simpleagent.spaces.describe import DescribeError
 from simpleagent.spaces.models import (
@@ -46,6 +50,16 @@ RECENT_DONE_WINDOW_MINUTES = 24 * 60
 FINAL_STATUSES = frozenset({"done", "error", "cancelled"})
 # 自动生成空间简介最多等多久：一次不带工具的短请求，正常几秒就回来
 DESCRIBE_TIMEOUT = 60.0
+
+
+def _permission_options(executor: str) -> list[dict[str, str]]:
+    """空间设置里权限下拉的选项：内置执行者三档，外部 CLI 两档。
+
+    description 显示在下拉框下面：写进 label 的话太长，下拉框里会被截断。
+    """
+    if executor == "simpleagent":
+        return [{"name": m.value, "label": m.label, "description": MODE_SUMMARY[m]} for m in Mode]
+    return [{"name": p, "label": PERMISSION_LABELS[p], "description": ""} for p in PERMISSIONS]
 
 
 def _within_window(ts: str, cutoff: float) -> bool:
@@ -132,6 +146,9 @@ class Server:
         m = re.match(r"^/api/spaces/([^/]+)/files$", path_only)
         if m and method == "GET":
             return self._space_files(m.group(1))
+        m = re.match(r"^/api/spaces/([^/]+)/commands$", path_only)
+        if m and method == "GET":
+            return self._space_commands(m.group(1))
         m = re.match(r"^/api/spaces/([^/]+)/describe$", path_only)
         if m and method == "POST":
             return self._describe_space(m.group(1))
@@ -222,13 +239,13 @@ class Server:
                 "name": name,
                 "label": EXECUTOR_LABELS[name],
                 "external": name != "simpleagent",
-                # 外部 CLI 的模型本次只支持「本机默认（不注入配置）」，所以是空列表；
-                # 权限档两份，向导里的下拉直接照这个渲染
+                # 外部 CLI 的模型本次只支持「本机默认（不注入配置）」，所以是空列表
                 "models": [] if name != "simpleagent" else profiles,
-                "permissions": []
-                if name == "simpleagent"
-                else [{"name": p, "label": PERMISSION_LABELS[p]} for p in PERMISSIONS],
-                "default_permission": SAFE,
+                # 权限下拉照这个渲染：内置执行者三档，外部 CLI 两档（它没有「工作区」）
+                "permissions": _permission_options(name),
+                "default_permission": (
+                    self.config.permissions.mode.value if name == "simpleagent" else SAFE
+                ),
             }
             for name in EXECUTORS
         ]
@@ -254,6 +271,8 @@ class Server:
 
     def _space_view(self, space) -> dict[str, Any]:
         data = space.to_dict()
+        # permission 可能是 None（没单独设过）；界面显示和标红都看实际生效的这个
+        data["mode"] = space.effective_mode(self.config.permissions.mode).value
         data["sessions"] = [m.to_dict() for m in self.store.list_sessions(space.id, limit=5)]
         return data
 
@@ -330,12 +349,16 @@ class Server:
                 # 执行者没变（只改名、改权限）就不拦：跑着的那轮已经按旧配置拉起来了
                 if exec_fields["executor"] != current.executor and self.runner.space_busy(space_id):
                     return Response(409, {"error": "这个空间还有会话在跑，停下来再切执行者"})
-                self.store.change_executor(
+                changed = self.store.change_executor(
                     space_id,
                     exec_fields.pop("executor"),
                     profile=data.pop("profile", None),
-                    permission=exec_fields.pop("permission", None) or SAFE,
+                    permission=exec_fields.pop("permission", None),
                     **exec_fields,
+                )
+                # 正在跑的会话从下一次工具调用起按新模式判定，不用等这一轮结束
+                self.runner.apply_mode(
+                    space_id, changed.effective_mode(self.config.permissions.mode)
                 )
             space = (
                 self.store.update_space(space_id, **data)
@@ -422,16 +445,34 @@ class Server:
         return Response(200, meta.to_dict())
 
     def _session_input(self, session_id: str, body: bytes) -> Response:
+        """发一句话。带 `quote`（消息 id）时引用那条消息：text 可以空着，服务端拼上消息全文，
+        发出去之后把消息标成已读。拼接放在这边：列表只有预览，全文本来就在服务端。"""
         space_id = self.store.find_session_space(session_id)
         if space_id is None:
             return Response(404, {"error": "session not found"})
         data = self._safe_json(body) or {}
         text = data.get("text")
-        if not text or not str(text).strip():
+        quote = data.get("quote")
+        if quote is not None and (not isinstance(quote, str) or not quote):
+            return Response(400, {"error": "quote 要填消息 id"})
+        if quote:
+            item = self.panel.get_message(quote)
+            if item is None:
+                return Response(404, {"error": "引用的消息不存在"})
+            # ref 是外部投递时带进来的，不拿它拼路径去 get_space，从空间列表里查名字
+            names = {s.id: s.name for s in self.store.list_spaces(opened_only=False)}
+            ref_space = str((item.get("ref") or {}).get("space_id") or "")
+            text = quote_text(item, str(text or ""), space_name=names.get(ref_space))
+        elif not text or not str(text).strip():
             return Response(400, {"error": "text 不能为空"})
         if reason := self._locked(space_id, session_id):
             return Response(409, {"error": reason})
-        self.runner.run_input(space_id, session_id, str(text))
+        try:
+            self.runner.run_input(space_id, session_id, str(text))
+        except SessionBusy as e:
+            return Response(409, {"error": str(e)})
+        if quote:
+            self.panel.mark_read(quote)  # 已经交出去处理了，归档倒计时从这一刻开始
         return Response(202, {"accepted": True})
 
     def _space_files(self, space_id: str) -> Response:
@@ -441,6 +482,34 @@ class Server:
             return Response(404, {"error": "space not found"})
         cwd = self.runner.cwd_for(space)
         return Response(200, {"cwd": str(cwd), "tree": file_tree(cwd, depth=2)})
+
+    def _space_commands(self, space_id: str) -> Response:
+        """输入框 / 菜单要列的技能。前端自己的 /help、/verify、/model 不走这里。
+
+        只有内置 loop 的普通空间会展开 /技能名（runner 的 _run_input）：外部 agent 的上下文
+        归它自己，指挥台的调度者没有技能，这两种返回空列表。每次现扫技能目录，不读会话里
+        冻住的那份：只有会话中途增删技能时两边才对不上，新会话就一致了。
+        """
+        space = self.store.get_space(space_id)
+        if space is None:
+            return Response(404, {"error": "space not found"})
+        if (
+            space.executor != "simpleagent"
+            or space_id == COMMAND_SPACE_ID
+            or not self.config.skills.enabled
+        ):
+            return Response(200, {"skills": []})
+        roots = skill_roots(self.config.skills.dirs, home_dir(), self.runner.cwd_for(space))
+        skills = sorted(discover_skills(roots).skills.values(), key=lambda skill: skill.name)
+        return Response(
+            200,
+            {
+                "skills": [
+                    {"name": skill.name, "description": " ".join(skill.description.split())}
+                    for skill in skills
+                ]
+            },
+        )
 
     def _session_rerun(self, session_id: str) -> Response:
         """重跑最后一条用户消息：改了 prompt / 换了模型后想再试一次时用。"""
@@ -456,7 +525,10 @@ class Server:
             return Response(400, {"error": "最后一条用户消息不是纯文本，无法重跑"})
         if reason := self._locked(space_id, session_id):
             return Response(409, {"error": reason})
-        self.runner.run_input(space_id, session_id, text)
+        try:
+            self.runner.run_input(space_id, session_id, text)
+        except SessionBusy as e:
+            return Response(409, {"error": str(e)})
         return Response(202, {"accepted": True, "text": text})
 
     def _locked(self, space_id: str, session_id: str) -> str | None:
@@ -545,8 +617,10 @@ class Server:
                     "status": meta.status,
                     "updated_at": meta.updated_at,
                     "verification": _verification_status(meta),
-                    # 指挥台派发的子会话：面板把它的卡片挂在调度者那张卡下面
+                    # 指挥台派发的子会话：面板把它的卡片挂在调度者那张卡下面。
+                    # 被别的调度者追问过的，挂到最近那一个下面（dispatched_by）
                     "parent_session_id": meta.parent_session_id,
+                    "dispatched_by": meta.dispatched_by,
                 }
                 if meta.status == "running":
                     running.append(item)
@@ -578,6 +652,8 @@ class Server:
         summary["title"] = meta.title if meta else ""
         summary["status"] = meta.status if meta else "idle"
         summary["parent_session_id"] = meta.parent_session_id if meta else None
+        summary["dispatched_by"] = meta.dispatched_by if meta else None
+        summary["locked"] = bool(self._locked(space_id, session_id))
         summary["line"] = one_line(summary)
         return Response(200, summary)
 
@@ -727,6 +803,69 @@ def file_tree(root: Path, depth: int = 2, limit: int = 300) -> list[dict[str, An
     return [{"name": root.name, "path": str(root), "type": "dir", "children": top}]
 
 
+# ----------------------------------------------------------------------- 请求来源检查
+# 会改状态的方法：除了 Host，还要查 Origin 和 Content-Type
+WRITE_METHODS = frozenset({"POST", "PATCH", "DELETE"})
+
+
+def host_allowed(host: str) -> bool:
+    """Host 头（去掉端口后）是不是 localhost、*.localhost 或字面 IP。
+
+    防 DNS rebinding：恶意网页把自己的域名解析到 127.0.0.1 后，浏览器会把它当同源，
+    能读写整个 API，但发来的 Host 仍是那个域名。localhost 和字面 IP 外人改不了解析，
+    所以只放这几种。缺 Host 头（HTTP/1.0 老客户端）也拒。
+    """
+    host = host.strip().lower()
+    if host.startswith("["):  # IPv6 必须带方括号：[::1]:8384
+        name, bracket, rest = host[1:].partition("]")
+        if not bracket or (rest and not (rest[0] == ":" and rest[1:].isdigit())):
+            return False
+        try:
+            return ipaddress.ip_address(name).version == 6
+        except ValueError:
+            return False
+    name, sep, port = host.partition(":")
+    if sep and not port.isdigit():
+        return False
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(name).version == 4
+    except ValueError:
+        return False
+
+
+def _same_origin(origin: str, host: str) -> bool:
+    """Origin 的 host:port 和请求的 Host 一致才算同源。Origin 为 "null"（沙箱 iframe、file://）不算。"""
+    parsed = urlparse(origin)
+    return parsed.scheme in ("http", "https") and parsed.netloc.lower() == host.strip().lower()
+
+
+def check_request(method: str, headers: dict[str, str], body: bytes) -> Response | None:
+    """路由之前的来源检查，不通过就返回错误响应；headers 的键已经是小写。
+
+    - Host 不在白名单 → 403，挡 DNS rebinding
+    - 写请求带了跨站 Origin → 403
+    - 写请求带 body 却不是 application/json → 415。text/plain 的 POST 属于「简单请求」，
+      跨站 fetch(mode: "no-cors") 不经过 CORS 预检就能发过来；要求 JSON 就逼它先预检，
+      而本服务不回 CORS 头，预检必然失败。
+
+    放在 HTTP 层而不是 Server.handle 里：单测直接调 handle 时不必伪造这些头。
+    """
+    host = headers.get("host", "")
+    if not host_allowed(host):
+        return Response(403, {"error": "host not allowed"})
+    if method not in WRITE_METHODS:
+        return None
+    origin = headers.get("origin")
+    if origin is not None and not _same_origin(origin, host):
+        return Response(403, {"error": "origin not allowed"})
+    media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if body and media_type != "application/json":
+        return Response(415, {"error": "content-type must be application/json"})
+    return None
+
+
 # ----------------------------------------------------------------------- 适配 http.server
 def _make_handler(app: Server):
     class Handler(BaseHTTPRequestHandler):
@@ -749,8 +888,12 @@ def _make_handler(app: Server):
             headers = {k.lower(): v for k, v in self.headers.items()}
             headers["x-query"] = parsed.query
             length = int(headers.get("content-length", 0) or 0)
+            # 被拒的请求也先把 body 读完：直接关掉还有没读数据的连接，内核会回 RST，
+            # 客户端可能收不到这个 403 / 415
             body = self.rfile.read(length) if length else b""
-            resp = app.handle(method, parsed.path, headers, body)
+            resp = check_request(method, headers, body) or app.handle(
+                method, parsed.path, headers, body
+            )
 
             self.send_response(resp.status)
             for k, v in resp.headers.items():

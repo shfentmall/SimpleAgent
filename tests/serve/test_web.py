@@ -245,7 +245,10 @@ def test_pending_approvals_carry_details(config, sa_home):
     from simpleagent.serve.runner import Runner
 
     store = SpaceStore(sa_home)
-    space = store.create_space(SpaceSpec(name="t", kind="generic", profile="a"))
+    # 只读模式：工作区模式下写工作目录里的文件不用问，就没有审批可测了
+    space = store.create_space(
+        SpaceSpec(name="t", kind="generic", profile="a", permission="read-only")
+    )
     session = store.create_session(space.id)
     script = [
         {
@@ -351,9 +354,10 @@ def test_index_and_assets(config):
     assert ctype.startswith("text/html")
     assert "SimpleAgent 工作台" in body.decode("utf-8")
 
-    # markdown.js 要先于 app.js 加载：app.js 直接调它挂在 window 上的 renderMarkdown
+    # markdown.js / turns.js 要先于 app.js 加载：app.js 直接调它们挂在 window 上的函数
     page = body.decode("utf-8")
     assert page.index("/assets/markdown.js") < page.index("/assets/app.js")
+    assert page.index("/assets/turns.js") < page.index("/assets/app.js")
 
     status, ctype, body = _get(f"{base}/index.html")
     assert status == 200 and ctype.startswith("text/html")
@@ -365,6 +369,10 @@ def test_index_and_assets(config):
     _, ctype, js = _get(f"{base}/assets/markdown.js")
     assert ctype.startswith("text/javascript")
     assert "renderMarkdown" in js.decode("utf-8")
+
+    _, ctype, js = _get(f"{base}/assets/turns.js")
+    assert ctype.startswith("text/javascript")
+    assert "groupTurns" in js.decode("utf-8")
 
     _, ctype, _ = _get(f"{base}/assets/styles.css")
     assert ctype.startswith("text/css")
@@ -401,10 +409,17 @@ def test_meta(config):
     assert execs["simpleagent"]["models"] == ["a", "b"]
     assert execs["claude-code"]["external"] is True
     assert execs["claude-code"]["models"] == []
-    # 权限两档由后端给，向导里直接渲染
-    assert [p["name"] for p in execs["claude-code"]["permissions"]] == ["safe", "full"]
-    assert execs["claude-code"]["default_permission"] == "safe"
-    assert execs["simpleagent"]["permissions"] == []
+    # 权限选项由后端给，向导里直接渲染：内置三档（默认跟配置），外部 CLI 两档（默认只读）
+    assert [p["name"] for p in execs["simpleagent"]["permissions"]] == [
+        "read-only",
+        "workspace",
+        "full",
+    ]
+    workspace = execs["simpleagent"]["permissions"][1]
+    assert workspace["label"] == "工作区" and workspace["description"].startswith("工作目录里")
+    assert execs["simpleagent"]["default_permission"] == "workspace"
+    assert [p["name"] for p in execs["claude-code"]["permissions"]] == ["read-only", "full"]
+    assert execs["claude-code"]["default_permission"] == "read-only"
 
 
 # ------------------------------------------------- 2b. 新建空间：四种组合与校验
@@ -532,3 +547,54 @@ def test_sessions_limit(config, sa_home):
 
     clamped = _get_json(f"{base}/api/spaces/{space.id}/sessions?limit=9999")
     assert len(clamped) == 6
+
+
+# --------------------------------------------------------------- 4. 输入框的 / 菜单
+def _write_skill(root, name: str, description: str) -> None:
+    skill = root / ".agents" / "skills" / name
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {description}\n---\n正文\n", encoding="utf-8"
+    )
+
+
+def test_space_commands_lists_skills_in_space_cwd(config, sa_home, tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    _write_skill(repo, "release", "发版流程：\n  先写 changelog")
+    _write_skill(repo, "audit", "安全审查")
+    store = SpaceStore(sa_home)
+    space = store.create_space(SpaceSpec(name="t", kind="agent", profile="a", cwd=str(repo)))
+    plain = store.create_space(SpaceSpec(name="空目录", kind="generic", profile="a"))
+
+    base = _serve(config)
+    got = _get_json(f"{base}/api/spaces/{space.id}/commands")
+    assert got == {
+        "skills": [
+            {"name": "audit", "description": "安全审查"},
+            {"name": "release", "description": "发版流程： 先写 changelog"},  # 换行压成空格
+        ]
+    }
+    assert _get_json(f"{base}/api/spaces/{plain.id}/commands") == {"skills": []}
+    try:
+        _get(f"{base}/api/spaces/sp_not_exist/commands")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+    else:
+        raise AssertionError("不存在的空间应当 404")
+
+
+def test_space_commands_empty_where_skills_are_not_expanded(config, sa_home, tmp_path):
+    """外部 agent 和指挥台不展开 /技能名，菜单里也不列。"""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    _write_skill(repo, "release", "发版流程")
+    store = SpaceStore(sa_home)
+    external = store.create_space(
+        SpaceSpec(name="c", kind="agent", executor="claude-code", cwd=str(repo))
+    )
+    commander = store.ensure_command_space()
+
+    base = _serve(config)
+    assert _get_json(f"{base}/api/spaces/{external.id}/commands") == {"skills": []}
+    assert _get_json(f"{base}/api/spaces/{commander.id}/commands") == {"skills": []}

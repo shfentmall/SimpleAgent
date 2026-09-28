@@ -13,11 +13,14 @@ import urllib.request
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+
+from simpleagent.agent.session import Session
 from simpleagent.llm.fake import FakeLLM
-from simpleagent.permissions import ApprovalDecision, ApprovalRequest
+from simpleagent.permissions import ApprovalDecision, ApprovalRequest, Mode
 from simpleagent.serve.approval import APIApprover, PendingApprovals
 from simpleagent.serve.bus import EventBus, Frame
-from simpleagent.serve.runner import Runner
+from simpleagent.serve.runner import Runner, SessionBusy
 from simpleagent.spaces.models import SpaceSpec
 from simpleagent.spaces.store import SpaceStore
 
@@ -153,7 +156,10 @@ def test_runner_fake_llm_stream(config, sa_home):
 # --------------------------------------------------------------- 4. 审批流：挂起 → POST → 继续
 def test_runner_approval_flow(config, sa_home):
     store = SpaceStore(sa_home)
-    space = store.create_space(SpaceSpec(name="t", kind="generic", profile="a"))
+    # 只读模式：工作区模式下写工作目录里的文件不用问，就没有审批可测了
+    space = store.create_space(
+        SpaceSpec(name="t", kind="generic", profile="a", permission="read-only")
+    )
     session = store.create_session(space.id)
     script = [
         {
@@ -178,6 +184,8 @@ def test_runner_approval_flow(config, sa_home):
             break
     assert frames[-1].type == "approval_request"
     assert not any(f.type == "tool_result" for f in frames)
+    # 实时推的审批帧也要带「为什么要问」，不能只有刷新后补发的卡才有
+    assert frames[-1].payload["reason"] == "工具 write_file 会改动文件或执行命令"
     ap_id = frames[-1].payload["approval_id"]
 
     # 允许后继续，直到下一个 message_done
@@ -193,6 +201,75 @@ def test_runner_approval_flow(config, sa_home):
     written = (store._space_dir(space.id) / "tmp" / "x.txt").read_text(encoding="utf-8")
     assert written == "hi"
     runner.shutdown()
+
+
+def _frames_until(q, frame_type: str) -> list[Frame]:
+    frames: list[Frame] = []
+    while True:
+        f = q.get(timeout=5)
+        frames.append(f)
+        if f.type == frame_type:
+            return frames
+
+
+def test_runner_uses_space_mode(config, sa_home):
+    """没单独设权限的空间跟配置默认（工作区）：工作目录里写文件不弹审批。"""
+    store = SpaceStore(sa_home)
+    space = store.create_space(SpaceSpec(name="t", kind="generic", profile="a"))
+    session = store.create_session(space.id)
+    script = [
+        {
+            "tool_calls": [
+                {"id": "c1", "name": "write_file", "arguments": {"path": "x.txt", "content": "hi"}}
+            ]
+        },
+        {"content": "写完了"},
+    ]
+    runner = Runner(config, store=store, llm_factory=_fake_factory(script))
+    runner.start()
+    q, _ = runner.bus.subscribe(session.id)
+    runner.run_input(space.id, session.id, "写个文件")
+    frames = _frames_until(q, "message_done")
+    frames += _frames_until(q, "message_done")
+    assert not any(f.type == "approval_request" for f in frames)
+    assert (store._space_dir(space.id) / "tmp" / "x.txt").read_text(encoding="utf-8") == "hi"
+    runner.shutdown()
+
+
+def test_apply_mode_reaches_running_agents_of_that_space_only(config, sa_home):
+    store = SpaceStore(sa_home)
+    mine = store.create_space(SpaceSpec(name="a", kind="generic", profile="a"))
+    other = store.create_space(SpaceSpec(name="b", kind="generic", profile="a"))
+    runner = Runner(config, store=store, llm_factory=_fake_factory([]))
+    runner.start()
+    agents = {}
+    for space in (mine, other):
+        session = store.create_session(space.id)
+        agents[space.id] = runner._agents[session.id] = runner._build_agent(
+            space, Session(session.id), "simpleagent"
+        )
+    assert agents[mine.id].tools.policy.mode is Mode.WORKSPACE
+
+    runner.apply_mode(mine.id, Mode.FULL)
+    deadline = time.monotonic() + 5
+    while agents[mine.id].tools.policy.mode is not Mode.FULL and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert agents[mine.id].tools.policy.mode is Mode.FULL
+    assert agents[other.id].tools.policy.mode is Mode.WORKSPACE
+    runner.shutdown()
+
+
+def test_build_agent_reads_the_latest_mode(config, sa_home):
+    """回归：_run_turn 读完空间后还要等 MCP 启动，这期间改的模式 apply_mode 够不着，
+    所以 _build_agent 要从存储里现读，不能用传进来的旧 Space 对象。"""
+    store = SpaceStore(sa_home)
+    stale = store.create_space(SpaceSpec(name="t", kind="generic", profile="a"))
+    session = store.create_session(stale.id)
+    store.change_executor(stale.id, "simpleagent", permission="read-only")
+    runner = Runner(config, store=store, llm_factory=_fake_factory([]))
+    agent = runner._build_agent(stale, Session(session.id), "simpleagent")
+    assert stale.permission is None  # 传进去的还是改之前的
+    assert agent.tools.policy.mode is Mode.READ_ONLY
 
 
 # --------------------------------------------------------------- 5. 验证命令
@@ -453,3 +530,70 @@ def test_context_edited_frame():
     frame = event_to_frame(ContextEdited("compact", 4500, 1500, 5000, 8, usage=usage), "s1")
     assert frame.payload["kind"] == "compact"
     assert frame.payload["usage"]["cached_tokens"] == 3900
+
+
+# ------------------------------------------------- 10. 同一个会话同一时间只跑一轮
+def test_input_to_busy_session_conflicts(config, sa_home):
+    """会话正在跑时再发输入 / 重跑：409，不开第二轮（以前只靠前端把输入框置灰）。"""
+    from simpleagent.serve.app import Server
+
+    server = Server(config, store=SpaceStore(sa_home), llm_factory=_fake_factory([]))
+    store = server.store
+    space = store.create_space(SpaceSpec(name="t", kind="generic", profile="a"))
+    session = store.create_session(space.id)
+    store.append_message(space.id, session.id, {"role": "user", "content": "上一句"})
+    token = server.runner.claim(session.id)  # 假装它正在跑（调度者追问它、或者你刚发过）
+
+    body = json.dumps({"text": "再来一句"}).encode()
+    busy = server.handle("POST", f"/api/sessions/{session.id}/input", {}, body)
+    assert busy.status == 409 and "正在跑" in busy.body["error"]
+    rerun = server.handle("POST", f"/api/sessions/{session.id}/rerun", {}, b"")
+    assert rerun.status == 409 and "正在跑" in rerun.body["error"]
+    # 什么都没落：用户消息还是只有原来那一条
+    assert len(store.load_session(space.id, session.id).messages) == 1
+    server.runner._release(session.id, token)
+    assert not server.runner.session_busy(session.id)
+
+
+def test_claim_released_on_every_exit(config, sa_home):
+    """每种收口都要放开占用，而且赶在终态帧之前：收到帧马上再发，不能撞上 SessionBusy。"""
+    store = SpaceStore(sa_home)
+    space = store.create_space(SpaceSpec(name="t", kind="generic", profile="a"))
+    broken = store.create_space(SpaceSpec(name="b", kind="generic", profile="nope"))
+    session = store.create_session(space.id)
+    failing = store.create_session(broken.id)
+    runner = Runner(config, store=store, llm_factory=_fake_factory([{"content": "好", "delay": 1}]))
+    runner.start()
+    q, _ = runner.bus.subscribe(session.id)
+    qf, _ = runner.bus.subscribe(failing.id)
+    try:
+        # 正常跑完：收到 done 立刻再发一句，必须能发出去
+        runner.run_input(space.id, session.id, "一")
+        while (f := q.get(timeout=5)).type != "status" or f.payload["status"] != "done":
+            pass
+        runner.run_input(space.id, session.id, "二")
+        # 跑着的时候再发：直接拒绝
+        with pytest.raises(SessionBusy):
+            runner.run_input(space.id, session.id, "三")
+        # 取消（等它真的开始跑：还没开跑时取消是空操作）
+        while (f := q.get(timeout=5)).type != "status" or f.payload["status"] != "running":
+            pass
+        runner.cancel(session.id)
+        while (f := q.get(timeout=5)).type != "status" or f.payload["status"] != "cancelled":
+            pass
+        assert not runner.session_busy(session.id)
+
+        # 起不来（profile 不存在）
+        runner.run_input(broken.id, failing.id, "hi")
+        while (f := qf.get(timeout=5)).type != "status" or f.payload["status"] != "error":
+            pass
+        assert not runner.session_busy(failing.id)
+
+        # 会话被锁（空间切过执行者）：没走 _finalize 的提前返回，也要放开
+        store.change_executor(space.id, "claude-code")
+        runner.run_input(space.id, session.id, "四")
+        while (f := q.get(timeout=5)).type != "error":
+            pass
+        assert not runner.session_busy(session.id)
+    finally:
+        runner.shutdown()

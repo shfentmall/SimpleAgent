@@ -13,7 +13,7 @@ import pytest
 from simpleagent.agents import FULL, SAFE, adapter_for
 from simpleagent.agents.claude import ClaudeAdapter
 from simpleagent.agents.opencode import OpenCodeAdapter
-from simpleagent.events import TextDelta, ToolResult
+from simpleagent.events import MessageDone, ReasoningDelta, TextDelta, ToolCallStart, ToolResult
 
 FIXTURES = Path(__file__).parent / "fixtures" / "cli"
 
@@ -116,6 +116,82 @@ def test_claude_partial_text_is_not_duplicated_by_full_message():
     assert [type(e).__name__ for e in events] == ["MessageDone"]
     assert events[0].message["content"] == "你好"
     assert not any(isinstance(e, TextDelta) for e in events)
+
+
+def test_claude_partial_thinking_is_not_duplicated_by_full_block():
+    adapter = ClaudeAdapter()
+    partial = json.dumps(
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "thinking_delta", "thinking": "先看目录"},
+            },
+        }
+    )
+    assert [type(e).__name__ for e in adapter.parse(partial).events] == ["ReasoningDelta"]
+    full = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "thinking", "thinking": "先看目录"}]},
+        }
+    )
+    assert adapter.parse(full).events == []
+    # 下一个思考块没有逐字流过（比如增量解析失败）：整段的照常发
+    assert [type(e).__name__ for e in adapter.parse(full).events] == ["ReasoningDelta"]
+
+
+def test_claude_real_read_only_sample():
+    """真实样本（2.1.283，只读档）：说一句打算 → Glob → 3 个 Read（并行）→ 结论。
+
+    每个内容块单独一条 assistant 事件，文字和工具调用分开到；第二、三个 Read 排在
+    前一个的结果后面。
+    """
+    adapter = ClaudeAdapter()
+    turns = [
+        adapter.parse(line)
+        for line in (FIXTURES / "claude-read-only.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    events = [e for t in turns for e in t.events]
+    # 连续的 TextDelta 合成一个，看清整体顺序
+    kinds = []
+    for e in events:
+        kind = type(e).__name__
+        if not (kinds and kind == "TextDelta" == kinds[-1]):
+            kinds.append(kind)
+    assert kinds == [
+        "TextDelta",
+        "MessageDone",  # 「我的查法……」，后面紧跟工具调用：是过程，不是回答
+        "ToolCallStart",
+        "ToolResult",
+        "ToolCallStart",
+        "ToolResult",
+        "ToolCallStart",
+        "ToolResult",
+        "ToolCallStart",
+        "ToolResult",
+        "TextDelta",
+        "MessageDone",  # 最后一段才是回答
+    ]
+    calls = [e for e in events if isinstance(e, ToolCallStart)]
+    assert [c.name for c in calls] == ["Glob", "Read", "Read", "Read"]
+    assert json.loads(calls[1].arguments) == {"file_path": "/tmp/sa-demo/src/ledger.py"}
+    results = [e for e in events if isinstance(e, ToolResult)]
+    assert [r.call_id for r in results] == [c.call_id for c in calls]
+    assert not any(r.is_error for r in results)
+
+    done = [e for e in events if isinstance(e, MessageDone)]
+    assert done[0].message["content"].startswith("我的查法")
+    assert done[1].message["content"].startswith("项目只有三个文件")
+    # 思考内容是空串（只给加密签名），不该冒出空的 ReasoningDelta
+    assert not any(isinstance(e, ReasoningDelta) for e in events)
+
+    # result 后面还跟着一条 task_summary，结束信号要看 result 那一条
+    (end,) = [t for t in turns if t.finished]
+    assert end.ok is True
+    assert adapter.session_id == "33333333-3333-4333-8333-333333333333"
+    assert adapter.usage.completion_tokens == 2387
 
 
 def test_claude_command_shape():

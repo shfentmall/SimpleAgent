@@ -50,6 +50,15 @@
 
 ## 索引
 
+- [2026-09-27 `sa serve` 本地 API 加请求来源检查：防 DNS rebinding 和跨站请求](2026-09-27-serve-request-guard.md)
+- [2026-09-25 权限模式开关：只读 / 工作区 / 全放行，默认工作区（照 dsh 的沙箱模式 + 审批策略预设）](2026-09-25-permission-mode.md)
+- [2026-09-25 新增 GitHub Actions：main 每次更新自动把版本号最后一位 +1（0.2.0 → 0.2.1）](2026-09-25-auto-bump-version.md)
+- [2026-09-25 控制面板消息可以引用到指挥台，照着一条消息拆任务派空间（引用过消息一律先出计划卡）](2026-09-25-message-to-command.md)
+- [2026-09-24 修复输入法选词按 Enter 被误判为发送/确认（指挥台漏判、Safari 兜底 keyCode 229）](2026-09-24-ime-enter-fix.md)
+- [2026-09-24 修正「追问已有会话」变更记录：补设计文档链接、更新 restoreDispatch 说明、补手动验证记录](2026-09-24-session-followup-changelog-fix.md)
+- [2026-09-24 指挥台调度者支持追问已有会话（recent_sessions / followup），会话加互斥锁](2026-09-24-command-session-followup.md)
+- [2026-09-24 斜杠命令补全：CLI 的 Tab 补全 + 网页的 / 菜单，顺手修复网页端 /技能名 调不到的 bug](2026-09-24-slash-completion.md)
+- [2026-09-24 README：安装前提醒 sa 和 macOS 自带命令撞名](2026-09-24-readme-sa-command-conflict-note.md)
 - [2026-09-24 修复 test_pinned_session_stays_on_top 在全量测试里的偶发失败（flaky）](2026-09-24-flaky-pinned-session-test-fix.md)
 - [2026-09-24 M8 第一部分：指挥台跨空间调度（调度者 + propose_plan/dispatch）+ 空间简介自动摘要](2026-09-24-command-dispatch.md)
 - [2026-09-24 空间新建后支持修改执行者，切换只影响新会话（老会话锁在原执行者，只读）](2026-09-24-space-change-executor.md)

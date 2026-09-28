@@ -123,8 +123,18 @@ tool_call → Registry.judge() → Policy.decide() ─┬─ ALLOW → 执行
                                                 └─ ASK   → Approver.request() → 允许 / 拒绝
 ```
 
-- `Policy` 是纯函数，无 IO。判定顺序固定：**工具禁用 → 路径越界 → bash 危险命令 → 默认等级**。
-  越界和危险命令必须排在默认等级之前，否则工具只要声明 `permission="allow"` 就能穿透边界。
+- `Policy` 无 IO。判定顺序固定：**工具禁用 → bash 危险命令 → 全放行模式 → 路径越界 → 默认等级 →
+  工作区模式放行文件改动**。危险命令排在模式之前（全放行也拦）；越界排在默认等级之前，
+  否则工具只要声明 `permission="allow"` 就能穿透边界。
+- **权限模式**（2026-09-25，照 dsh 的「沙箱模式 + 审批策略」预设）：`Policy.mode` 是一个旋钮，
+  取值 `Mode.READ_ONLY` / `WORKSPACE`（默认）/ `FULL`。模式定下每类调用放行、问还是拒；
+  「问」落到谁手里仍由前端挑的审批器决定，所以不需要单独的审批策略旋钮。
+  工作区模式只自动放行 `Scope.file_edit=True` 的调用（write_file / edit_file），bash 照样问：
+  没有 OS 沙箱就管不住一条命令写到哪里。`mode` 是可变属性，REPL 的 `/mode`、客户端的空间设置
+  直接改它，下一次工具调用起生效。默认值来自 `config.toml` 的 `[permissions].mode`；
+  无人值守（`sa run`、定时任务）不继承「全放行」（`PermissionsConfig.unattended`）；
+  客户端里每个空间的 `permission` 没设过就跟配置默认（`Space.effective_mode`）。
+  设计和改动记录见 [design/permission-mode.md](design/permission-mode.md)。
 - `Scope.paths` 只放**会被改动**的绝对路径；只读工具不报，因此不受工作目录边界限制
   （读 `~/.zshrc` 是日常需求，为它弹一次确认不划算）。`../` 要在 scope 里就 `resolve()` 掉。
 - bash 的危险命令清单刻意很窄：只拦「问了也不该答应」的——`rm -rf` 指向家目录 / 系统根目录 /
@@ -385,8 +395,10 @@ src/simpleagent/
   command/                ✅ 指挥台调度者：调度 prompt（空间清单）、propose_plan / dispatch 工具、
                           ✅ Dispatcher 协议（Runner 实现 run_child）（M8 第一部分，见 design/command-dispatch.md）
   spaces/describe.py      ✅ 空间简介的自动摘要：读 AGENTS.md / README / 顶层文件 / 会话标题，调一次模型
+  panel/quote.py          ✅ 引用控制面板消息：要求 + 引用块拼进一次输入，调度者照着派任务（见 design/message-to-command.md）
   ui/repl.py              ✅ 交互式 REPL（写操作终端确认；M5 起有 /mcp，M6 起有 /context、/compact，
-                          ✅ M7 起有 /memory、/skills、/prompt 和 /<技能名>）
+                          ✅ M7 起有 /memory、/skills、/prompt 和 /<技能名>）；命令表 COMMANDS
+  ui/complete.py          ✅ / 命令的 Tab 补全：readline 回调（兼容 libedit），补命令名、技能名和第一个参数
   ui/headless.py          ✅ `sa run`：无人值守单次执行，白名单审批
   ui/approve.py           ✅ ConsoleApprover：终端 y / a / 其他键拒绝
   ui/debug.py             ✅ debug 输出：API 调用与工具调用的过程，走 stderr（off / on / verbose / full）
