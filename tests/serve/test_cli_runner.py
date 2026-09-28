@@ -77,7 +77,10 @@ def test_cli_run_translates_events_and_records_everything(config, sa_home, tmp_p
 
     messages = store.load_session(space.id, session.id).messages
     assert messages[0] == {"role": "user", "content": "跑一下 pwd"}
-    assert messages[1]["role"] == "tool"
+    # 工具调用单独落了一条助手消息，刷新后历史里还知道调的是什么
+    (call,) = messages[1]["tool_calls"]
+    assert call["function"]["name"] == "bash"
+    assert messages[2]["role"] == "tool" and messages[2]["tool_call_id"] == call["id"]
     assert messages[-1]["role"] == "assistant"
     assert "当前目录是" in messages[-1]["content"]
 
@@ -86,6 +89,36 @@ def test_cli_run_translates_events_and_records_everything(config, sa_home, tmp_p
     assert argv[:3] == ["run", "--format", "json"]
     assert "--auto" not in argv
     assert argv[-1] == "跑一下 pwd"
+    runner.shutdown()
+
+
+def test_claude_history_keeps_tool_calls(config, sa_home, tmp_path, monkeypatch):
+    """claude 的真实样本：每个工具结果前面都落了对应的工具调用，id 对得上。
+
+    以前只落文本和结果，刷新后前端只能画出没名字、没参数的空白工具卡。
+    """
+    store = SpaceStore(sa_home)
+    space = _make_space(
+        store, tmp_path, monkeypatch, "claude-read-only.jsonl", executor="claude-code"
+    )
+    session = store.create_session(space.id)
+    runner = Runner(config, store=store)
+    runner.start()
+
+    runner.run_input(space.id, session.id, "total() 会不会出错？")
+    frames = _run_until_settled(runner, session.id)
+    assert frames[-1].payload["status"] == "done"
+
+    messages = store.load_session(space.id, session.id).messages
+    seen: dict[str, str] = {}  # call_id -> 工具名
+    for m in messages:
+        for tc in m.get("tool_calls") or []:
+            seen[tc["id"]] = tc["function"]["name"]
+        if m["role"] == "tool":
+            assert m["tool_call_id"] in seen, "工具结果前面没有对应的工具调用"
+    assert list(seen.values()) == ["Glob", "Read", "Read", "Read"]
+    texts = [m["content"] for m in messages if m["role"] == "assistant" and m.get("content")]
+    assert texts[0].startswith("我的查法") and texts[-1].startswith("项目只有三个文件")
     runner.shutdown()
 
 

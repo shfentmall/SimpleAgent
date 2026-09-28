@@ -34,10 +34,7 @@ const state = {
   running: false,
   startedAt: null,     // 本轮开始时间，用于显示已用时
   noReplyTimer: null,  // 兜底：发出去之后一直没有任何帧就提醒
-  acc: "",           // 当前助手消息的累积文本
-  accEl: null,       // 累积文本渲染到的元素
-  streamEl: null,    // 流式时的光标占位容器
-  toolCards: new Map(),   // call_id -> { body, toggle }
+  turn: null,        // 正在接帧的这一轮助手回复（见 newTurn），跑完就清空
   showAll: new Set(),     // 展开了「查看全部」的空间 id
   collapsed: new Set(JSON.parse(localStorage.getItem(LS_COLLAPSED) || "[]")),  // 折叠的空间 id
   filter: "",
@@ -409,13 +406,14 @@ function renderHeader() {
 }
 
 /* ────────────────────────────── 消息流 ────────────────────────────── */
+/* 一轮助手回复画成一个气泡：上面一条「过程」折叠条（说过的话、思考、每次工具调用），
+   下面是最终回答。哪段算过程、哪段算回答见 turns.js；运行中和看历史用同一套画法。
+   过程默认收着：运行中折叠条上显示做到第几步、在做什么，点它才展开。 */
+const T = window.SATurns;
+
 function clearStream() {
-  const box = streamEl();
-  box.innerHTML = "";
-  state.toolCards.clear();
-  state.acc = "";
-  state.accEl = null;
-  state.streamEl = null;
+  streamEl().innerHTML = "";
+  state.turn = null;
 }
 
 function addUserBubble(text) {
@@ -426,20 +424,181 @@ function addUserBubble(text) {
   el.innerHTML = `<div class="avatar">你</div><div class="body"><div class="who">用户</div><div class="text"></div></div>`;
   el.querySelector(".text").textContent = text;
   box.appendChild(el);
+  state.turn = null;  // 之后的帧开新的一轮
   scrollDown();
 }
 
-function ensureAssistantBubble() {
-  if (state.accEl) return state.accEl;
+/* 空间目录：工具参数里的绝对路径在这个目录下的，显示成相对路径 */
+function spaceCwd() {
+  const sp = findSpace(state.spaceId);
+  return (sp && sp.cwd) || "";
+}
+
+/* 开一轮：头像 + 过程（折叠条 + 明细）+ 审批卡 + 回答 + 错误 */
+function newTurn({ live = true } = {}) {
   const box = streamEl();
   $("empty-state")?.remove();
   const el = document.createElement("div");
   el.className = "msg assistant";
-  el.innerHTML = `<div class="avatar">AI</div><div class="body"><div class="who">助手</div><div class="text md"></div></div>`;
+  el.innerHTML = `<div class="avatar">AI</div><div class="body"><div class="who">助手</div>
+    <div class="proc hidden">
+      <button class="proc-head" type="button"><span class="chev">▶</span><span class="proc-label"></span><span class="proc-toggle">展开</span></button>
+      <div class="proc-body"></div>
+    </div>
+    <div class="turn-cards"></div>
+    <div class="text md answer"></div>
+    <div class="turn-tail"></div></div>`;
   box.appendChild(el);
-  state.accEl = el.querySelector(".text");
-  state.streamEl = el;
-  return state.accEl;
+  const turn = {
+    live,
+    proc: el.querySelector(".proc"),
+    label: el.querySelector(".proc-label"),
+    toggle: el.querySelector(".proc-toggle"),
+    body: el.querySelector(".proc-body"),
+    cards: el.querySelector(".turn-cards"),
+    answerEl: el.querySelector(".answer"),
+    tail: el.querySelector(".turn-tail"),
+    steps: [],            // 和 turns.js 的 steps 同一个形状，折叠条上的汇总用它算
+    tools: new Map(),     // call_id -> { step, out, mark, meta }
+    answer: "",           // 最后一次工具调用之后的文字：再来工具调用就挪进过程
+    think: null,          // 正在流的思考内容 { step, el }
+    waiting: 0,           // 还没处理的审批卡
+    startedAt: state.startedAt || Date.now(),
+    seconds: null,        // 收尾时定下来的用时；看历史时不知道
+  };
+  el.querySelector(".proc-head").onclick = () =>
+    setProcOpen(turn, !turn.proc.classList.contains("is-open"));
+  return turn;
+}
+
+function ensureTurn() {
+  if (!state.turn) state.turn = newTurn();
+  return state.turn;
+}
+
+function setProcOpen(turn, open) {
+  turn.proc.classList.toggle("is-open", open);
+  turn.toggle.textContent = open ? "收起" : "展开";
+}
+
+/* 折叠条上那句话。运行中：处理中 · 第几步 · 在做什么 · 已用时；结束后：做了哪些事 · 用时 */
+function renderProcHead(turn) {
+  const tools = turn.steps.filter((s) => s.kind === "tool");
+  turn.proc.classList.toggle("hidden", !turn.steps.length && !turn.waiting);
+  const parts = [];
+  if (turn.live) {
+    parts.push(turn.waiting
+      ? `<span class="wait">⏸ 等你批准</span>`
+      : `<span class="live">◐ 处理中</span>`);
+    if (tools.length) parts.push(`第 ${tools.length} 步`);
+    const last = turn.steps[turn.steps.length - 1];
+    if (last && last.kind === "tool" && !last.done) {
+      const brief = T.toolBrief(last.name, last.args, spaceCwd());
+      parts.push(escapeHtml(`${T.toolLabel(last.name)} ${brief}`.trim()));
+    } else if (turn.think || (last && last.kind === "tool" && !turn.answer)) {
+      parts.push("思考中");  // 在想下一步：工具都跑完了、还没开始说话
+    }
+    parts.push(`<span class="dim">${fmtDur(Math.floor((Date.now() - turn.startedAt) / 1000))}</span>`);
+  } else {
+    const what = T.summarize(turn.steps, spaceCwd())
+      || (turn.steps.some((s) => s.kind === "think") && !tools.length ? "思考过程" : "");
+    parts.push(what ? `过程 · ${escapeHtml(what)}` : "过程");
+    const bad = tools.filter((s) => s.isError).length;
+    if (bad) parts.push(`<span class="err">${bad} 步出错</span>`);
+    if (turn.seconds !== null) parts.push(`<span class="dim">${fmtDur(turn.seconds)}</span>`);
+  }
+  turn.label.innerHTML = parts.join(" · ");
+}
+
+/* 过程里加一步。工具是一行（名字 + 关键参数 + 结果行数），点这一行才展开参数和输出 */
+function addStep(turn, step) {
+  turn.steps.push(step);
+  let el;
+  if (step.kind === "tool") {
+    el = document.createElement("div");
+    el.className = "step";
+    el.innerHTML = `<div class="step-row"><span class="mark"></span><span class="tname"></span>
+      <span class="brief"></span><span class="meta"></span></div><div class="step-out hidden"></div>`;
+    const row = el.querySelector(".step-row");
+    el.querySelector(".tname").textContent = T.toolLabel(step.name);
+    el.querySelector(".brief").textContent = T.toolBrief(step.name, step.args, spaceCwd());
+    const ref = { step, out: el.querySelector(".step-out"), mark: el.querySelector(".mark"), meta: el.querySelector(".meta") };
+    row.onclick = () => {
+      ref.out.classList.toggle("hidden");
+      if (!ref.out.classList.contains("hidden")) fillStepOut(ref);
+    };
+    if (step.id) turn.tools.set(step.id, ref);
+    paintStep(ref);
+  } else if (step.kind === "think") {
+    el = document.createElement("div");
+    el.className = "think";
+    el.textContent = step.text;
+  } else {
+    el = document.createElement("div");
+    el.className = "narr md";
+    el.innerHTML = renderMarkdown(step.text);
+  }
+  turn.body.appendChild(el);
+  renderProcHead(turn);
+  return el;
+}
+
+function paintStep(ref) {
+  const s = ref.step;
+  const [mark, cls] = !s.done ? ["◐", "run"] : s.cancelled ? ["–", "off"] : s.isError ? ["✗", "fail"] : ["✓", "ok"];
+  ref.mark.textContent = mark;
+  ref.mark.className = `mark ${cls}`;
+  const lines = s.result ? s.result.replace(/\n+$/, "").split("\n").length : 0;
+  ref.meta.textContent = !s.done ? "…" : s.cancelled ? "未完成" : s.isError ? "出错" : lines ? `${lines} 行` : "完成";
+  if (!ref.out.classList.contains("hidden")) fillStepOut(ref);
+}
+
+/* 展开后的内容现用现画：工具输出可能很长，收着的时候不占 DOM */
+function fillStepOut(ref) {
+  const s = ref.step;
+  let args = s.args || "";
+  try { args = JSON.stringify(JSON.parse(args || "{}"), null, 2); } catch { /* 原样显示 */ }
+  ref.out.innerHTML = "";
+  if (args && args !== "{}") {
+    const a = document.createElement("div");
+    a.className = "step-args";
+    a.textContent = args.length > 4000 ? `${args.slice(0, 4000)}\n…` : args;
+    ref.out.appendChild(a);
+  }
+  const r = document.createElement("div");
+  r.textContent = s.done ? (s.result || "（没有输出）") : "运行中…";
+  ref.out.appendChild(r);
+}
+
+/* 来了工具调用：前面那段文字原来是「边做边说」，从回答区挪进过程 */
+function demoteAnswer(turn) {
+  if (turn.answer.trim()) addStep(turn, { kind: "text", text: turn.answer });
+  turn.answer = "";
+  turn.answerEl.innerHTML = "";
+}
+
+/* 一轮收尾：去掉光标、定下用时、没跑完的工具标成未完成。
+   有回答时过程保持收着；没有回答（出错、中断）就把过程摊开，这时过程就是全部内容 */
+function finishTurn(turn, { timed = true } = {}) {
+  if (!turn) return;
+  turn.live = false;
+  turn.think = null;
+  if (timed) turn.seconds = Math.floor((Date.now() - turn.startedAt) / 1000);
+  turn.answerEl.innerHTML = turn.answer ? renderMarkdown(turn.answer) : "";
+  for (const ref of turn.tools.values()) {
+    if (!ref.step.done) { Object.assign(ref.step, { done: true, cancelled: true }); paintStep(ref); }
+  }
+  // 一轮结束时还没处理的审批（中途停止、出错）已经作废：按钮去掉，收进过程
+  for (const card of [...turn.cards.children]) {
+    card.querySelector("div").textContent = `未处理 · ${card.dataset.tool || ""}（这一轮已经结束）`;
+    card.querySelector("button")?.parentElement.remove();
+    card.classList.add("is-done");
+    turn.body.appendChild(card);
+  }
+  turn.waiting = 0;
+  if (!turn.answer.trim() && turn.steps.length) setProcOpen(turn, true);
+  renderProcHead(turn);
+  if (state.turn === turn) state.turn = null;
 }
 
 /* 流式光标放进最后一个块的末尾（段落、列表项、代码块里），不要另起一行。
@@ -453,43 +612,14 @@ function placeCursor(el) {
   host.insertAdjacentHTML("beforeend", '<span class="cursor">&nbsp;</span>');
 }
 
-/* 收尾时按完整文本再渲染一遍去掉光标：外部 CLI 执行者不一定先发 message_done 再发工具调用 */
-function finishAssistantBubble() {
-  if (state.accEl) state.accEl.innerHTML = renderMarkdown(state.acc);
-  state.acc = "";
-  state.accEl = null;
-  state.streamEl = null;
-}
-
-function addToolCard(name, argsText, callId) {
-  const box = streamEl();
-  $("empty-state")?.remove();
-  const card = document.createElement("div");
-  card.className = "card";
-  card.innerHTML = `
-    <div class="card-head"><span class="name">${escapeHtml(name)}</span>
-      <span class="args">${escapeHtml(shortPath(argsText, 60))}</span>
-      <span class="tail">展开</span></div>
-    <div class="card-body hidden"></div>`;
-  const body = card.querySelector(".card-body");
-  const tail = card.querySelector(".tail");
-  card.querySelector(".card-head").onclick = () => {
-    body.classList.toggle("hidden");
-    tail.textContent = body.classList.contains("hidden") ? "展开" : "收起";
-  };
-  box.appendChild(card);
-  if (callId) state.toolCards.set(callId, { card, body });
-  scrollDown();
-  return { card, body };
-}
-
+/* 出错、达到步数上限这类：跟在这一轮的回答后面；不在某一轮里（加载失败、发送失败）就接在最后 */
 function addErrorCard(text) {
   const box = streamEl();
   $("empty-state")?.remove();
   const el = document.createElement("div");
   el.className = "card is-error";
   el.textContent = text;
-  box.appendChild(el);
+  (state.turn ? state.turn.tail : box).appendChild(el);
   scrollDown();
 }
 
@@ -503,11 +633,13 @@ function planHtml(argsText) {
   return `<div class="plan">${plan.summary ? `<div class="plan-sum">${escapeHtml(plan.summary)}</div>` : ""}<ol>${steps}</ol></div>`;
 }
 
+/* 审批卡要人操作，不收进过程：放在折叠条和回答之间。处理完挪进过程，留个记录 */
 function addApprovalCard(approvalId, toolName, argsText, reason) {
-  const box = streamEl();
+  const turn = ensureTurn();
   const el = document.createElement("div");
   el.className = "card is-approval";
   el.dataset.approval = approvalId;
+  el.dataset.tool = toolName;
   // 计划每次都要人看：不给「始终允许」
   const isPlan = toolName === "propose_plan";
   el.innerHTML = `
@@ -523,12 +655,22 @@ function addApprovalCard(approvalId, toolName, argsText, reason) {
     b.onclick = async () => {
       try {
         await api.post(`/api/approvals/${approvalId}`, { action: b.dataset.act });
-        el.querySelectorAll("button").forEach((x) => (x.disabled = true));
-        el.querySelector("div").textContent = `已处理：${b.textContent}`;
+        // 收成一条记录挪进过程：普通审批只留一行（参数上面那一行已经有了），计划卡留着计划
+        const head = el.querySelector("div");
+        head.textContent = `已处理：${b.textContent} · ${toolName}`;
+        for (const child of [...el.children]) {
+          if (child !== head && (!isPlan || child.querySelector("button"))) child.remove();
+        }
+        el.classList.add("is-done");
+        turn.body.appendChild(el);
+        turn.waiting = Math.max(0, turn.waiting - 1);
+        renderProcHead(turn);
       } catch (e) { toast(`提交失败：${e.message}`); }
     };
   });
-  box.appendChild(el);
+  turn.cards.appendChild(el);
+  turn.waiting += 1;
+  renderProcHead(turn);
   scrollDown();
 }
 
@@ -539,41 +681,27 @@ function scrollDown(force) {
   if (force || nearBottom) box.scrollTop = box.scrollHeight;
 }
 
-/* 历史消息 → 气泡。assistant 带 tool_calls 时画成工具卡，tool 消息回填到对应卡片。 */
-function renderHistory(messages) {
+/* 历史消息 → 一轮一轮画出来。会话还在跑时，最后一轮留着接后面的帧 */
+function renderHistory(messages, { running = false } = {}) {
   clearStream();
   const box = streamEl();
   if (!messages.length) {
-    box.innerHTML = `<div class="empty"><div class="empty-title">新会话</div>
+    box.innerHTML = `<div class="empty" id="empty-state"><div class="empty-title">新会话</div>
       <div class="empty-sub">在下面输入第一句话。</div></div>`;
     return;
   }
-  for (const m of messages) {
-    if (m.role === "user") {
-      addUserBubble(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
-    } else if (m.role === "assistant") {
-      if (m.content) {
-        const el = document.createElement("div");
-        el.className = "msg assistant";
-        el.innerHTML = `<div class="avatar">AI</div><div class="body"><div class="who">助手</div>
-          <div class="text md">${renderMarkdown(m.content)}</div></div>`;
-        box.appendChild(el);
-      }
-      for (const tc of m.tool_calls || []) {
-        const args = tc.function ? tc.function.arguments : "";
-        addToolCard(tc.function ? tc.function.name : "tool", args, tc.id);
-      }
-    } else if (m.role === "tool") {
-      const hit = state.toolCards.get(m.tool_call_id);
-      const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-      if (hit) {
-        hit.body.textContent = text;
-        hit.body.classList.remove("hidden");
-      } else {
-        addToolCard(m.name || "tool", "", m.tool_call_id).body.textContent = text;
-      }
-    }
-  }
+  const turns = T.groupTurns(messages);
+  turns.forEach((t, i) => {
+    if (t.user !== null) addUserBubble(t.user);
+    if (!t.steps.length && !t.answer) return;
+    const live = running && i === turns.length - 1;
+    const turn = newTurn({ live });
+    for (const s of t.steps) addStep(turn, s);
+    turn.answer = t.answer;
+    turn.answerEl.innerHTML = t.answer ? renderMarkdown(t.answer) : "";
+    if (live) state.turn = turn;
+    else finishTurn(turn, { timed: false });
+  });
   scrollDown();
 }
 
@@ -610,37 +738,45 @@ async function onFrame(type, frame) {
   const p = frame.payload || {};
 
   if (type === "text_delta") {
-    state.acc += p.text || "";
-    const el = ensureAssistantBubble();
-    el.innerHTML = renderMarkdown(state.acc);
-    placeCursor(el);
+    // 先当回答显示；后面要是来了工具调用，再挪进过程（demoteAnswer）
+    const turn = ensureTurn();
+    turn.think = null;
+    turn.answer += p.text || "";
+    turn.answerEl.innerHTML = renderMarkdown(turn.answer);
+    placeCursor(turn.answerEl);
     scrollDown();
   } else if (type === "reasoning_delta") {
-    let d = state.streamEl && state.streamEl.querySelector("details.reasoning");
-    if (!d) {
-      ensureAssistantBubble();
-      d = document.createElement("details");
-      d.className = "reasoning";
-      d.innerHTML = `<summary>思考过程</summary><div></div>`;
-      state.streamEl.querySelector(".body").appendChild(d);
+    const turn = ensureTurn();
+    if (!turn.think) {
+      const step = { kind: "think", text: "" };
+      turn.think = { step, el: addStep(turn, step) };
+      renderProcHead(turn);
     }
-    d.querySelector("div").textContent += p.text || "";
+    turn.think.step.text += p.text || "";
+    turn.think.el.textContent = turn.think.step.text;
   } else if (type === "tool_call_start") {
-    finishAssistantBubble();
+    const turn = ensureTurn();
+    turn.think = null;
+    demoteAnswer(turn);
     const args = typeof p.arguments === "string" ? p.arguments : JSON.stringify(p.arguments);
-    addToolCard(p.name, args, p.call_id);
-  } else if (type === "tool_result") {
-    const hit = state.toolCards.get(p.call_id);
-    if (hit) {
-      hit.body.textContent = p.content || "";
-      hit.body.classList.remove("hidden");
-      hit.card.classList.toggle("is-error", !!p.is_error);
-    } else {
-      addToolCard(p.name || "tool", "", p.call_id).body.textContent = p.content || "";
-    }
+    addStep(turn, { kind: "tool", id: p.call_id, name: p.name, args, result: "", isError: false, done: false });
     scrollDown();
+  } else if (type === "tool_result") {
+    const turn = ensureTurn();
+    let ref = turn.tools.get(p.call_id);
+    if (!ref) {
+      addStep(turn, { kind: "tool", id: p.call_id, name: p.name || "工具", args: "", done: false });
+      ref = turn.tools.get(p.call_id);
+    }
+    if (ref) {
+      Object.assign(ref.step, { result: p.content || "", isError: !!p.is_error, done: true });
+      paintStep(ref);
+    }
+    renderProcHead(turn);
   } else if (type === "message_done") {
-    finishAssistantBubble();
+    // 这段文字说完了（去掉光标）；它是不是最终回答，要等后面有没有工具调用
+    const turn = state.turn;
+    if (turn && turn.answer) turn.answerEl.innerHTML = renderMarkdown(turn.answer);
     if (p.usage) updateUsage(p.usage);
     await refreshSessions();
   } else if (type === "status") {
@@ -655,12 +791,15 @@ async function onFrame(type, frame) {
         ? `${STATUS_TEXT[p.status]}，用时 ${fmtDur(sec)}`
         : (STATUS_TEXT[p.status] || p.status);
     }
+    // 跑完（验证是另一回事，头部有自己的状态）：这一轮收尾，过程收成一行
+    if (p.status !== "running") finishTurn(state.turn);
     renderHeader();
     if (p.status !== "running") await refreshSessions();
   } else if (type === "error") {
     state.running = false;
     state.startedAt = null;
     addErrorCard(p.message || "出错了");
+    finishTurn(state.turn);
     renderHeader();
   } else if (type === "max_steps") {
     addErrorCard(`达到最大步数（${p.max_steps}）已停止。`);
@@ -744,7 +883,7 @@ async function selectSession(spaceId, sessionId) {
   try {
     const data = await api.get(`/api/sessions/${sessionId}`);
     state.messages = data.messages || [];
-    renderHistory(state.messages);
+    renderHistory(state.messages, { running: state.running });
     scrollDown(true);
     if (typeof data.seq === "number") seq = data.seq;
   } catch (e) {
@@ -1655,6 +1794,8 @@ async function rerun() {
   if (!state.sessionId) return;
   try {
     const r = await api.post(`/api/sessions/${state.sessionId}/rerun`, {});
+    // 服务端把这句话又落了一条用户消息：界面上也补一条，之后的帧才是新的一轮
+    addUserBubble(r.text);
     state.running = true;
     state.startedAt = Date.now();
     $("status-hint").textContent = "重跑中…";
@@ -2228,12 +2369,13 @@ async function boot() {
     pollInbox();  // 在后台时跳过的那几轮补上
   });
 
-  // 运行中每秒刷新一次「已用时」
+  // 运行中每秒刷新一次「已用时」（输入框下面和折叠条上各一处）
   setInterval(() => {
     if (state.running && state.startedAt) {
       $("status-hint").textContent =
         `${STATUS_TEXT.running}… ${fmtDur(Math.floor((Date.now() - state.startedAt) / 1000))}`;
     }
+    if (state.turn && state.turn.live) renderProcHead(state.turn);
   }, 1000);
 
   // 回到上次打开的会话（刷新页面不该丢上下文）

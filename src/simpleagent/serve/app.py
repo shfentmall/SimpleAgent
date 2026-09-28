@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import queue
 import re
@@ -802,6 +803,69 @@ def file_tree(root: Path, depth: int = 2, limit: int = 300) -> list[dict[str, An
     return [{"name": root.name, "path": str(root), "type": "dir", "children": top}]
 
 
+# ----------------------------------------------------------------------- 请求来源检查
+# 会改状态的方法：除了 Host，还要查 Origin 和 Content-Type
+WRITE_METHODS = frozenset({"POST", "PATCH", "DELETE"})
+
+
+def host_allowed(host: str) -> bool:
+    """Host 头（去掉端口后）是不是 localhost、*.localhost 或字面 IP。
+
+    防 DNS rebinding：恶意网页把自己的域名解析到 127.0.0.1 后，浏览器会把它当同源，
+    能读写整个 API，但发来的 Host 仍是那个域名。localhost 和字面 IP 外人改不了解析，
+    所以只放这几种。缺 Host 头（HTTP/1.0 老客户端）也拒。
+    """
+    host = host.strip().lower()
+    if host.startswith("["):  # IPv6 必须带方括号：[::1]:8384
+        name, bracket, rest = host[1:].partition("]")
+        if not bracket or (rest and not (rest[0] == ":" and rest[1:].isdigit())):
+            return False
+        try:
+            return ipaddress.ip_address(name).version == 6
+        except ValueError:
+            return False
+    name, sep, port = host.partition(":")
+    if sep and not port.isdigit():
+        return False
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(name).version == 4
+    except ValueError:
+        return False
+
+
+def _same_origin(origin: str, host: str) -> bool:
+    """Origin 的 host:port 和请求的 Host 一致才算同源。Origin 为 "null"（沙箱 iframe、file://）不算。"""
+    parsed = urlparse(origin)
+    return parsed.scheme in ("http", "https") and parsed.netloc.lower() == host.strip().lower()
+
+
+def check_request(method: str, headers: dict[str, str], body: bytes) -> Response | None:
+    """路由之前的来源检查，不通过就返回错误响应；headers 的键已经是小写。
+
+    - Host 不在白名单 → 403，挡 DNS rebinding
+    - 写请求带了跨站 Origin → 403
+    - 写请求带 body 却不是 application/json → 415。text/plain 的 POST 属于「简单请求」，
+      跨站 fetch(mode: "no-cors") 不经过 CORS 预检就能发过来；要求 JSON 就逼它先预检，
+      而本服务不回 CORS 头，预检必然失败。
+
+    放在 HTTP 层而不是 Server.handle 里：单测直接调 handle 时不必伪造这些头。
+    """
+    host = headers.get("host", "")
+    if not host_allowed(host):
+        return Response(403, {"error": "host not allowed"})
+    if method not in WRITE_METHODS:
+        return None
+    origin = headers.get("origin")
+    if origin is not None and not _same_origin(origin, host):
+        return Response(403, {"error": "origin not allowed"})
+    media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if body and media_type != "application/json":
+        return Response(415, {"error": "content-type must be application/json"})
+    return None
+
+
 # ----------------------------------------------------------------------- 适配 http.server
 def _make_handler(app: Server):
     class Handler(BaseHTTPRequestHandler):
@@ -824,8 +888,12 @@ def _make_handler(app: Server):
             headers = {k.lower(): v for k, v in self.headers.items()}
             headers["x-query"] = parsed.query
             length = int(headers.get("content-length", 0) or 0)
+            # 被拒的请求也先把 body 读完：直接关掉还有没读数据的连接，内核会回 RST，
+            # 客户端可能收不到这个 403 / 415
             body = self.rfile.read(length) if length else b""
-            resp = app.handle(method, parsed.path, headers, body)
+            resp = check_request(method, headers, body) or app.handle(
+                method, parsed.path, headers, body
+            )
 
             self.send_response(resp.status)
             for k, v in resp.headers.items():
