@@ -59,6 +59,7 @@
 - [2026-09-24 指挥台调度者支持追问已有会话（recent_sessions / followup），会话加互斥锁](2026-09-24-command-session-followup.md)
 - [2026-09-24 斜杠命令补全：CLI 的 Tab 补全 + 网页的 / 菜单，顺手修复网页端 /技能名 调不到的 bug](2026-09-24-slash-completion.md)
 - [2026-09-24 README：安装前提醒 sa 和 macOS 自带命令撞名](2026-09-24-readme-sa-command-conflict-note.md)
+- [2026-09-24 修复 test_pinned_session_stays_on_top 在全量测试里的偶发失败（flaky）](2026-09-24-flaky-pinned-session-test-fix.md)
 - [2026-09-24 M8 第一部分：指挥台跨空间调度（调度者 + propose_plan/dispatch）+ 空间简介自动摘要](2026-09-24-command-dispatch.md)
 - [2026-09-24 空间新建后支持修改执行者，切换只影响新会话（老会话锁在原执行者，只读）](2026-09-24-space-change-executor.md)
 - [2026-09-23 M7 完成：项目指令（AGENTS.md）+ 长期记忆（memory/）+ 技能（SKILL.md）](2026-09-23-m7-memory-skills-instructions.md)
