@@ -14,6 +14,7 @@ const FRAME_TYPES = [
 ];
 
 const LS_KEY = "sa.workbench.current";   // 记住上次打开的会话，刷新后自动回到原位
+const LS_COLLAPSED = "sa.workbench.collapsed";   // 左栏折叠起来的空间 id，刷新后保持
 
 /* 这次按键是不是输入法在用：选词、把拼音串原样上屏时按的 Enter 是确认候选，不是发送。
    Chrome / Firefox 里这次 keydown 的 isComposing 是 true；Safari 先发 compositionend
@@ -38,6 +39,7 @@ const state = {
   streamEl: null,    // 流式时的光标占位容器
   toolCards: new Map(),   // call_id -> { body, toggle }
   showAll: new Set(),     // 展开了「查看全部」的空间 id
+  collapsed: new Set(JSON.parse(localStorage.getItem(LS_COLLAPSED) || "[]")),  // 折叠的空间 id
   filter: "",
   tab: "chat",            // 当前右栏 tab
   editingSpace: null,     // 向导处于「空间设置」模式时是那个空间，新建时为 null
@@ -187,10 +189,13 @@ function renderSpaces() {
         }/${vs.length}</span>`
       : "";
 
+    // 搜索时一律展开，不然匹配的会话藏在折叠的空间里看不到
+    const collapsed = !filter && state.collapsed.has(sp.id);
     const card = document.createElement("div");
-    card.className = "space is-open";
+    card.className = "space is-open" + (collapsed ? " is-collapsed" : "");
     card.innerHTML = `
-      <div class="space-head">
+      <div class="space-head" title="${collapsed ? "展开" : "折叠"}">
+        <span class="caret">${collapsed ? "▸" : "▾"}</span>
         <span class="space-name">${escapeHtml(sp.name)}</span>
         <span class="badge ${cls}">${label}</span>
         ${danger}
@@ -261,6 +266,12 @@ function renderSpaces() {
       list.appendChild(more);
     }
 
+    card.querySelector(".space-head").onclick = () => {
+      if (state.collapsed.has(sp.id)) state.collapsed.delete(sp.id);
+      else state.collapsed.add(sp.id);
+      localStorage.setItem(LS_COLLAPSED, JSON.stringify([...state.collapsed]));
+      renderSpaces();
+    };
     card.querySelector('[data-act="new-session"]').onclick = (ev) => {
       ev.stopPropagation();
       newSession(sp.id);
