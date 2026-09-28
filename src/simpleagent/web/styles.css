@@ -143,7 +143,7 @@ body {
 
 .sessions { margin-top: 4px; display: flex; flex-direction: column; gap: 0; }
 .session {
-  display: flex; align-items: center; gap: 6px; padding: 2px 6px; line-height: 1.35;
+  display: flex; align-items: center; gap: 6px; padding: 3px 6px; line-height: 1.35;
   border-radius: 5px; cursor: pointer; font-size: 12px; color: var(--text-2);
 }
 .session:hover { background: var(--bg); }
