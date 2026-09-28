@@ -50,6 +50,7 @@
 
 ## 索引
 
+- [2026-09-28 左栏空间可折叠，会话行更紧凑](2026-09-28-sidebar-space-collapse.md)
 - [2026-09-27 `sa serve` 本地 API 加请求来源检查：防 DNS rebinding 和跨站请求](2026-09-27-serve-request-guard.md)
 - [2026-09-25 权限模式开关：只读 / 工作区 / 全放行，默认工作区（照 dsh 的沙箱模式 + 审批策略预设）](2026-09-25-permission-mode.md)
 - [2026-09-25 新增 GitHub Actions：main 每次更新自动把版本号最后一位 +1（0.2.0 → 0.2.1）](2026-09-25-auto-bump-version.md)
