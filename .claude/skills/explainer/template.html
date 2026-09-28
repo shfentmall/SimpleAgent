@@ -1,0 +1,642 @@
+<!-- /explainer 的样板：2026-09-24「指挥台调度」原理图（用户点名喜欢的风格）。复制后只换内容，保留整段 <style> 和各组件的 class。 -->
+<title>指挥台调度</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --panel-2: #fbfcfd;
+    --line: #e4e7ec;
+    --line-strong: #d3d8e0;
+    --ink: #1f2328;
+    --ink-2: #5b6472;
+    --ink-3: #8b95a3;
+    --accent: #2f6feb;
+    --accent-soft: #eaf1fe;
+    --green: #1a7f45;
+    --green-soft: #e7f5ed;
+    --red: #c0392b;
+    --amber: #9a6700;
+    --amber-soft: #fdf3e0;
+    --blue: #1b64c9;
+    --blue-soft: #e9f1fd;
+    --purple: #6b3fa0;
+    --purple-soft: #f3ecfb;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", "Helvetica Neue", Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #121418;
+      --panel: #1a1d23;
+      --panel-2: #20242b;
+      --line: #2a2f37;
+      --line-strong: #3a414c;
+      --ink: #e7eaef;
+      --ink-2: #a8b0bc;
+      --ink-3: #737d8b;
+      --accent: #6e9bff;
+      --accent-soft: #1b2a45;
+      --green: #4cc38a;
+      --green-soft: #13291f;
+      --red: #ef7a6d;
+      --amber: #e3ad4f;
+      --amber-soft: #33270f;
+      --blue: #7aa7ff;
+      --blue-soft: #172641;
+      --purple: #bb94ee;
+      --purple-soft: #2a1f3b;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #121418;
+    --panel: #1a1d23;
+    --panel-2: #20242b;
+    --line: #2a2f37;
+    --line-strong: #3a414c;
+    --ink: #e7eaef;
+    --ink-2: #a8b0bc;
+    --ink-3: #737d8b;
+    --accent: #6e9bff;
+    --accent-soft: #1b2a45;
+    --green: #4cc38a;
+    --green-soft: #13291f;
+    --red: #ef7a6d;
+    --amber: #e3ad4f;
+    --amber-soft: #33270f;
+    --blue: #7aa7ff;
+    --blue-soft: #172641;
+    --purple: #bb94ee;
+    --purple-soft: #2a1f3b;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 15px/1.7 var(--sans);
+  }
+  .wrap {
+    max-width: 960px;
+    margin: 0 auto;
+    padding-inline: 20px;
+    padding-block: 40px 56px;
+    display: flex;
+    flex-direction: column;
+    gap: 48px;
+  }
+
+  /* ── 开头 ── */
+  .eyebrow {
+    margin: 0 0 10px;
+    font: 500 12px/1.4 var(--mono);
+    letter-spacing: 0.06em;
+    color: var(--amber);
+  }
+  h1 {
+    margin: 0;
+    font-size: clamp(26px, 4.4vw, 34px);
+    line-height: 1.28;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+  .lede {
+    margin: 16px 0 0;
+    max-width: 62ch;
+    font-size: 16px;
+    color: var(--ink-2);
+  }
+  .terms {
+    margin: 28px 0 0;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .terms div { background: var(--panel); padding: 14px 16px 16px; }
+  .terms dt { font-weight: 700; display: flex; align-items: center; gap: 8px; }
+  .terms dd { margin: 4px 0 0; font-size: 13.5px; color: var(--ink-2); line-height: 1.65; }
+
+  /* ── 分节 ── */
+  section > h2 {
+    margin: 0;
+    font-size: 21px;
+    line-height: 1.35;
+    font-weight: 750;
+    text-wrap: balance;
+  }
+  section > .intro {
+    margin: 8px 0 18px;
+    max-width: 64ch;
+    color: var(--ink-2);
+  }
+  .ask {
+    margin: 14px 0 18px;
+    padding: 12px 16px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    max-width: 64ch;
+  }
+  .ask small { display: block; color: var(--ink-3); font-size: 12px; margin-bottom: 2px; }
+
+  figure { margin: 0; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px 20px 16px;
+  }
+  .scroll { overflow-x: auto; }
+  .scroll svg { display: block; width: 100%; height: auto; }
+  .scroll svg.w640 { min-width: 640px; }
+  .scroll svg.w720 { min-width: 720px; }
+  figcaption {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+    font-size: 13px;
+    color: var(--ink-2);
+    line-height: 1.7;
+  }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 6px; color: var(--ink-3); font-size: 12.5px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend svg { width: 26px; height: 8px; flex: none; }
+
+  /* ── 图里的元素 ── */
+  svg text { font-family: var(--sans); }
+  .t-name { font-size: 15px; font-weight: 600; fill: var(--ink); }
+  .t-sub { font-size: 11px; fill: var(--ink-2); }
+  .t-lbl { font-size: 12px; fill: var(--ink-2); }
+  .t-h { font-size: 14px; font-weight: 700; fill: var(--ink-2); }
+  .t-cap { font-size: 13px; fill: var(--ink-2); }
+  .t-mono { font-family: var(--mono); font-size: 12.5px; fill: var(--ink); }
+  .t-small { font-size: 11px; fill: var(--ink-3); }
+  .c-cmd { fill: var(--amber); }
+  .c-ok { fill: var(--green); }
+  .c-acc { fill: var(--accent); }
+  .c-ink { fill: var(--ink); }
+  .fw { font-weight: 600; }
+  .halo { paint-order: stroke; stroke: var(--panel); stroke-width: 5px; stroke-linejoin: round; }
+
+  .n-you { fill: var(--panel); stroke: var(--ink); stroke-width: 1.5; }
+  .n-cmd { fill: var(--amber-soft); stroke: var(--amber); stroke-width: 1.5; }
+  .n-sa { fill: var(--blue-soft); stroke: var(--blue); stroke-width: 1; }
+  .n-cc { fill: var(--purple-soft); stroke: var(--purple); stroke-width: 1; }
+  .n-ok { fill: var(--green-soft); stroke: var(--green); stroke-width: 1; }
+  .n-note { fill: var(--panel-2); stroke: var(--line-strong); stroke-width: 1; }
+
+  .e-send { stroke: var(--ink); stroke-width: 1.5; fill: none; }
+  .e-back { stroke: var(--ink-3); stroke-width: 1.5; stroke-dasharray: 5 4; fill: none; }
+  .e-cmd { stroke: var(--amber); stroke-width: 1.5; fill: none; }
+  .e-appr { stroke: var(--amber); stroke-width: 1.5; stroke-dasharray: 2 3; fill: none; }
+  .e-ok { stroke: var(--green); stroke-width: 1.5; fill: none; }
+  .e-sum { stroke: var(--accent); stroke-width: 2; fill: none; }
+  .e-flow { stroke: var(--ink-2); stroke-width: 1.5; fill: none; }
+  .lifeline { stroke: var(--line-strong); stroke-width: 1; stroke-dasharray: 3 4; }
+  .rule { stroke: var(--line); stroke-width: 1; }
+  .bracket { stroke: var(--ink-3); stroke-width: 1.2; fill: none; }
+  .act-sa { fill: var(--blue-soft); stroke: var(--blue); stroke-width: 1; }
+  .act-cc { fill: var(--purple-soft); stroke: var(--purple); stroke-width: 1; }
+
+  .m-ink { fill: var(--ink); }
+  .m-back { fill: var(--ink-3); }
+  .m-cmd { fill: var(--amber); }
+  .m-ok { fill: var(--green); }
+  .m-acc { fill: var(--accent); }
+  .m-flow { fill: var(--ink-2); }
+
+  /* ── 徽标：和工作台界面里的一致 ── */
+  .badge {
+    font-size: 11px; font-weight: 600; line-height: 1.5;
+    padding: 1px 6px; border-radius: 4px; white-space: nowrap;
+  }
+  .b-cmd { background: var(--amber-soft); color: var(--amber); }
+  .b-sa { background: var(--blue-soft); color: var(--blue); }
+  .b-cc { background: var(--purple-soft); color: var(--purple); }
+
+  /* ── 计划卡示意 ── */
+  .confirm { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 20px; margin-top: 16px; align-items: start; }
+  .mock-label { font: 500 11.5px/1.4 var(--mono); color: var(--ink-3); letter-spacing: 0.04em; margin-bottom: 8px; }
+  .plan-card {
+    background: var(--panel);
+    border: 1px solid var(--amber);
+    border-radius: 10px;
+    padding: 14px 16px;
+    font-size: 13.5px;
+  }
+  .plan-card .head { display: flex; align-items: center; gap: 8px; font-weight: 700; }
+  .plan-card .sum { color: var(--ink-2); margin-top: 6px; }
+  .plan-card ol { margin: 6px 0 0; padding-left: 20px; color: var(--ink-2); }
+  .plan-card li { margin: 3px 0; }
+  .plan-card li b { color: var(--ink); }
+  .plan-card .after { color: var(--ink-3); }
+  .plan-card .btns { display: flex; gap: 8px; margin-top: 12px; }
+  .fake-btn {
+    display: inline-block; padding: 4px 12px; border-radius: 6px; font-size: 12.5px;
+    border: 1px solid var(--line-strong); color: var(--ink); background: var(--panel);
+  }
+  .fake-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .notes { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 12px; font-size: 14px; color: var(--ink-2); }
+  .notes b { color: var(--ink); }
+
+  /* ── 规矩 ── */
+  .rules {
+    margin: 16px 0 0; padding: 0; list-style: none;
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 28px;
+  }
+  .rules li { padding: 14px 0; border-top: 1px solid var(--line); font-size: 14px; color: var(--ink-2); }
+  .rules b { display: block; color: var(--ink); font-size: 15px; margin-bottom: 2px; }
+
+  /* ── 空间清单示意 ── */
+  .roster { margin-top: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .roster-row { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 4px 16px; padding: 14px 18px; border-top: 1px solid var(--line); }
+  .roster-row:first-child { border-top: 0; }
+  .roster-row .name { font-weight: 700; }
+  .roster-row .meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .roster-row .desc { grid-column: 2; font-size: 14px; color: var(--ink-2); }
+  .tip { margin: 14px 0 0; font-size: 14px; color: var(--ink-2); max-width: 70ch; }
+  .tip b { color: var(--ink); }
+
+  .limits { margin: 12px 0 0; padding-left: 20px; color: var(--ink-2); font-size: 14.5px; max-width: 70ch; }
+  .limits li { margin: 6px 0; }
+
+  footer { font-size: 12.5px; color: var(--ink-3); border-top: 1px solid var(--line); padding-top: 16px; }
+  code { font-family: var(--mono); font-size: 0.92em; }
+
+  @media (max-width: 720px) {
+    .terms { grid-template-columns: 1fr; }
+    .confirm { grid-template-columns: 1fr; }
+    .rules { grid-template-columns: 1fr; }
+    .roster-row { grid-template-columns: 1fr; }
+    .roster-row .desc { grid-column: 1; }
+    .panel { padding: 14px 12px 12px; }
+  }
+</style>
+
+<main class="wrap">
+
+  <header class="x-block" id="top">
+    <p class="eyebrow">SIMPLEAGENT 工作台 · 2026-09-24 上线</p>
+    <h1>在指挥台说一句话，调度者替你把活派出去</h1>
+    <p class="lede">指挥台多了一个「调度者」。你不用再指定交给哪个空间，直接说要做什么，它看各空间的简介决定派给谁、拆成几步。
+      需要几个空间配合时，它先给你看计划，你确认了才开始；能同时做的一起做，有先后的等前一步结果回来再往下派。
+      全部做完，它把结论汇总成一条回复给你。</p>
+    <dl class="terms">
+      <div>
+        <dt>空间</dt>
+        <dd>一类事一个工作目录，比如理财、健康、旅游。每个空间配一个 AI 执行者：内置的 SimpleAgent，或者 Claude Code、OpenCode。</dd>
+      </div>
+      <div>
+        <dt>调度者 <span class="badge b-cmd">调度</span></dt>
+        <dd>指挥台背后的 AI，只会派任务和出计划。它自己不读写文件；它派出去的子任务在界面上带「派」标记。</dd>
+      </div>
+      <div>
+        <dt>简介</dt>
+        <dd>空间设置里新加的一段话，调度者靠它判断派给谁。可以手写，也可以一键自动生成。</dd>
+      </div>
+    </dl>
+  </header>
+
+  <!-- ─────────────── 图 1：以前 vs 现在 ─────────────── -->
+  <section class="x-block" id="before-after">
+    <h2>以前和现在：谁来拆活、传话</h2>
+    <p class="intro">只变了一处：以前拆任务、传话、拼结果都是你自己来，现在交给调度者。</p>
+    <figure class="panel">
+      <div class="scroll">
+        <svg class="w640" viewBox="0 0 820 350" role="img"
+             aria-label="以前：你分别给理财、健康、旅游三个空间各发一句，结果各自回到你手上。现在：你只对调度者说一句，调度者派给三个空间，结果都回到调度者，由它汇总给你。">
+          <defs>
+            <marker id="f1-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,1 L10,5 L0,9 z" class="m-ink"/></marker>
+            <marker id="f1-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,1 L10,5 L0,9 z" class="m-back"/></marker>
+          </defs>
+
+          <line x1="410" y1="6" x2="410" y2="344" class="rule"/>
+
+          <!-- 以前 -->
+          <text x="195" y="22" text-anchor="middle" class="t-h">以前：你自己当调度</text>
+          <rect x="135" y="44" width="120" height="44" rx="8" class="n-you"/>
+          <text x="195" y="71" text-anchor="middle" class="t-name">你</text>
+
+          <line x1="160" y1="88" x2="60" y2="248" class="e-send" marker-end="url(#f1-a)"/>
+          <line x1="70" y1="250" x2="170" y2="90" class="e-back" marker-end="url(#f1-b)"/>
+          <line x1="190" y1="88" x2="190" y2="248" class="e-send" marker-end="url(#f1-a)"/>
+          <line x1="200" y1="250" x2="200" y2="90" class="e-back" marker-end="url(#f1-b)"/>
+          <line x1="220" y1="88" x2="320" y2="248" class="e-send" marker-end="url(#f1-a)"/>
+          <line x1="330" y1="250" x2="230" y2="90" class="e-back" marker-end="url(#f1-b)"/>
+
+          <text x="100" y="165" text-anchor="end" class="t-mono halo">@理财</text>
+          <text x="208" y="150" class="t-mono halo">@健康</text>
+          <text x="290" y="165" class="t-mono halo">@旅游</text>
+
+          <rect x="13" y="250" width="104" height="46" rx="8" class="n-sa"/>
+          <text x="65" y="270" text-anchor="middle" class="t-name">理财</text>
+          <text x="65" y="287" text-anchor="middle" class="t-sub">内置</text>
+          <rect x="143" y="250" width="104" height="46" rx="8" class="n-cc"/>
+          <text x="195" y="270" text-anchor="middle" class="t-name">健康</text>
+          <text x="195" y="287" text-anchor="middle" class="t-sub">Claude Code</text>
+          <rect x="273" y="250" width="104" height="46" rx="8" class="n-sa"/>
+          <text x="325" y="270" text-anchor="middle" class="t-name">旅游</text>
+          <text x="325" y="287" text-anchor="middle" class="t-sub">内置</text>
+
+          <text x="195" y="324" text-anchor="middle" class="t-cap">发 3 句话，盯 3 份结果</text>
+          <text x="195" y="343" text-anchor="middle" class="t-cap">前两份的结论，要你自己抄给旅游</text>
+
+          <!-- 现在 -->
+          <text x="625" y="22" text-anchor="middle" class="t-h c-cmd">现在：调度者来当调度</text>
+          <rect x="565" y="44" width="120" height="44" rx="8" class="n-you"/>
+          <text x="625" y="71" text-anchor="middle" class="t-name">你</text>
+
+          <line x1="618" y1="88" x2="618" y2="138" class="e-send" marker-end="url(#f1-a)"/>
+          <line x1="632" y1="140" x2="632" y2="90" class="e-back" marker-end="url(#f1-b)"/>
+          <text x="608" y="119" text-anchor="end" class="t-lbl">一句话</text>
+          <text x="642" y="119" class="t-lbl">一份汇总</text>
+
+          <rect x="535" y="140" width="180" height="50" rx="8" class="n-cmd"/>
+          <text x="625" y="162" text-anchor="middle" class="t-name">调度者</text>
+          <text x="625" y="180" text-anchor="middle" class="t-sub">看简介 · 拆步骤 · 汇总</text>
+
+          <line x1="590" y1="190" x2="490" y2="248" class="e-send" marker-end="url(#f1-a)"/>
+          <line x1="500" y1="250" x2="600" y2="192" class="e-back" marker-end="url(#f1-b)"/>
+          <line x1="620" y1="190" x2="620" y2="248" class="e-send" marker-end="url(#f1-a)"/>
+          <line x1="630" y1="250" x2="630" y2="192" class="e-back" marker-end="url(#f1-b)"/>
+          <line x1="650" y1="190" x2="750" y2="248" class="e-send" marker-end="url(#f1-a)"/>
+          <line x1="760" y1="250" x2="660" y2="192" class="e-back" marker-end="url(#f1-b)"/>
+
+          <rect x="443" y="250" width="104" height="46" rx="8" class="n-sa"/>
+          <text x="495" y="270" text-anchor="middle" class="t-name">理财</text>
+          <text x="495" y="287" text-anchor="middle" class="t-sub">内置</text>
+          <rect x="573" y="250" width="104" height="46" rx="8" class="n-cc"/>
+          <text x="625" y="270" text-anchor="middle" class="t-name">健康</text>
+          <text x="625" y="287" text-anchor="middle" class="t-sub">Claude Code</text>
+          <rect x="703" y="250" width="104" height="46" rx="8" class="n-sa"/>
+          <text x="755" y="270" text-anchor="middle" class="t-name">旅游</text>
+          <text x="755" y="287" text-anchor="middle" class="t-sub">内置</text>
+
+          <text x="625" y="324" text-anchor="middle" class="t-cap">说 1 句话，确认 1 次计划，收 1 份汇总</text>
+          <text x="625" y="343" text-anchor="middle" class="t-cap">前一步的结论，调度者转给下一步</text>
+        </svg>
+      </div>
+      <figcaption>
+        左右两边是同一件事、同样三个空间，区别只在中间多了调度者这一层。
+        <div class="legend">
+          <span><svg viewBox="0 0 26 8" aria-hidden="true"><line x1="0" y1="4" x2="26" y2="4" class="e-send"/></svg>派出任务</span>
+          <span><svg viewBox="0 0 26 8" aria-hidden="true"><line x1="0" y1="4" x2="26" y2="4" class="e-back"/></svg>交回结果</span>
+        </div>
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- ─────────────── 图 2：一次跨空间任务 ─────────────── -->
+  <section class="x-block" id="flow">
+    <h2>一次跨空间任务是怎么跑完的</h2>
+    <p class="ask"><small>举个例子，你在指挥台说：</small>「下周去东京出差 5 天，按这个月还能花的钱和我最近的体检情况，帮我排个行程。」</p>
+    <figure class="panel">
+      <div class="scroll">
+        <svg class="w640" viewBox="0 0 800 630" role="img"
+             aria-label="时序图：你把任务交给调度者；调度者读简介后发来计划卡；你确认后，调度者同时把第 1 步派给理财、第 2 步派给健康；两份结论回来后，调度者把它们写进第 3 步派给旅游；旅游要写文件时审批卡直接弹给你，你批准后它完成，调度者把结果汇总给你。">
+          <defs>
+            <marker id="f2-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,1 L10,5 L0,9 z" class="m-ink"/></marker>
+            <marker id="f2-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,1 L10,5 L0,9 z" class="m-back"/></marker>
+            <marker id="f2-c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,1 L10,5 L0,9 z" class="m-cmd"/></marker>
+            <marker id="f2-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,1 L10,5 L0,9 z" class="m-ok"/></marker>
+            <marker id="f2-s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,1 L10,5 L0,9 z" class="m-acc"/></marker>
+          </defs>
+
+          <!-- 泳道 -->
+          <line x1="70" y1="62" x2="70" y2="622" class="lifeline"/>
+          <line x1="260" y1="62" x2="260" y2="622" class="lifeline"/>
+          <line x1="420" y1="62" x2="420" y2="622" class="lifeline"/>
+          <line x1="575" y1="62" x2="575" y2="622" class="lifeline"/>
+          <line x1="730" y1="62" x2="730" y2="622" class="lifeline"/>
+
+          <rect x="20" y="12" width="100" height="50" rx="8" class="n-you"/>
+          <text x="70" y="43" text-anchor="middle" class="t-name">你</text>
+          <rect x="195" y="12" width="130" height="50" rx="8" class="n-cmd"/>
+          <text x="260" y="33" text-anchor="middle" class="t-name">调度者</text>
+          <text x="260" y="51" text-anchor="middle" class="t-sub">只派活、出计划</text>
+          <rect x="360" y="12" width="120" height="50" rx="8" class="n-sa"/>
+          <text x="420" y="33" text-anchor="middle" class="t-name">理财</text>
+          <text x="420" y="51" text-anchor="middle" class="t-sub">内置 · 写要批准</text>
+          <rect x="515" y="12" width="120" height="50" rx="8" class="n-cc"/>
+          <text x="575" y="33" text-anchor="middle" class="t-name">健康</text>
+          <text x="575" y="51" text-anchor="middle" class="t-sub">Claude Code · 只读</text>
+          <rect x="670" y="12" width="120" height="50" rx="8" class="n-sa"/>
+          <text x="730" y="33" text-anchor="middle" class="t-name">旅游</text>
+          <text x="730" y="51" text-anchor="middle" class="t-sub">内置 · 写要批准</text>
+
+          <!-- 1. 你说任务 -->
+          <line x1="70" y1="100" x2="257" y2="100" class="e-send" marker-end="url(#f2-a)"/>
+          <text x="165" y="92" text-anchor="middle" class="t-lbl c-ink">东京 5 天，按预算和体检排行程</text>
+
+          <!-- 2. 读简介 -->
+          <rect x="192" y="118" width="136" height="44" rx="6" class="n-note"/>
+          <text x="260" y="136" text-anchor="middle" class="t-lbl">读各空间的简介</text>
+          <text x="260" y="153" text-anchor="middle" class="t-lbl">要三个空间配合</text>
+
+          <!-- 3. 计划卡 -->
+          <line x1="260" y1="192" x2="73" y2="192" class="e-cmd" marker-end="url(#f2-c)"/>
+          <text x="165" y="184" text-anchor="middle" class="t-lbl c-cmd fw">计划卡：三步，谁做什么</text>
+
+          <!-- 4. 确认 -->
+          <line x1="70" y1="230" x2="257" y2="230" class="e-ok" marker-end="url(#f2-g)"/>
+          <text x="165" y="222" text-anchor="middle" class="t-lbl c-ok fw">确认执行</text>
+          <text x="70" y="252" text-anchor="middle" class="t-small halo">点拒绝就一步都不派</text>
+
+          <!-- 5. 并行派出 ①② -->
+          <path d="M252,282 H245 V308 H252" class="bracket"/>
+          <text x="240" y="299" text-anchor="end" class="t-lbl">同时派出</text>
+          <line x1="260" y1="308" x2="568" y2="308" class="e-send" marker-end="url(#f2-a)"/>
+          <line x1="260" y1="282" x2="413" y2="282" class="e-send" marker-end="url(#f2-a)"/>
+          <rect x="414" y="282" width="12" height="66" rx="2" class="act-sa"/>
+          <rect x="569" y="308" width="12" height="70" rx="2" class="act-cc"/>
+          <text x="340" y="274" text-anchor="middle" class="t-lbl c-ink">① 算本月还能花多少</text>
+          <text x="497" y="300" text-anchor="middle" class="t-lbl c-ink halo">② 体检有什么要注意</text>
+
+          <!-- 6. 结论交回 -->
+          <line x1="414" y1="348" x2="263" y2="348" class="e-back" marker-end="url(#f2-b)"/>
+          <text x="340" y="340" text-anchor="middle" class="t-lbl">还能花 8,000 元</text>
+          <line x1="569" y1="378" x2="263" y2="378" class="e-back" marker-end="url(#f2-b)"/>
+          <text x="497" y="370" text-anchor="middle" class="t-lbl halo">少走路，别排太满</text>
+
+          <!-- 7. 带着结论派 ③ -->
+          <text x="250" y="436" text-anchor="end" class="t-lbl">等 ①② 都回来</text>
+          <line x1="260" y1="432" x2="723" y2="432" class="e-send" marker-end="url(#f2-a)"/>
+          <text x="575" y="408" text-anchor="middle" class="t-lbl c-ink halo">③ 排 5 天行程，写成行程单</text>
+          <text x="575" y="424" text-anchor="middle" class="t-lbl c-acc fw halo">任务里带上 ①② 的结论</text>
+          <rect x="724" y="432" width="12" height="128" rx="2" class="act-sa"/>
+
+          <!-- 8. 审批直接给你 -->
+          <line x1="724" y1="470" x2="73" y2="470" class="e-appr" marker-end="url(#f2-c)"/>
+          <text x="497" y="462" text-anchor="middle" class="t-lbl c-cmd fw halo">写文件前弹审批卡</text>
+          <line x1="70" y1="498" x2="721" y2="498" class="e-ok" marker-end="url(#f2-g)"/>
+          <text x="497" y="490" text-anchor="middle" class="t-lbl c-ok fw halo">批准</text>
+
+          <!-- 9. 旅游交回 -->
+          <line x1="724" y1="560" x2="263" y2="560" class="e-back" marker-end="url(#f2-b)"/>
+          <text x="650" y="552" text-anchor="middle" class="t-lbl">行程单写好了</text>
+
+          <!-- 10. 汇总 -->
+          <line x1="260" y1="598" x2="74" y2="598" class="e-sum" marker-end="url(#f2-s)"/>
+          <text x="165" y="590" text-anchor="middle" class="t-lbl c-acc fw">汇总：行程 + 预算说明</text>
+        </svg>
+      </div>
+      <figcaption>
+        从上往下是时间顺序。① ② 互不依赖，同时派出去；③ 要用前两步的结论，等它们都回来才派，调度者把结论写进 ③ 的任务里。
+        空间之间不直接说话，信息都经调度者转交。旅游要写文件时，审批卡直接弹给你，不经过调度者。
+        <div class="legend">
+          <span><svg viewBox="0 0 26 8" aria-hidden="true"><line x1="0" y1="4" x2="26" y2="4" class="e-send"/></svg>派出任务</span>
+          <span><svg viewBox="0 0 26 8" aria-hidden="true"><line x1="0" y1="4" x2="26" y2="4" class="e-back"/></svg>交回结果</span>
+          <span><svg viewBox="0 0 26 8" aria-hidden="true"><line x1="0" y1="4" x2="26" y2="4" class="e-cmd"/></svg>等你拍板的卡片</span>
+          <span><svg viewBox="0 0 26 8" aria-hidden="true"><line x1="0" y1="4" x2="26" y2="4" class="e-ok"/></svg>你的操作</span>
+          <span><svg viewBox="0 0 26 8" aria-hidden="true"><rect x="9" y="0" width="8" height="8" rx="1" class="act-sa"/></svg>空间正在干活</span>
+        </div>
+      </figcaption>
+    </figure>
+  </section>
+
+  <!-- ─────────────── 图 3：什么时候要确认 ─────────────── -->
+  <section class="x-block" id="confirm">
+    <h2>什么时候会停下来问你</h2>
+    <p class="intro">只有要多个空间配合时才会先问你。只用一个空间的活直接派，不打扰你。</p>
+    <figure class="panel">
+      <div class="scroll">
+        <svg class="w720" viewBox="0 0 920 296" role="img"
+             aria-label="判断流程：以 @ 开头的输入直接发给那个空间；否则交给调度者。只用一个空间就直接派；用到多个空间先出计划卡，确认后按计划派出，拒绝则一步都不派；没有合适的空间就不派，说明原因。">
+          <defs>
+            <marker id="f3-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,1 L10,5 L0,9 z" class="m-flow"/></marker>
+          </defs>
+
+          <rect x="8" y="127" width="104" height="46" rx="8" class="n-you"/>
+          <text x="60" y="155" text-anchor="middle" class="t-name">指挥台输入</text>
+          <line x1="112" y1="150" x2="134" y2="150" class="e-flow" marker-end="url(#f3-a)"/>
+
+          <polygon points="198,112 260,150 198,188 136,150" class="n-note"/>
+          <text x="198" y="155" text-anchor="middle" class="t-lbl c-ink fw">以 @ 开头？</text>
+
+          <path d="M198,112 V52 H287" class="e-flow" marker-end="url(#f3-a)"/>
+          <text x="206" y="88" class="t-lbl">是</text>
+          <rect x="290" y="29" width="170" height="46" rx="8" class="n-sa"/>
+          <text x="375" y="50" text-anchor="middle" class="t-name">直接发给那个空间</text>
+          <text x="375" y="67" text-anchor="middle" class="t-sub">不经过调度者，和以前一样</text>
+
+          <line x1="260" y1="150" x2="287" y2="150" class="e-flow" marker-end="url(#f3-a)"/>
+          <text x="274" y="142" text-anchor="middle" class="t-lbl">否</text>
+          <rect x="290" y="125" width="170" height="50" rx="8" class="n-cmd"/>
+          <text x="375" y="146" text-anchor="middle" class="t-name">调度者</text>
+          <text x="375" y="164" text-anchor="middle" class="t-sub">看简介，定用几个空间</text>
+
+          <path d="M460,150 H488 V52 H557" class="e-flow" marker-end="url(#f3-a)"/>
+          <path d="M460,150 H557" class="e-flow" marker-end="url(#f3-a)"/>
+          <path d="M460,150 H488 V250 H557" class="e-flow" marker-end="url(#f3-a)"/>
+          <text x="523" y="45" text-anchor="middle" class="t-lbl">1 个空间</text>
+          <text x="523" y="143" text-anchor="middle" class="t-lbl">多个空间</text>
+          <text x="523" y="243" text-anchor="middle" class="t-lbl">没有合适的</text>
+
+          <rect x="560" y="29" width="150" height="46" rx="8" class="n-sa"/>
+          <text x="635" y="50" text-anchor="middle" class="t-name">直接派</text>
+          <text x="635" y="67" text-anchor="middle" class="t-sub">不用你确认</text>
+
+          <rect x="560" y="127" width="150" height="46" rx="8" class="n-cmd"/>
+          <text x="635" y="148" text-anchor="middle" class="t-name c-cmd">出计划卡</text>
+          <text x="635" y="165" text-anchor="middle" class="t-sub">等你确认</text>
+
+          <rect x="560" y="227" width="150" height="46" rx="8" class="n-note"/>
+          <text x="635" y="248" text-anchor="middle" class="t-name">不派</text>
+          <text x="635" y="265" text-anchor="middle" class="t-sub">说明原因，建议建新空间</text>
+
+          <path d="M710,150 H736 V105 H787" class="e-flow" marker-end="url(#f3-a)"/>
+          <path d="M710,150 H736 V195 H787" class="e-flow" marker-end="url(#f3-a)"/>
+          <text x="762" y="98" text-anchor="middle" class="t-lbl c-ok fw">确认</text>
+          <text x="762" y="188" text-anchor="middle" class="t-lbl fw">拒绝</text>
+
+          <rect x="790" y="82" width="122" height="46" rx="8" class="n-ok"/>
+          <text x="851" y="103" text-anchor="middle" class="t-name">按计划派出</text>
+          <text x="851" y="120" text-anchor="middle" class="t-sub">能并行的一起跑</text>
+
+          <rect x="790" y="172" width="122" height="46" rx="8" class="n-note"/>
+          <text x="851" y="193" text-anchor="middle" class="t-name">一步都不派</text>
+          <text x="851" y="210" text-anchor="middle" class="t-sub">你说怎么改，它重出</text>
+        </svg>
+      </div>
+      <figcaption>带 <code>@空间名</code> 的输入走老路，直接下发；不带 <code>@</code> 的交给调度者判断。</figcaption>
+    </figure>
+
+    <div class="confirm">
+      <div>
+        <div class="mock-label">界面示意 · 计划卡</div>
+        <div class="plan-card">
+          <div class="head">确认执行计划 <span class="badge b-cmd">调度</span></div>
+          <div class="sum">理财和健康同时查，都回来后交给旅游排行程。</div>
+          <ol>
+            <li><b>理财</b>：算这个月还能花多少钱</li>
+            <li><b>健康</b>：看最近的体检报告，出差要注意什么</li>
+            <li><b>旅游</b>：按前两步的结论排 5 天东京行程，写成行程单<span class="after">（等第 1、2 步做完）</span></li>
+          </ol>
+          <div class="btns"><span class="fake-btn primary">确认执行</span><span class="fake-btn">拒绝</span></div>
+        </div>
+      </div>
+      <ul class="notes">
+        <li><b>只有「确认执行」和「拒绝」两个按钮。</b>没有「始终允许」，每次跨空间都要你看一眼。</li>
+        <li><b>有问题的计划不会拿来问你。</b>空间名写错、依赖的步骤排在后面，这类计划直接退回给调度者重写。</li>
+        <li><b>拒绝之后不会偷偷派。</b>告诉调度者怎么改，它会重新出一版计划。</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ─────────────── 规矩 ─────────────── -->
+  <section class="x-block" id="rules">
+    <h2>几条写死在代码里的规矩</h2>
+    <p class="intro">下面这些由程序强制执行，不靠 AI 自觉。模型想绕过去，也只会收到一条报错。</p>
+    <ul class="rules">
+      <li><b>跨空间必须先确认</b>没有批准过的计划，派第二个空间会被直接拦下。</li>
+      <li><b>只能按计划派</b>计划批准后，想派到计划外的空间同样会被拦下。</li>
+      <li><b>一个空间同时只跑一个任务</b>避免两个 AI 在同一个目录里互相覆盖。</li>
+      <li><b>空间原来的权限照旧</b>内置执行者要改文件、跑命令，审批卡直接出现在指挥台对应的任务卡上。</li>
+      <li><b>一停全停</b>停掉调度者，它派出去、还没跑完的子任务一起停。</li>
+      <li><b>不会层层转包</b>调度者自己不碰文件；子任务拿不到派活的能力，不会再往下派。</li>
+    </ul>
+  </section>
+
+  <!-- ─────────────── 简介 ─────────────── -->
+  <section class="x-block" id="profile">
+    <h2>调度者靠「简介」挑空间</h2>
+    <p class="intro">在调度者眼里，每个空间就是下面这样一条。简介写得越具体，派得越准；没写简介的空间，它只能看名字和目录猜。</p>
+    <div class="roster" role="list">
+      <div class="roster-row" role="listitem">
+        <div class="name">理财</div>
+        <div class="meta"><span class="badge b-sa">内置</span><span class="badge b-sa">能读写，写要批准</span></div>
+        <div class="desc">记账和投资。bills/ 里放每月账单 CSV，负责月度开销统计、预算和基金定投记录。</div>
+      </div>
+      <div class="roster-row" role="listitem">
+        <div class="name">健康</div>
+        <div class="meta"><span class="badge b-cc">Claude Code</span><span class="badge b-cc">只读</span></div>
+        <div class="desc">体检报告、化验单和运动记录。只做解读和提醒，不改文件。</div>
+      </div>
+      <div class="roster-row" role="listitem">
+        <div class="name">旅游</div>
+        <div class="meta"><span class="badge b-sa">内置</span><span class="badge b-sa">能读写，写要批准</span></div>
+        <div class="desc">出行规划。存着常住酒店、航司偏好和往期行程单，负责排行程、写行程单。</div>
+      </div>
+    </div>
+    <p class="tip"><b>不想手写可以自动生成：</b>在空间设置里点「自动生成」，它读这个目录的 AGENTS.md（没有就读 CLAUDE.md）、README 开头、文件列表和最近 10 个会话标题，写一段 50～100 字。生成结果只填进输入框，你改完点保存才生效。</p>
+  </section>
+
+  <!-- ─────────────── 限制 ─────────────── -->
+  <section class="x-block" id="limits">
+    <h2>现在还做不到的</h2>
+    <ul class="limits">
+      <li>空间之间不能直接对话，信息都经调度者转交。报告、数据文件这类大产物，只能在任务里写上文件路径。</li>
+      <li>子任务只交回最后一条回复，最多 4000 字；中间过程留在各自的会话里，点任务卡能看全文。</li>
+      <li>只读的空间不会接到改文件的活，这类空间能干的事有限。</li>
+      <li>调度会话只能从指挥台的任务卡进去，而任务卡只保留 24 小时，之后暂时没有回看入口。</li>
+    </ul>
+  </section>
+
+  <footer>图里的空间、金额和体检内容都是举例。</footer>
+</main>
