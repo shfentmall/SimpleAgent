@@ -3,7 +3,7 @@
 > 状态：W1~W5 已实现（W5 = 控制面板：指挥台 / 消息 / 备忘）。知识库入口留给 M7。
 > 控制面板消息已补：外部文本弹层看全文、点开 30 分钟后自动归档、`sa inbox push` 外部投递（见 10.11）。
 > 任务终态已分流：只有失败进消息，完成 / 取消只在指挥台显示，指挥台刷新后从后台恢复近 24 小时的任务卡（见 10.12）。
-> 对话里模型的回复按 Markdown 渲染（标题 / 列表 / 表格 / 引用 / 链接），零依赖手写，图片不加载（见 10.13）。
+> 对话里模型的回复按 Markdown 渲染（标题 / 列表 / 表格 / 引用 / 链接 / LaTeX 公式），零依赖手写，图片不加载（见 10.13）。
 > 新建空间已拆成「目录形态 × 执行者」两个正交维度（见 4 与 10.9）；外部 CLI 的启动器仍留 M8。
 > W1~W5 只改 `src/`，不动核心 loop 的默认行为。
 > 前置：M3（会话 JSONL 持久化 + 权限），M4（daemon / 定时任务）只影响“控制面板”的填充内容，不阻塞骨架。
@@ -741,11 +741,33 @@ W5 起每个 session 跑完都往消息里落一条（完成 / 失败 / 取消�
 （`finishTurn`，见 10.16）都会按完整文本再渲染一遍去掉光标——外部 CLI 执行者不一定先发 `message_done`
 再发工具调用。
 
-**测试。** `tests/serve/test_markdown.py` 用 node 直接跑 `markdown.js`（`module.exports` 导出），
+**测试。** `tests/serve/test_markdown.py` 用 node 直接跑 `markdown.js` / `math.js`（`module.exports` 导出），
 在 Python 里断言 HTML；没装 node 就整体跳过，不为测试引入 npm。覆盖块级结构、误渲染
-（`__init__.py`、`2 * 3 * 4`）、各个位置的 HTML 注入、`javascript:` 链接、图片不加载。
+（`__init__.py`、`2 * 3 * 4`、钱数不当公式）、各个位置的 HTML 注入（含公式里）、`javascript:` 链接、图片不加载，
+以及 TeX 的上下标、大型运算符、定界符、环境、字体和容错。
 
-**没做的**：代码块的语言标注和复制按钮、数学公式、流式渲染的节流（回复很长时再说）。
+**公式。** `$…$`、`\(…\)` 是行内公式，`$$…$$`、`\[…\]` 和直接写的 `\begin{align}` 这类是行间公式，
+交给 `web/math.js` 的 `texToMathML` 转成 MathML，由浏览器原生排版（Chrome 109+ / Safari / Firefox 都支持
+MathML Core）。没引 KaTeX：它要带几百 KB 的 JS + CSS + 字体，也违反零依赖。转换器手写，覆盖模型常写的
+TeX 子集：分式、根号、上下标、希腊字母、常见运算符和箭头、`\sum` `\int` `\lim`、`\left…\right`、重音、
+`\text`、`\mathbb` 这类字体、矩阵 / cases / aligned 环境；认不出的命令显示成红字，不会整条失败。
+- 单个 `$` 按 pandoc 的规矩认：开头的 `$` 后面不能是空白，结尾的 `$` 前面不能是空白、后面不能紧跟数字。
+  「从 $5 涨到 $10」「价格是$100」不会被当成公式。行内代码里的 `$`、`\$` 都是字面量。
+- 公式在 `renderInline` 里排在行内代码之后、反斜杠转义之前取走：`\{` `\,` 是 TeX 命令，不能先被当成
+  Markdown 转义；公式里的 `*` `_` 也不会变成斜体。行间公式块能打断段落，没闭合就延伸到末尾（流式）。
+- 安全口径不变：公式里的每个字符都经过 `escapeHtml`，标签和属性值来自固定表，`\color` 的颜色、
+  `\hspace` 的宽度按白名单校验。查表一律用自有属性，`\constructor` 摸不到 `Object.prototype`。
+- Chrome 的 MathML Core 只认 `mathvariant="normal"`、不认 `columnalign`：`\mathbb{R}` 直接换成
+  Unicode 数学字母 ℝ，表格对齐写在 `mtd` 的 style 上。
+- 字体要点名 `STIX Two Math`（macOS 自带；Windows 是 `Cambria Math`）。Chrome 的 generic `math` 在
+  macOS 上没落到带 OpenType MATH 表的字体，括号不会随内容拉伸、`∑` 也不会变大。
+- 几个在 Chrome + STIX Two Math 下调出来的口径：重音不标 `accent="true"`（否则 `¯` 贴在字母顶上看不见）；
+  `\widehat` 用组合字符 U+0302 才拉得宽；撇号直接跟在后面，不放进 `msup`（会被抬得太高）；
+  运算符后面的 `-` 标 `form="prefix"`，`\approx -D` 不留二元运算符的间距。
+- 流式光标不插进 `<math>` 里（`CURSOR_STOP` 加了 `math`）。
+
+**没做的**：代码块的语言标注和复制按钮、流式渲染的节流（回复很长时再说）、表格单元格里带 `|` 的公式
+（`$|x|$` 会被拆成两列）、`\newcommand` 这类宏定义、`\widetilde` 拉宽（STIX Two Math 没有对应字形）。
 
 ### 10.14 指挥台调度：一句任务自动派给空间
 

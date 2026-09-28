@@ -614,8 +614,8 @@ function finishTurn(turn, { timed = true } = {}) {
 }
 
 /* 流式光标放进最后一个块的末尾（段落、列表项、代码块里），不要另起一行。
-   链接、换行、分隔线这类元素里面放不了，停在它们外面 */
-const CURSOR_STOP = new Set(["A", "BR", "HR", "INPUT"]);
+   链接、换行、分隔线、公式这类元素里面放不了，停在它们外面（MathML 的 tagName 是小写） */
+const CURSOR_STOP = new Set(["A", "BR", "HR", "INPUT", "math"]);
 
 function placeCursor(el) {
   let host = el;

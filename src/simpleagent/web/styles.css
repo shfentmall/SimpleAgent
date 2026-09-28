@@ -454,6 +454,13 @@ pre.code {
 .md table { border-collapse: collapse; font-size: 12.5px; }
 .md th, .md td { border: 1px solid var(--border); padding: 4px 9px; text-align: left; vertical-align: top; }
 .md th { background: var(--panel-2); font-weight: 600; white-space: nowrap; }
+/* 公式（web/math.js 输出的 MathML）。字体要点名带 OpenType MATH 表的数学字体：Chrome 的
+   generic `math` 在 macOS 上不一定落到 STIX Two Math，落空了括号不会随内容拉伸、∑ 也不会变大。
+   macOS 自带 STIX Two Math，Windows 自带 Cambria Math。行间公式太宽就横向滚动 */
+.md math { font-family: "STIX Two Math", "Cambria Math", "Latin Modern Math", math; font-size: 1.1em; }
+.md .math-block { margin: 0 0 8px; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+.md p > math[display="block"] { margin: 6px 0; }
+.md .math-unknown, .md .math-error { color: var(--red); }
 
 .cursor { display: inline-block; width: 6px; background: var(--accent); animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
