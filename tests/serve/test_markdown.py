@@ -15,26 +15,38 @@ import pytest
 import simpleagent.web
 
 NODE = shutil.which("node")
-SCRIPT = Path(simpleagent.web.__file__).parent / "markdown.js"
+WEB = Path(simpleagent.web.__file__).parent
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="需要 node 来跑前端 JS")
 
 
-def md(src: str) -> str:
+def _run(script: str, func: str, *args: object) -> str:
     js = (
-        f"const {{ renderMarkdown }} = require({json.dumps(str(SCRIPT))});"
-        "const src = JSON.parse(require('fs').readFileSync(0, 'utf8'));"
-        "process.stdout.write(JSON.stringify(renderMarkdown(src)));"
+        f"const {{ {func} }} = require({json.dumps(str(WEB / script))});"
+        "const args = JSON.parse(require('fs').readFileSync(0, 'utf8'));"
+        f"process.stdout.write(JSON.stringify({func}(...args)));"
     )
     out = subprocess.run(
         [NODE, "-e", js],
-        input=json.dumps(src),
+        input=json.dumps(args),
         capture_output=True,
         text=True,
         check=True,
         timeout=10,
     )
     return json.loads(out.stdout)
+
+
+def md(src: str) -> str:
+    return _run("markdown.js", "renderMarkdown", src)
+
+
+def tex(src: str, display: bool = False) -> str:
+    """math.js 的 TeX → MathML，不带外面的 <math> 标签"""
+    html = _run("math.js", "texToMathML", src, display)
+    return (
+        html.removeprefix('<math display="block">').removeprefix("<math>").removesuffix("</math>")
+    )
 
 
 # --------------------------------------------------------------- 块级
@@ -138,6 +150,121 @@ def test_bare_url_trims_trailing_punctuation():
     assert "</a>)</p>" in html  # 多出来的右括号留在链接外面
 
 
+# --------------------------------------------------------------- 公式
+def test_display_math_block():
+    html = md("$$\\frac{\\Delta P}{P} \\approx -D_{mod} \\times \\Delta y$$")
+    assert html.startswith('<div class="math-block"><math display="block">')
+    assert '<mfrac><mrow><mi mathvariant="normal">Δ</mi><mi>P</mi></mrow><mi>P</mi></mfrac>' in html
+    # ≈ 后面的负号是一元的，不留二元运算符的间距
+    assert '<mo>≈</mo><mo form="prefix">−</mo>' in html
+    assert "$$" not in html and "\\frac" not in html
+
+
+def test_multiline_display_math_interrupts_paragraph():
+    html = md("久期：\n$$\n\\frac{a}{b}\n$$\n其中 $a$ 是价格")
+    assert html == (
+        '<p>久期：</p><div class="math-block"><math display="block">'
+        "<mfrac><mi>a</mi><mi>b</mi></mfrac></math></div>"
+        "<p>其中 <math><mi>a</mi></math> 是价格</p>"
+    )
+
+
+def test_bracket_and_paren_delimiters():
+    assert md("\\(x^2\\)") == "<p><math><msup><mi>x</mi><mn>2</mn></msup></math></p>"
+    assert md("\\[\nE = mc^2\n\\]").startswith('<div class="math-block"><math display="block">')
+    # 段落里夹的 $$…$$ 按行间公式显示
+    assert '<math display="block">' in md("这是 $$x$$ 行内")
+
+
+def test_bare_align_environment():
+    html = md("\\begin{align}\na &= b \\\\\n&= c\n\\end{align}")
+    assert html.startswith('<div class="math-block"><math display="block"><mtable>')
+    assert html.count("<mtr>") == 2
+
+
+def test_unclosed_display_math_renders_while_streaming():
+    assert md("$$\n\\frac{a}{b") == (
+        '<div class="math-block"><math display="block">'
+        "<mfrac><mi>a</mi><mi>b</mi></mfrac></math></div>"
+    )
+
+
+def test_money_is_not_math():
+    src = "从 $100 涨到 $120，价格是$5，折扣后$3，US$5 和 5$"
+    assert md(src) == f"<p>{src}</p>"
+
+
+def test_math_is_literal_in_code_and_after_backslash():
+    assert md("`$x$` 和 \\$5 和 \\$x\\$") == "<p><code>$x$</code> 和 $5 和 $x$</p>"
+
+
+def test_markdown_does_not_touch_math():
+    # 公式里的 * _ 不能变成斜体；\{ 是 TeX 命令，不是 Markdown 转义
+    html = md("$a*b*c$ 和 $x_1 + y_1$ 和 $\\{1, 2\\}$")
+    assert "<em>" not in html
+    assert '<mo stretchy="false">{</mo>' in html
+
+
+def test_math_in_list_and_table():
+    assert "<li>公式 <math>" in md("- 公式 $x$")
+    html = md("| 符号 | 含义 |\n|---|---|\n| $\\sigma^2$ | 方差 |")
+    assert "<td><math><msup><mi>σ</mi><mn>2</mn></msup></math></td>" in html
+
+
+# --------------------------------------------------------------- TeX → MathML
+def test_tex_scripts_and_fractions():
+    assert tex("x_i^2") == "<msubsup><mi>x</mi><mi>i</mi><mn>2</mn></msubsup>"
+    assert tex("x^23") == "<mrow><msup><mi>x</mi><mn>2</mn></msup><mn>3</mn></mrow>"
+    assert tex("\\sqrt[3]{a}") == "<mroot><mi>a</mi><mn>3</mn></mroot>"
+    assert tex("\\frac12") == "<mfrac><mn>1</mn><mn>2</mn></mfrac>"
+    assert tex("f'(x)").startswith('<mrow><mrow><mi>f</mi><mo lspace="0" rspace="0">′</mo></mrow>')
+
+
+def test_tex_big_operators_and_functions():
+    # 上下限放 munderover，行内还是行间交给浏览器按 movablelimits 决定
+    assert tex("\\sum_{i=1}^n").startswith('<munderover><mo movablelimits="true">∑</mo>')
+    assert tex("\\int_0^1").startswith("<msubsup><mo>∫</mo>")
+    assert tex("\\lim_{x\\to 0}").startswith("<munder><mo movablelimits")
+    # \sin x 之间有小间距，\sin(x) 没有
+    assert "<mi>sin</mi><mspace" in tex("\\sin x")
+    assert "<mspace" not in tex("\\sin(x)")
+
+
+def test_tex_delimiters_and_environments():
+    assert tex("\\left(\\frac{a}{b}\\right)") == (
+        '<mrow><mo fence="true" stretchy="true">(</mo><mfrac><mi>a</mi><mi>b</mi></mfrac>'
+        '<mo fence="true" stretchy="true">)</mo></mrow>'
+    )
+    m = tex("\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}")
+    assert m.count("<mtr>") == 2 and m.count("<mtd>") == 4
+    cases = tex("\\begin{cases} x & x > 0 \\\\ -x & \\text{otherwise} \\end{cases}")
+    assert cases.startswith('<mrow><mo fence="true" stretchy="true">{</mo><mtable>')
+    assert "<mtext>otherwise</mtext>" in cases
+    # 没写环境的多行公式照样排成表
+    assert tex("a &= b \\\\ &= c", True).startswith("<mtable>")
+
+
+def test_tex_fonts_use_unicode_letters():
+    # Chrome 不认 mathvariant="double-struck"，直接换成 Unicode 数学字母
+    assert tex("\\mathbb{R}") == "<mi>ℝ</mi>"
+    assert tex("\\mathbf{x}") == "<mi>𝐱</mi>"
+    assert tex("\\mathcal{L}") == "<mi>ℒ</mi>"
+    assert tex("\\boldsymbol{\\beta}") == "<mi>𝜷</mi>"
+    assert tex("\\mathrm{d}x") == '<mrow><mi mathvariant="normal">d</mi><mi>x</mi></mrow>'
+
+
+def test_tex_is_forgiving():
+    assert tex("\\frac{a") == "<mfrac><mi>a</mi><mrow></mrow></mfrac>"
+    assert tex("a}b") == "<mrow><mi>a</mi><mi>b</mi></mrow>"
+    # 认不出的命令显示成红字；Object.prototype 上的名字也不能摸到
+    assert tex("\\foo") == '<mtext class="math-unknown">\\foo</mtext>'
+    assert tex("\\constructor") == '<mtext class="math-unknown">\\constructor</mtext>'
+    # 嵌套深到爆栈就原样显示源码
+    assert _run("math.js", "texToMathML", "{" * 20000, False).startswith(
+        '<code class="math-error">'
+    )
+
+
 # --------------------------------------------------------------- 安全
 def test_raw_html_is_escaped_everywhere():
     payload = "<img src=x onerror=alert(1)>"
@@ -152,6 +279,21 @@ def test_raw_html_is_escaped_everywhere():
         html = md(src)
         assert "<img" not in html, src
         assert "&lt;img" in html, src
+
+
+def test_math_escapes_everything():
+    for src in [
+        "$<img src=x onerror=alert(1)>$",
+        "$$\\text{<img src=x onerror=alert(1)>}$$",
+        "$\\operatorname{<img src=x>}$",
+    ]:
+        html = md(src)
+        assert "<img" not in html, src
+        assert "&lt;" in html, src
+    # 颜色、宽度这些进属性值的参数按白名单校验，不合格就丢掉
+    html = md('$\\color{red" onmouseover="alert(1)}{a} \\hspace{1em" x="y}$')
+    assert "onmouseover" not in html and 'x="y"' not in html
+    assert '<mstyle mathcolor="red">' in md("$\\color{red}{a}$")
 
 
 def test_only_http_links_are_clickable():

@@ -4,6 +4,8 @@
    再逐块「转义 + 行内格式」。安全上只守一条：原文的每个字符都恰好经过一次 escapeHtml
    才进 HTML，标签只由这里生成——模型输出里的 <script> 原样显示成文字。
 
+   公式（$…$、$$…$$、\(…\)、\[…\]）交给 math.js 的 texToMathML 转成 MathML。
+
    刻意不支持：setext 标题（=== / --- 下划线）、4 空格缩进代码块（和嵌套列表冲突）、
    引用式链接、原始 HTML（只放行 <br>）、__粗体__（会把 __init__.py 渲染坏）。 */
 
@@ -13,6 +15,16 @@
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) =>
       ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // 浏览器里 math.js 由 <script> 先加载；node 跑测试时在这里 require
+  if (typeof root.texToMathML !== "function" && typeof require === "function") require("./math.js");
+
+  /* 公式源码 → MathML；math.js 没加载上就原样显示源码 */
+  function mathHtml(tex, display) {
+    if (typeof root.texToMathML === "function") return root.texToMathML(tex, display);
+    const [l, r] = display ? ["$$", "$$"] : ["$", "$"];
+    return escapeHtml(l + tex + r);
   }
 
   /* ─────────────────────────── 块级 ─────────────────────────── */
@@ -54,6 +66,20 @@
     return { indent: indentOf(m[1]), marker: m[2] };
   }
 
+  /* 行间公式块的开头：$$、\[ 或者直接写的 \begin{align} 这类。
+     $$a$$ 后面还跟着文字的不算块，交给段落里的行内公式处理 */
+  const MATH_ENV_RE = /^[ \t]*\\begin\{(equation|align|aligned|gather|gathered|multline|split|eqnarray|alignat)(\*?)\}/;
+  function mathOpen(line) {
+    const env = line.match(MATH_ENV_RE);
+    if (env) return { open: "", close: `\\end{${env[1]}${env[2]}}`, keep: true };
+    const m = line.match(/^[ \t]*(\$\$(?!\$)|\\\[)(.*)$/);
+    if (!m) return null;
+    const close = m[1] === "$$" ? "$$" : "\\]";
+    const k = m[2].indexOf(close);
+    if (k >= 0 && m[2].slice(k + close.length).trim()) return null;
+    return { open: m[1], close, keep: false };
+  }
+
   function fenceCloses(line, marker) {
     const m = line.match(/^[ \t]*(`{3,}|~{3,})[ \t]*$/);
     return !!m && m[1][0] === marker[0] && m[1].length >= marker.length;
@@ -93,7 +119,7 @@
 
   function startsBlock(lines, i) {
     const line = lines[i];
-    return !!fenceOpen(line) || HEADING_RE.test(line) || HR_RE.test(line)
+    return !!fenceOpen(line) || !!mathOpen(line) || HEADING_RE.test(line) || HR_RE.test(line)
       || QUOTE_RE.test(line) || LIST_RE.test(line) || isTableStart(lines, i);
   }
 
@@ -106,6 +132,7 @@
       if (!line.trim()) { i++; continue; }
       let m;
       const fence = fenceOpen(line);
+      const math = fence ? null : mathOpen(line);
       if (fence) {
         // 没闭合就一直吃到结尾：流式输出时代码块还没写完，不能先按普通文本闪一下
         const body = [];
@@ -116,6 +143,23 @@
         if (i >= lines.length && body.length && !body[body.length - 1].trim()) body.pop();
         i++;
         out.push(`<pre class="code"><code>${escapeHtml(body.join("\n"))}</code></pre>`);
+      } else if (math) {
+        // 行间公式：吃到结束符为止。没闭合（流式输出还没写完）就到末尾，先渲染已有的部分
+        let rest = line.trimStart().slice(math.open.length);
+        const tex = [];
+        for (;;) {
+          const k = rest.indexOf(math.close);
+          if (k >= 0) {
+            tex.push(rest.slice(0, k) + (math.keep ? math.close : ""));
+            i++;
+            break;
+          }
+          tex.push(rest);
+          if (++i >= lines.length) break;
+          rest = lines[i];
+        }
+        const src = tex.join("\n").trim();
+        if (src) out.push(`<div class="math-block">${mathHtml(src, true)}</div>`);
       } else if ((m = line.match(HEADING_RE))) {
         const n = m[1].length;
         out.push(`<h${n}>${renderInline(m[2])}</h${n}>`);
@@ -220,6 +264,12 @@
   // 占位符用 NUL 包住序号：模型输出里不会有 NUL（renderMarkdown 入口也会先删掉）
   const SLOT_RE = /\x00(\d+)\x00/g;
   const CODE_SPAN_RE = /(?<!`)(`+)(?!`)(.*?[^`])\1(?!`)/g;
+  // 行内公式。单个 $ 按 pandoc 的规矩认，免得把钱数当公式：开头的 $ 后面不能是空白，
+  // 结尾的 $ 前面不能是空白、后面不能紧跟数字——「从 $5 涨到 $10」不算
+  const DISPLAY_MATH_RE = /(?<!\\)\$\$(?!\$)(.+?)\$\$/g;
+  const BRACKET_MATH_RE = /\\\[(.+?)\\\]/g;
+  const PAREN_MATH_RE = /\\\((.+?)\\\)/g;
+  const DOLLAR_MATH_RE = /(?<![\\$\w])\$(?![\s$])((?:\\.|[^\\$])+?)(?<!\s)\$(?![\d$])/g;
   const ESCAPE_RE = /\\([!-/:-@[-`{-~])/g;
   const LINK_RE = /(!?)\[([^\]\n]*)\]\(\s*<?((?:[^()\s<>\x00]|\([^()\s\x00]*\))*)>?(?:\s+"[^"]*")?\s*\)/g;
   const ANGLE_URL_RE = /<(https?:\/\/[^\s<>]+)>/gi;
@@ -265,7 +315,7 @@
       .replace(/~~(?=\S)(.+?)(?<=\S)~~/g, "<del>$1</del>");
   }
 
-  /* 代码、转义字符、链接这些「内容不能再被加工」的片段先换成占位符存进 slots，
+  /* 代码、公式、转义字符、链接这些「内容不能再被加工」的片段先换成占位符存进 slots，
      剩下的文本整体转义后再做粗体 / 斜体，最后把占位符换回去。
      这样代码里的 ** 不会变粗体，网址里的 _ 不会变斜体。 */
   function renderInline(raw) {
@@ -277,6 +327,11 @@
         const c = /^ .*[^ ].* $/.test(code) ? code.slice(1, -1) : code;
         return keep(`<code>${escapeHtml(c)}</code>`);
       })
+      // 公式要在反斜杠转义之前取走：\{ \, 这些是 TeX 命令，不是 Markdown 转义
+      .replace(DISPLAY_MATH_RE, (_, tex) => keep(mathHtml(tex.trim(), true)))
+      .replace(BRACKET_MATH_RE, (_, tex) => keep(mathHtml(tex.trim(), true)))
+      .replace(PAREN_MATH_RE, (_, tex) => keep(mathHtml(tex.trim(), false)))
+      .replace(DOLLAR_MATH_RE, (_, tex) => keep(mathHtml(tex, false)))
       .replace(ESCAPE_RE, (_, c) => keep(escapeHtml(c)))
       .replace(/<br\s*\/?>/gi, () => keep("<br>"))  // 模型爱在表格单元格里写 <br> 换行
       // 链接文字就地格式化，里面 `code` 的占位符在这里一起换回去

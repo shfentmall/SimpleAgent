@@ -357,6 +357,8 @@ def test_index_and_assets(config):
     # markdown.js / turns.js 要先于 app.js 加载：app.js 直接调它们挂在 window 上的函数
     page = body.decode("utf-8")
     assert page.index("/assets/markdown.js") < page.index("/assets/app.js")
+    # markdown.js 调 math.js 挂在 window 上的 texToMathML
+    assert page.index("/assets/math.js") < page.index("/assets/markdown.js")
     assert page.index("/assets/turns.js") < page.index("/assets/app.js")
 
     status, ctype, body = _get(f"{base}/index.html")
@@ -369,6 +371,10 @@ def test_index_and_assets(config):
     _, ctype, js = _get(f"{base}/assets/markdown.js")
     assert ctype.startswith("text/javascript")
     assert "renderMarkdown" in js.decode("utf-8")
+
+    _, ctype, js = _get(f"{base}/assets/math.js")
+    assert ctype.startswith("text/javascript")
+    assert "texToMathML" in js.decode("utf-8")
 
     _, ctype, js = _get(f"{base}/assets/turns.js")
     assert ctype.startswith("text/javascript")
