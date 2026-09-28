@@ -21,6 +21,18 @@ const LS_COLLAPSED = "sa.workbench.collapsed";   // 左栏折叠起来的空间 
    再发 keydown，isComposing 已经变回 false，只能靠 keyCode 229（输入法占用）认出来。 */
 const imeBusy = (e) => e.isComposing || e.keyCode === 229;
 
+/* 折叠状态存在 localStorage，可能是手改过的脏数据（坏 JSON、不是数组）。
+   这里在脚本加载期跑，抛异常会让整个 app.js 不执行、左栏一个空间都不渲染，
+   所以解析失败就当没有折叠。 */
+function loadCollapsed() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LS_COLLAPSED) || "[]");
+    return new Set(Array.isArray(saved) ? saved : []);
+  } catch {
+    return new Set();
+  }
+}
+
 const state = {
   spaces: [],
   profiles: [],
@@ -36,7 +48,7 @@ const state = {
   noReplyTimer: null,  // 兜底：发出去之后一直没有任何帧就提醒
   turn: null,        // 正在接帧的这一轮助手回复（见 newTurn），跑完就清空
   showAll: new Set(),     // 展开了「查看全部」的空间 id
-  collapsed: new Set(JSON.parse(localStorage.getItem(LS_COLLAPSED) || "[]")),  // 折叠的空间 id
+  collapsed: loadCollapsed(),  // 折叠的空间 id
   filter: "",
   tab: "chat",            // 当前右栏 tab
   editingSpace: null,     // 向导处于「空间设置」模式时是那个空间，新建时为 null
