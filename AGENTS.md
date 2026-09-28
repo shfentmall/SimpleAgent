@@ -43,7 +43,7 @@ SimpleAgent 是一个自用的本地 agent，有两个目标：一是学习 agen
 ### 2.3 提交与推送
 
 - 只在用户明确要求时才 `git commit` / `git push`
-- 用户敲 `/ship` 就是要求走完整个上线流程：审查、检查、验证、变更记录、开 PR、合并到 main，步骤见 [`.claude/skills/ship/SKILL.md`](.claude/skills/ship/SKILL.md)
+- 用户敲 `/ship` 就是要求走完整个上线流程：审查、检查、验证、变更记录、开 PR、合并到 main。主会话只写交接简报（[`.claude/skills/ship/SKILL.md`](.claude/skills/ship/SKILL.md)），具体步骤由子 agent [`shipper`](.claude/agents/shipper.md) 在干净的上下文里跑
 - 版本号：main 每次更新（合并 PR 或直接推送），[`.github/workflows/bump-version.yml`](.github/workflows/bump-version.yml) 会自动把最后一位 +1（0.2.0 → 0.2.1），提交回 main，不打 tag。
   - 平时分支里不要手动改版本号（正式发版除外，见下一条）
   - 直接推 main 前先 `git pull`，因为本地会少 bot 刚推的那个提交
