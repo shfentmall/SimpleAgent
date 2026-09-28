@@ -108,6 +108,8 @@ body {
 }
 .space.is-open { border-color: var(--border-strong); background: #fff; }
 .space-head { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.space-head .caret { width: 10px; font-size: 10px; color: var(--text-3); flex-shrink: 0; }
+.space.is-collapsed .space-dir, .space.is-collapsed .sessions { display: none; }
 .space-name { font-weight: 600; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .space-dir {
   font: 11px/1.4 var(--mono); color: var(--text-3); margin-top: 3px;
@@ -139,9 +141,9 @@ body {
   background: var(--red-soft); color: var(--red);
 }
 
-.sessions { margin-top: 6px; display: flex; flex-direction: column; gap: 1px; }
+.sessions { margin-top: 4px; display: flex; flex-direction: column; gap: 0; }
 .session {
-  display: flex; align-items: center; gap: 6px; padding: 4px 6px;
+  display: flex; align-items: center; gap: 6px; padding: 2px 6px; line-height: 1.35;
   border-radius: 5px; cursor: pointer; font-size: 12px; color: var(--text-2);
 }
 .session:hover { background: var(--bg); }
