@@ -114,6 +114,8 @@ class Judgment:
 class ApprovalDecision:
     allow: bool
     always: bool = False  # always 由审批器自己记住，注册表不替它记账
+    # 不是人按的拒绝（比如等超时了）要说清楚，回给模型的原因里用它代替「已被拒绝」
+    note: str = ""
 
 
 @dataclass(frozen=True)

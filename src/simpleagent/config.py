@@ -238,6 +238,9 @@ class PermissionsConfig(BaseModel):
 
     # 交互会话（REPL、客户端里没单独设过的空间）默认用哪个模式；中文名也认
     mode: Mode = Mode.WORKSPACE
+    # 客户端审批等人答的上限（秒），超时按拒绝；0 = 一直等。
+    # 不设上限的话，关掉页面后没人答的审批会一直占着会话，它就再也发不了消息
+    approval_timeout: float = Field(default=300, ge=0)
 
     @field_validator("mode", mode="before")
     @classmethod

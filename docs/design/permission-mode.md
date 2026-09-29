@@ -214,7 +214,8 @@ REPL 里 `/mode` 列出三档和当前这档，`/mode 全放行` 切换，下一
 - **工作区模式下 bash 还要问。** 等 Seatbelt 沙箱开关：打开后工作区模式下 bash 在沙箱里直接跑，被拦时带理由申请一次。
 - **「a / 本次会话始终允许」仍按工具名放行**（调研里的缺口③）。在工作区模式下它只影响 bash 和 MCP 写操作，但对 bash 按一次
   还是等于后面都不问。可以学 Claude Code 按命令前缀记，或者对 bash 不给这个选项。
-- **客户端审批不会超时**（缺口⑥）：文档说「不在线 / 超时按拒绝」，代码是一直等。这次没动。
+- ~~**客户端审批不会超时**（缺口⑥）~~：已补上。`APIApprover` 等满 `[permissions].approval_timeout`（默认 300 秒）
+  按拒绝处理，`_finalize` 兜底清掉这一轮剩下的审批。
 - **外部 CLI 没有工作区档**：claude 可以用 `--permission-mode acceptEdits`，opencode 要配 `edit: allow` 加 `external_directory`。
 - **切模式不会放行已经挂着的审批卡**：比如从只读切到全放行，之前弹出的卡还要手动点。
 - **旧值 `safe` 是懒迁移**：读的时候当只读，保存一次空间设置才写成 `read-only`。

@@ -1,8 +1,9 @@
 """事件 → 帧 的序列化，以及服务端自己发出的补充帧。
 
 核心 loop 产出的 Event（TextDelta / MessageDone / ToolCallStart / ToolResult / ...）在这里
-转成总线上的 Frame；另外服务端在「会话状态变化」「出错」「等待审批」「验证完成」时也会发帧，
-这些帧由本模块构造（type 分别为 status / error / approval_request / verification）。
+转成总线上的 Frame；另外服务端在「会话状态变化」「出错」「等待审批」「审批超时」「验证完成」时
+也会发帧，这些帧由本模块构造（type 分别为 status / error / approval_request / approval_timeout /
+verification）。
 """
 
 from __future__ import annotations
@@ -148,6 +149,11 @@ def approval_request_frame(
             "reason": reason,
         },
     )
+
+
+def approval_timeout_frame(session_id: str, approval_id: str, timeout: float) -> Frame:
+    # 等超时按拒绝了结：还开着的审批卡收到它就去掉按钮，不然之后点「允许」看着成功、其实没用
+    return Frame(session_id, "approval_timeout", {"approval_id": approval_id, "timeout": timeout})
 
 
 def verification_frame(session_id: str, verification: dict[str, Any]) -> Frame:

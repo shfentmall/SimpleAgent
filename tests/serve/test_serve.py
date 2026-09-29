@@ -125,6 +125,37 @@ async def test_approval_roundtrip():
     assert decision2.allow is True
 
 
+async def test_approval_timeout_denies_and_tells_client():
+    """没人答的审批等满 timeout 按拒绝了结：登记清掉，推一帧让还开着的审批卡作废。"""
+    bus = EventBus()
+    q, _ = bus.subscribe("se1")
+    pending = PendingApprovals()
+    approver = APIApprover(bus, pending, timeout=0.05)
+
+    decision = await approver.request(
+        ApprovalRequest(session_id="se1", tool_name="bash", arguments='{"command":"ls"}')
+    )
+
+    assert decision.allow is False
+    assert "没人确认" in decision.note
+    assert pending.pending_ids() == [] and pending.details() == []
+    frames = [q.get(timeout=1) for _ in range(2)]
+    assert [f.type for f in frames] == ["approval_request", "approval_timeout"]
+    assert frames[1].payload["approval_id"] == frames[0].payload["approval_id"]
+
+
+async def test_drop_session_denies_only_that_sessions_approvals():
+    pending = PendingApprovals()
+    mine = pending.add("ap1", ApprovalRequest(session_id="se1", tool_name="bash", arguments=""))
+    other = pending.add("ap2", ApprovalRequest(session_id="se2", tool_name="bash", arguments=""))
+
+    pending.drop_session("se1")
+
+    assert mine.result() == ApprovalDecision(allow=False)
+    assert not other.done()
+    assert pending.pending_ids() == ["ap2"]
+
+
 # --------------------------------------------------------------- 3. Runner + FakeLLM 流式
 def test_runner_fake_llm_stream(config, sa_home):
     store = SpaceStore(sa_home)
@@ -200,6 +231,55 @@ def test_runner_approval_flow(config, sa_home):
     # 文件确实被写了
     written = (store._space_dir(space.id) / "tmp" / "x.txt").read_text(encoding="utf-8")
     assert written == "hi"
+    runner.shutdown()
+
+
+def test_abandoned_approval_times_out_and_frees_session(config, sa_home):
+    """弹了审批就关掉页面：等超时按拒绝，这一轮照常收口，会话能再发消息。
+
+    改动前审批一直等，这一轮不结束，会话的占用也不放，之后每次发消息都是 SessionBusy。
+    """
+    config.permissions.approval_timeout = 0.2
+    store = SpaceStore(sa_home)
+    space = store.create_space(
+        SpaceSpec(name="t", kind="generic", profile="a", permission="read-only")
+    )
+    session = store.create_session(space.id)
+    script = [
+        {
+            "tool_calls": [
+                {"id": "c1", "name": "write_file", "arguments": {"path": "x.txt", "content": "hi"}}
+            ]
+        },
+        {"content": "没写成"},
+    ]
+    runner = Runner(config, store=store, llm_factory=_fake_factory(script))
+    runner.start()
+    q, _ = runner.bus.subscribe(session.id)
+
+    runner.run_input(space.id, session.id, "写个文件")
+    # 没人去点：一直读到这一轮收口
+    frames = _frames_until(q, "status")  # running
+    frames += _frames_until(q, "status")
+    types = [f.type for f in frames]
+    assert types.index("approval_request") < types.index("approval_timeout")
+    assert frames[-1].payload["status"] == "done"
+
+    # 决策是拒绝，回给模型的原因说清楚是超时，不是人按的拒绝
+    tool_msg = next(
+        m for m in store.load_session(space.id, session.id).messages if m["role"] == "tool"
+    )
+    assert "没人确认" in tool_msg["content"]
+    assert not (store._space_dir(space.id) / "tmp" / "x.txt").exists()
+    assert store.get_session_meta(space.id, session.id).status == "done"
+    # 审批登记和会话占用都清掉了：超时的卡再点是 404，会话能再发一句
+    ap_id = next(f for f in frames if f.type == "approval_request").payload["approval_id"]
+    assert runner.pending.details() == []
+    assert runner.approve(ap_id, "allow") is False
+    assert not runner.session_busy(session.id)
+    runner.run_input(space.id, session.id, "再来")  # 每轮新造 FakeLLM：脚本从头再走一遍
+    assert _frames_until(q, "status")[-1].payload["status"] == "running"
+    assert _frames_until(q, "status")[-1].payload["status"] == "done"
     runner.shutdown()
 
 

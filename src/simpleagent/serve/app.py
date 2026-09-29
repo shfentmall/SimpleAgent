@@ -750,7 +750,10 @@ class Server:
         data = self._safe_json(body) or {}
         ok = self.runner.approve(approval_id, data.get("action", "allow"))
         if not ok:
-            return Response(404, {"error": "approval not found or runner not started"})
+            # 最常见的是等超时已经按拒绝了结了：这句会直接弹给点按钮的人看
+            return Response(
+                404, {"error": "这条审批已经不在了：可能等超时按拒绝处理了，或者已在别处处理过"}
+            )
         return Response(200, {"resolved": approval_id})
 
     # ----------------------------------------------------------------- 工具

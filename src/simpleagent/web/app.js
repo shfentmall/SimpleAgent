@@ -9,8 +9,8 @@ const streamEl = () => $("pane-chat");
    onmessage 只收默认的 message 事件，收不到带 event 名的帧。 */
 const FRAME_TYPES = [
   "text_delta", "reasoning_delta", "message_done", "tool_call_start", "tool_result",
-  "approval_request", "verification", "status", "usage", "error", "max_steps", "turn_end",
-  "unknown",
+  "approval_request", "approval_timeout", "verification", "status", "usage", "error",
+  "max_steps", "turn_end", "unknown",
 ];
 
 const LS_KEY = "sa.workbench.current";   // 记住上次打开的会话，刷新后自动回到原位
@@ -667,16 +667,7 @@ function addApprovalCard(approvalId, toolName, argsText, reason) {
     b.onclick = async () => {
       try {
         await api.post(`/api/approvals/${approvalId}`, { action: b.dataset.act });
-        // 收成一条记录挪进过程：普通审批只留一行（参数上面那一行已经有了），计划卡留着计划
-        const head = el.querySelector("div");
-        head.textContent = `已处理：${b.textContent} · ${toolName}`;
-        for (const child of [...el.children]) {
-          if (child !== head && (!isPlan || child.querySelector("button"))) child.remove();
-        }
-        el.classList.add("is-done");
-        turn.body.appendChild(el);
-        turn.waiting = Math.max(0, turn.waiting - 1);
-        renderProcHead(turn);
+        settleApprovalCard(turn, el, `已处理：${b.textContent} · ${toolName}`);
       } catch (e) { toast(`提交失败：${e.message}`); }
     };
   });
@@ -684,6 +675,30 @@ function addApprovalCard(approvalId, toolName, argsText, reason) {
   turn.waiting += 1;
   renderProcHead(turn);
   scrollDown();
+}
+
+/* 审批卡了结：收成一条记录挪进过程。普通审批只留一行（参数上面那一行已经有了），计划卡留着计划 */
+function settleApprovalCard(turn, el, label) {
+  const head = el.querySelector("div");
+  head.textContent = label;
+  const isPlan = el.dataset.tool === "propose_plan";
+  for (const child of [...el.children]) {
+    if (child !== head && (!isPlan || child.querySelector("button"))) child.remove();
+  }
+  el.classList.add("is-done");
+  if (el.parentElement !== turn.cards) return;   // 已经收过（比如点完按钮恰好又超时）：只改文字
+  turn.body.appendChild(el);
+  turn.waiting = Math.max(0, turn.waiting - 1);
+  renderProcHead(turn);
+}
+
+/* 服务端等超时按拒绝了结的审批：卡片不能再留着按钮，点了看着成功、其实没人接 */
+function expireApprovalCard(approvalId, timeout) {
+  const el = document.querySelector(`[data-approval="${approvalId}"]`);
+  if (!el || !state.turn) return;
+  const sec = Math.round(timeout || 0);
+  const waited = sec && sec % 60 === 0 ? `${sec / 60} 分钟` : fmtDur(sec);
+  settleApprovalCard(state.turn, el, `已超时 · ${el.dataset.tool || ""}（${waited}没人确认，按拒绝处理）`);
 }
 
 /* 只在用户本来就贴着底部时才自动滚动：否则翻看上面内容时会被流式输出一直拽回去 */
@@ -817,6 +832,8 @@ async function onFrame(type, frame) {
     addErrorCard(`达到最大步数（${p.max_steps}）已停止。`);
   } else if (type === "approval_request") {
     addApprovalCard(p.approval_id, p.tool_name, p.arguments || "", p.reason);
+  } else if (type === "approval_timeout") {
+    expireApprovalCard(p.approval_id, p.timeout);
   } else if (type === "verification") {
     await refreshSessions();
   } else if (type === "usage") {
@@ -1130,11 +1147,14 @@ async function renderDispatch() {
     el.querySelectorAll("[data-act^='ap-']").forEach((btn) => {
       btn.onclick = async (ev) => {
         ev.stopPropagation();
-        await api.post(`/api/approvals/${d.approval.approval_id}`,
-          { action: btn.dataset.act.replace("ap-", "") });
+        try {
+          await api.post(`/api/approvals/${d.approval.approval_id}`,
+            { action: btn.dataset.act.replace("ap-", "") });
+          toast("已处理");
+        } catch (e) { toast(`提交失败：${e.message}`); }
+        // 失败多半是等超时已经按拒绝了结了：先收掉，还在等的话下一轮轮询会再补回来
         d.approval = null;
         renderDispatch();
-        toast("已处理");
       };
     });
     const reply = el.querySelector("[data-act='reply']");
