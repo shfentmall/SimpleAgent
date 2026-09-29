@@ -6,7 +6,8 @@
    然后 await 一个 Future —— 此时 agent loop 被挂起，不会真的去改文件。
 3. 客户端回 POST /api/approvals/{id} {action: allow|deny|always}，HTTP 层在 runner 的
    asyncio 线程上 set_result，Future 解除，request() 返回决策，工具按决策执行或跳过。
-4. 客户端不在线 / 超时则按无人值守策略拒绝（M3 行为；这里直接返回拒绝）。
+4. 等满 timeout 秒还没人答（客户端关了、人走开了）就按拒绝处理，再推一帧 approval_timeout
+   让还开着的审批卡作废。不设上限的话，没人管的审批会一直占着会话，这个会话再也发不了消息。
 
 「本次会话始终允许」(always) 记在 Runner 传进来的共享字典里，按 session_id 维度生效，
 跨多轮对话都有效。
@@ -24,7 +25,7 @@ from simpleagent.permissions import (  # 协议本身在 permissions 里，这�
     Approver,
 )
 from simpleagent.serve.bus import EventBus
-from simpleagent.serve.frames import approval_request_frame
+from simpleagent.serve.frames import approval_request_frame, approval_timeout_frame
 
 __all__ = ["APIApprover", "ApprovalDecision", "ApprovalRequest", "Approver", "PendingApprovals"]
 
@@ -58,6 +59,15 @@ class PendingApprovals:
         if fut is not None and not fut.done():
             fut.set_result(decision)
 
+    def drop_session(self, session_id: str) -> None:
+        """这个会话还挂着的审批全部按拒绝了结：一轮都收口了，留下的卡点了也不会有人接。"""
+        for aid, req in list(self._requests.items()):
+            if req.session_id == session_id:
+                self.resolve(aid, ApprovalDecision(allow=False))
+
+    def has(self, approval_id: str) -> bool:
+        return approval_id in self._futures
+
     def pending_ids(self) -> list[str]:
         return list(self._futures)
 
@@ -85,11 +95,15 @@ class APIApprover:
         bus: EventBus,
         pending: PendingApprovals,
         always_store: dict[str, set[str]] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> None:
         self.bus = bus
         self.pending = pending
         # session_id -> 已选「始终允许」的工具名集合（跨轮对话共享）
         self.always_store: dict[str, set[str]] = always_store if always_store is not None else {}
+        # 等人答的上限（秒）；None 或 0 = 一直等
+        self.timeout = timeout or None
 
     async def request(self, req: ApprovalRequest) -> ApprovalDecision:
         if req.tool_name in self.always_store.get(req.session_id, set()):
@@ -103,7 +117,15 @@ class APIApprover:
             )
         )
         try:
-            decision = await future
+            decision = await asyncio.wait_for(future, self.timeout)
+        except TimeoutError:
+            # wait_for 已经把 Future 取消了，这里只是把登记清掉
+            self.pending.resolve(approval_id, ApprovalDecision(allow=False))
+            self.bus.publish(approval_timeout_frame(req.session_id, approval_id, self.timeout))
+            minutes = (
+                f"{self.timeout / 60:g} 分钟" if self.timeout >= 60 else f"{self.timeout:g} 秒"
+            )
+            return ApprovalDecision(allow=False, note=f"等了 {minutes}没人确认，按拒绝处理")
         except asyncio.CancelledError:
             # 整个 run 被取消时顺手清掉这个挂起的审批，避免泄漏
             self.pending.resolve(approval_id, ApprovalDecision(allow=False))

@@ -147,7 +147,7 @@ tool_call → Registry.judge() → Policy.decide() ─┬─ ALLOW → 执行
   |---|---|
   | `ConsoleApprover`（`ui/approve.py`） | REPL：y / a（本次会话都允许）/ 其他键拒绝 |
   | `WhitelistApprover` | `sa run` 和以后的 `sa daemon`：名单外一律拒绝，原因回给模型 |
-  | `APIApprover`（`serve/approval.py`） | 桌面客户端：推一帧 SSE 后 `await Future` |
+  | `APIApprover`（`serve/approval.py`） | 桌面客户端：推一帧 SSE 后 `await Future`；等满 `[permissions].approval_timeout`（默认 300 秒）没人答按拒绝，推一帧 `approval_timeout` |
 
   危险判定放在 Policy 里，是三个前端共享的底线：定时任务也绕不过去。
 

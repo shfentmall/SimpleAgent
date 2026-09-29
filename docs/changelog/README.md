@@ -50,6 +50,7 @@
 
 ## 索引
 
+- [2026-09-29 客户端审批加超时：没人答的审批 5 分钟后按拒绝，不再一直占着会话](2026-09-29-approval-timeout.md)
 - [2026-09-28 对话里的 LaTeX 公式按数学排版显示，不再露出源码（零依赖 TeX → MathML）](2026-09-28-markdown-math-formula.md)
 - [2026-09-28 左栏空间里的会话行稍微放宽：上下内边距 2px → 3px](2026-09-28-session-row-padding.md)
 - [2026-09-28 /ship 改由子 agent shipper 在干净上下文里跑，原理图拆成独立的 /explainer](2026-09-28-ship-shipper-and-explainer.md)

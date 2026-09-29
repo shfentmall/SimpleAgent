@@ -142,7 +142,7 @@ class ToolRegistry:
                 )
             )
             if not answer.allow:
-                return error(f"{reason}；已被拒绝", decision)
+                return error(f"{reason}；{answer.note or '已被拒绝'}", decision)
         try:
             content = await tool.fn(args, ctx)
         except ToolError as e:

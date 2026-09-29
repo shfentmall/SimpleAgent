@@ -310,7 +310,7 @@ class SpaceStore:
 {"seq": 128, "session_id": "se_9f2a", "type": "text_delta", "ts": "...", "payload": {"text": "..."}}
 ```
 
-`type` 取值：`text_delta` / `reasoning_delta` / `message_done` / `tool_call_start` / `tool_result` / `approval_request` / `verification` / `status` / `usage` / `error` / `max_steps` / `turn_end`。
+`type` 取值：`text_delta` / `reasoning_delta` / `message_done` / `tool_call_start` / `tool_result` / `approval_request` / `approval_timeout` / `verification` / `status` / `usage` / `error` / `max_steps` / `turn_end`。
 `seq` 单 session 内单调递增，客户端按 seq 去重、断线后按 `Last-Event-ID` 续传。
 
 ### 6.2 路由
@@ -345,7 +345,7 @@ class SpaceStore:
 | PATCH/DELETE | `/api/todos/{id}` | 改（text / done）/ 删 |
 | GET | `/api/knowledge/...` | 知识库（M7） |
 
-审批走异步 `approve()` 接口：后台需要确认时推 `approval_request` 事件并挂起，客户端回 POST 后继续；客户端不在线则按无人值守策略拒绝（M3 已定的行为）。
+审批走异步 `approve()` 接口：后台需要确认时推 `approval_request` 事件并挂起，客户端回 POST 后继续；等满 `[permissions].approval_timeout`（默认 300 秒，0 = 一直等）没人答就按拒绝处理，推一帧 `approval_timeout` 让还开着的审批卡去掉按钮，之后再 POST 这个 id 是 404。
 
 **请求来源检查**（`serve/app.py` 的 `check_request`，在 HTTP 层、路由之前；参考 Paseo 的做法）。只监听 127.0.0.1 还不够，浏览器里的恶意网页照样能打过来：
 

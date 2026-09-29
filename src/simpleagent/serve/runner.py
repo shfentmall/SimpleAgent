@@ -256,7 +256,9 @@ class Runner:
                 pass
 
     def approve(self, approval_id: str, action: str) -> bool:
-        if self._loop is None:
+        """返回 False = 没有这个待审批（已经超时、被别处处理了、或者 runner 没起来）。"""
+        # 在 HTTP 线程上读 pending 只是查一下键，不改它；真正了结还是放回事件循环上做
+        if self._loop is None or not self.pending.has(approval_id):
             return False
         decision = _action_to_decision(action)
         self._loop.call_soon_threadsafe(self.pending.resolve, approval_id, decision)
@@ -549,6 +551,9 @@ class Runner:
         extra: dict[str, Any] = {"space_id": space_id, "usage": usage}
         if reason is not None:
             extra["reason"] = reason
+        # 这一轮还挂着的审批跟着作废：正常走不到这里（审批器自己会清），兜底防 GET /api/approvals
+        # 里留下点了也没人接的卡
+        self.pending.drop_session(session_id)
         # 放开占用要赶在终态帧之前：客户端收到这帧马上再发一句，不能撞上还没放开的占用。
         # 这时占用一定还是这一轮自己的，可以不带 token 直接放；之后到 _run_turn 退出都没有
         # await，下一轮要等这段同步代码跑完才开始，不会和它的收尾交错
@@ -716,7 +721,12 @@ class Runner:
             max_output_chars=self.config.tool_output.max_chars,
             max_output_lines=self.config.tool_output.max_lines,
         )
-        approver = APIApprover(self.bus, self.pending, self.always_allow)
+        approver = APIApprover(
+            self.bus,
+            self.pending,
+            self.always_allow,
+            timeout=self.config.permissions.approval_timeout,
+        )
         tools.approver = approver
         # 客户端模式也走同一套权限判定：越界和危险命令先被拦掉，剩下的才去问客户端。
         # 模式看空间自己的设置；中途改了由 apply_mode 改这个 Policy，下一次工具调用起生效。
@@ -755,7 +765,9 @@ class Runner:
                 command_prompt(self.targets(), default_mode=self.config.permissions.mode),
             )
             self._prompts[session.id] = cached
-        approver = APIApprover(self.bus, self.pending, {})
+        approver = APIApprover(
+            self.bus, self.pending, {}, timeout=self.config.permissions.approval_timeout
+        )
         # 这个调度会话引用过消息（这一轮或之前）：之后每次派发都要先出计划卡。
         # 看落盘的原始历史：本轮的输入在构造 agent 之前已经落了，模型那份历史可能被压缩过
         quoted = any(
